@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+# needrestart-lxc - Check LXC containers on Proxmox for processes using
+# outdated shared libraries, and optionally restart specific services
+# inside containers without restarting the entire container.
+#
+# This script reads /proc/*/maps from the host to detect processes in
+# containers that are using deleted/replaced shared libraries. It maps
+# those processes to their container and systemd service using cgroup
+# information, and can restart individual services via `pct exec`.
+#
+# It does NOT modify or depend on needrestart being installed inside
+# containers. It is a standalone tool that complements the host-side
+# needrestart by providing per-service granularity for LXC containers.
+
+readonly PROGNAME="needrestart-lxc"
+
+# Global configuration
+readonly CGROUP_LXC_PATTERN="^0::/lxc/([0-9]+)/ns/(.+)$"
+readonly BLACKLIST_PATTERNS=(
+   # Special device paths (needrestart: blacklist_mappings)
+   "^/memfd:"
+   "^/dev/"
+   "^/(SYSV00000000"
+   # aio(7) mappings
+   "^/\\[aio\\]"
+   # General bracket-enclosed mappings ([heap], [stack], [vdso], etc.)
+   "^\\["
+   # Temporary directories (Tcl bytecode, JNA, etc.)
+   "^(/var)?/tmp/"
+   "^(/var)?/run/"
+   # Oil Runtime Compiler JIT files
+   "/orcexec\\.[\\w\\d]+( \\(deleted\\))?$"
+   # Java Native Access temp files
+   "/jna[0-9]+\\.tmp( \\(deleted\\))?$"
+   "/\\.cache/JNA/"
+   # Binaries that are not daemons (needrestart: blacklist)
+   "^/usr/bin/sudo"
+   "^/usr/bin/apt-get"
+)
+
+# Modes of operation
+MODE="list"
+VERBOSE=0
+DEEP=0
+DRY_RUN=0
+CONTAINER_FILTER=""
+EXCLUDE_PATTERNS=()
+
+# Collected data structures
+declare -A CT_NAMES      # CTID -> container name
+declare -A CT_PIDS      # CTID -> init PID
+declare -A CONT_SERVICES # "CTID:service" -> "deleted_lib1,deleted_lib2"
+
+# ------------------------------------------------------------------------------
+# Utility functions
+# ------------------------------------------------------------------------------
+
+print_usage() {
+   cat <<-EOF
+Usage: $PROGNAME [OPTIONS]
+
+Check LXC containers on a Proxmox host for processes using outdated
+shared libraries, and optionally restart specific services inside
+those containers.
+
+Options:
+  -l, --list          List containers with services needing restart (default)
+  -r, --restart       Restart services inside containers
+  -n, --dry-run       Show what would be restarted without doing it
+  -c, --container ID  Only check a specific container (by CTID)
+  -e, --exclude PAT   Exclude services matching regex (can be repeated)
+  -d, --deep          Also check for inode mismatches (slower but thorough)
+  -v, --verbose       Show verbose output including affected libraries
+  -h, --help          Show this help message
+
+Examples:
+  $PROGNAME                     # List all containers needing service restarts
+  $PROGNAME -v                  # Show which libraries are outdated
+  $PROGNAME -r                  # Restart affected services in containers
+  $PROGNAME -n -r               # Show what would be restarted (dry run)
+  $PROGNAME -c 100              # Only check container 100
+  $PROGNAME -d                   # Deep scan including inode comparison
+  $PROGNAME -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
+EOF
+}
+
+log_verbose() {
+   (( VERBOSE )) && printf "%s\n" "$*" >&2
+}
+
+log_error() {
+   printf "ERROR: %s\n" "$*" >&2
+}
+
+# Check if a library path should be blacklisted
+is_blacklisted() {
+   local path="$1"
+   local pattern
+   for pattern in "${BLACKLIST_PATTERNS[@]}"; do
+      [[ "$path" =~ $pattern ]] && return 0
+   done
+   return 1
+}
+
+# Check if a service name should be excluded
+is_excluded() {
+   local service="$1"
+   local pattern
+   for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+      [[ "$service" =~ $pattern ]] && return 0
+   done
+   return 1
+}
+
+# ------------------------------------------------------------------------------
+# Container discovery
+# ------------------------------------------------------------------------------
+
+load_container_names() {
+   local ctid name
+   while IFS=' ' read -r ctid name; do
+      CT_NAMES["$ctid"]="$name"
+   done < <(pct list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1, $NF}')
+   log_verbose "Loaded ${#CT_NAMES[@]} container names"
+}
+
+get_container_pids() {
+   local pid cgroup ctid
+   while IFS=' ' read -r pid cgroup; do
+      if [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]]; then
+         ctid="${BASH_REMATCH[1]}"
+         if [[ "$cgroup" == */ns/init.scope ]]; then
+            CT_PIDS["$ctid"]="$pid"
+         fi
+      fi
+   done < <(ps -eo pid,cgroup 2>/dev/null)
+   log_verbose "Found ${#CT_PIDS[@]} running containers"
+}
+
+# ------------------------------------------------------------------------------
+# Library freshness checking (fast scan)
+# ------------------------------------------------------------------------------
+
+# Fast check: look for (deleted) in /proc/<pid>/maps and check /proc/<pid>/exe
+# Returns 0 if process needs restart, 1 otherwise.
+# Sets FOUND_LIBS global with the list of affected libraries.
+FOUND_LIBS=""
+check_process_fast() {
+   local pid="$1"
+   local exe_path raw_line clean_path
+   local -a libs_found=()
+
+   FOUND_LIBS=""
+
+   # Check if executable was replaced
+   exe_path=$(readlink "/proc/${pid}/exe" 2>/dev/null) || return 1
+   if [[ "$exe_path" == *" (deleted)" ]]; then
+      local clean_exe="${exe_path% (deleted)}"
+      if ! is_blacklisted "$clean_exe"; then
+         FOUND_LIBS="${clean_exe} (executable)"
+         return 0
+      fi
+   fi
+
+   # Extract r-xp deleted mappings from maps, filter through blacklist
+   while IFS= read -r raw_line; do
+      [[ -z "$raw_line" ]] && continue
+      # Remove (deleted) suffix for blacklist check
+      clean_path="${raw_line% (deleted)}"
+      if ! is_blacklisted "$clean_path"; then
+         libs_found+=("$clean_path")
+      fi
+   done < <(grep -E 'r-xp.*\(deleted\)' "/proc/${pid}/maps" 2>/dev/null \
+      | awk '{for(i=6;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}' \
+      | sort -u)
+
+   if (( ${#libs_found[@]} > 0 )); then
+      FOUND_LIBS="$(printf '%s\n' "${libs_found[@]}")"
+      return 0
+   fi
+
+   return 1
+}
+
+# Deep check: also compare inode numbers for shared libraries
+# Returns 0 if process needs restart, 1 otherwise.
+# Sets FOUND_LIBS global with the list of affected libraries.
+check_process_deep() {
+   local pid="$1"
+   local init_pid="$2"
+   local line path perms maps_inode maps_dev disk_path
+   local disk_stat disk_inode disk_dev maps_dev_clean disk_dev_clean
+   local found_libs=""
+
+   # First do the fast check
+   if check_process_fast "$pid"; then
+      found_libs="$FOUND_LIBS"
+   fi
+
+   # Now check for inode mismatches on shared libraries
+   while IFS= read -r line; do
+      perms=$(echo "$line" | awk '{print $2}')
+      [[ "$perms" != *x* ]] && continue
+
+      path=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}')
+
+      [[ -z "$path" ]] && continue
+      is_blacklisted "$path" && continue
+      [[ "$path" == *" (deleted)" ]] && continue
+      [[ "$path" != *.so* ]] && continue
+
+      maps_inode=$(echo "$line" | awk '{print $5}')
+      maps_dev=$(echo "$line" | awk '{print $4}')
+      [[ "$maps_inode" == "0" ]] && continue
+
+      disk_path="/proc/${init_pid}/root${path}"
+      [[ -e "$disk_path" ]] || continue
+
+      disk_stat=$(stat -c '%d:%i' "$disk_path" 2>/dev/null) || continue
+      disk_inode=$(echo "$disk_stat" | cut -d: -f2)
+      disk_dev=$(echo "$disk_stat" | cut -d: -f1)
+
+      maps_dev_clean=$(echo "$maps_dev" | sed 's/^0*//;s/:0*/:/')
+      disk_dev_clean=$(echo "$disk_dev" | sed 's/^0*//;s/:0*/:/')
+
+      if [[ "$maps_inode" != "$disk_inode" ]] && [[ "$maps_dev_clean" == "$disk_dev_clean" ]]; then
+         if [[ -n "$found_libs" ]]; then
+            found_libs="${found_libs}
+${path} (inode mismatch)"
+         else
+            found_libs="${path} (inode mismatch)"
+         fi
+      fi
+   done < "/proc/${pid}/maps"
+
+   if [[ -n "$found_libs" ]]; then
+      FOUND_LIBS="$found_libs"
+      return 0
+   fi
+   return 1
+}
+
+# ------------------------------------------------------------------------------
+# Main scanning logic
+# ------------------------------------------------------------------------------
+
+scan_containers() {
+   local pid cgroup ctid service path_suffix key init_pid
+
+   log_verbose "Scanning container processes for outdated libraries..."
+
+   while IFS=' ' read -r pid cgroup; do
+      # Check if this process is in an LXC container
+      [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]] || continue
+
+      ctid="${BASH_REMATCH[1]}"
+      path_suffix="${BASH_REMATCH[2]}"
+
+      # Apply container filter
+      [[ -n "$CONTAINER_FILTER" ]] && [[ "$ctid" != "$CONTAINER_FILTER" ]] && continue
+
+      # Extract service name from cgroup path
+      # init.scope = PID 1 (systemd) - handled as "systemd-manager" which
+      # can be restarted with daemon-reexec, not a full container restart
+      if [[ "$path_suffix" == "init.scope" ]]; then
+         service="systemd-manager"
+      elif [[ "$path_suffix" =~ /([^/]+\.service)$ ]]; then
+         service="${BASH_REMATCH[1]}"
+      elif [[ "$path_suffix" =~ ^([^/]+\.service)$ ]]; then
+         service="${BASH_REMATCH[1]}"
+      else
+         continue
+      fi
+
+      # Skip excluded services
+      is_excluded "$service" && continue
+
+      # Deduplicate: skip if we already checked this container+service
+      key="${ctid}:${service}"
+      [[ -n "${CONT_SERVICES[$key]+x}" ]] && continue
+
+      # Get init PID for container root filesystem access
+      if [[ -n "${CT_PIDS[$ctid]+x}" ]]; then
+         init_pid="${CT_PIDS[$ctid]}"
+      else
+         init_pid=$(ps -eo pid,cgroup 2>/dev/null | command grep "lxc/${ctid}/ns/init.scope" | head -1 | awk '{print $1}')
+         [[ -n "$init_pid" ]] && CT_PIDS["$ctid"]="$init_pid"
+      fi
+
+      # Skip inaccessible processes
+      [[ -r "/proc/${pid}/maps" ]] || continue
+      [[ -r "/proc/${pid}/exe" ]] || continue
+
+      log_verbose "Checking PID $pid (CT $ctid, $service)..."
+
+      if (( DEEP )); then
+         check_process_deep "$pid" "$init_pid"
+      else
+         check_process_fast "$pid"
+      fi
+
+      if [[ -n "$FOUND_LIBS" ]]; then
+         CONT_SERVICES["$key"]="$FOUND_LIBS"
+         log_verbose "  -> Service $service in CT $ctid needs restart"
+      fi
+   done < <(ps -eo pid,cgroup 2>/dev/null)
+}
+
+# ------------------------------------------------------------------------------
+# Output and restart functions
+# ------------------------------------------------------------------------------
+
+print_results() {
+   local key ctid service ct_name libs
+
+   if (( ${#CONT_SERVICES[@]} == 0 )); then
+      printf "No containers have services needing restart.\n"
+      return 0
+   fi
+
+   local -a sorted_keys=()
+   for key in "${!CONT_SERVICES[@]}"; do
+      sorted_keys+=("$key")
+   done
+   mapfile -t sorted_keys < <(printf '%s\n' "${sorted_keys[@]}" | sort)
+
+   for key in "${sorted_keys[@]}"; do
+      ctid="${key%%:*}"
+      service="${key#*:}"
+      ct_name="${CT_NAMES[$ctid]:-unknown}"
+      libs="${CONT_SERVICES[$key]}"
+      if (( VERBOSE )); then
+         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$service"
+         local lib
+         while IFS= read -r lib; do
+            [[ -n "$lib" ]] && printf "  - %s\n" "$lib"
+         done <<< "$libs"
+      else
+         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$service"
+      fi
+   done
+}
+
+restart_services() {
+   local key ctid service ct_name cmd rc
+
+   if (( ${#CONT_SERVICES[@]} == 0 )); then
+      printf "No containers have services needing restart.\n"
+      return 0
+   fi
+
+   local -a sorted_keys=()
+   for key in "${!CONT_SERVICES[@]}"; do
+      sorted_keys+=("$key")
+   done
+   mapfile -t sorted_keys < <(printf '%s\n' "${sorted_keys[@]}" | sort)
+
+   for key in "${sorted_keys[@]}"; do
+      ctid="${key%%:*}"
+      service="${key#*:}"
+      ct_name="${CT_NAMES[$ctid]:-unknown}"
+
+      # systemd-manager can be restarted with daemon-reexec, no container reboot needed
+      if [[ "$service" == "systemd-manager" ]]; then
+         printf "Container %s (%s): systemd needs reexec (systemctl daemon-reexec)\n" "$ctid" "$ct_name"
+         if ! (( DRY_RUN )); then
+            pct exec "$ctid" -- systemctl daemon-reexec
+            rc=$?
+            if (( rc )); then
+               log_error "Failed to daemon-reexec in container $ctid (exit code: $rc)"
+            fi
+         else
+            printf "  [DRY RUN] Would run: pct exec %s -- systemctl daemon-reexec\n" "$ctid"
+         fi
+         continue
+      fi
+
+      printf "Container %s (%s): restarting service %s\n" "$ctid" "$ct_name" "$service"
+      if ! (( DRY_RUN )); then
+         cmd=("pct" "exec" "$ctid" "--" "systemctl" "restart" "$service")
+         log_verbose "  Running: ${cmd[*]}"
+         "${cmd[@]}"
+         rc=$?
+         if (( rc )); then
+            log_error "Failed to restart $service in container $ctid (exit code: $rc)"
+            log_verbose "$(pct exec "$ctid" -- systemctl status "$service" 2>&1 | tail -5)"
+         fi
+      else
+         printf "  [DRY RUN] Would run: pct exec %s -- systemctl restart %s\n" "$ctid" "$service"
+      fi
+   done
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+main() {
+   local args_valid=1
+
+   while [[ $# -gt 0 ]]; do
+      case "$1" in
+         -l|--list)
+            MODE="list"
+            shift
+            ;;
+         -r|--restart)
+            MODE="restart"
+            shift
+            ;;
+         -n|--dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+         -c|--container)
+            CONTAINER_FILTER="$2"
+            shift 2
+            ;;
+         -e|--exclude)
+            EXCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
+         -d|--deep)
+            DEEP=1
+            shift
+            ;;
+         -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+         -h|--help)
+            print_usage
+            exit 0
+            ;;
+         *)
+            log_error "Unknown option: $1"
+            args_valid=0
+            shift
+            ;;
+      esac
+   done
+
+   if ! (( args_valid )); then
+      print_usage >&2
+      exit 1
+   fi
+
+   # Validate container filter
+   if [[ -n "$CONTAINER_FILTER" ]] && ! [[ "$CONTAINER_FILTER" =~ ^[0-9]+$ ]]; then
+      log_error "Container ID must be numeric, got: $CONTAINER_FILTER"
+      exit 1
+   fi
+
+   # Must run as root
+   if (( EUID != 0 )); then
+      log_error "This script must be run as root to access /proc/*/maps"
+      exit 1
+   fi
+
+   # Load container information
+   load_container_names
+   get_container_pids
+
+   # Scan for outdated libraries
+   scan_containers
+
+   # Output results
+   case "$MODE" in
+      list)
+         print_results
+         ;;
+      restart)
+         restart_services
+         ;;
+      *)
+         print_results
+         ;;
+   esac
+}
+
+main "$@"
