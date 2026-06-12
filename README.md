@@ -48,6 +48,16 @@ needrestart-lxc -c 100 -e systemd-logind.service
 Container 100 (test): service systemd-journald.service needs restart
 ```
 
+### User session services
+
+The script detects outdated processes in user session cgroups (e.g., `user@N.service`) and
+reports them as services needing restart. This covers cases where `needrestart` would flag an
+entire container for reboot because of outdated libraries in user session processes.
+
+For login session scopes and other scope units that cannot be restarted with `systemctl restart`,
+the script maps them to their parent `user@N.service` when possible, since that is the
+restartable unit.
+
 ### Deep scan
 
 The deep scan takes longer and checks all open files for a container for changed inodes. This can be invoked

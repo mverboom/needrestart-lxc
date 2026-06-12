@@ -260,16 +260,37 @@ scan_containers() {
       [[ -n "$CONTAINER_FILTER" ]] && [[ "$ctid" != "$CONTAINER_FILTER" ]] && continue
 
       # Extract service name from cgroup path
-      # init.scope = PID 1 (systemd) - handled as "systemd-manager" which
-      # can be restarted with daemon-reexec, not a full container restart
+      # Try patterns in order of specificity (most specific first)
       if [[ "$path_suffix" == "init.scope" ]]; then
+         # Container's PID 1 (systemd) - handled as "systemd-manager" which
+         # can be restarted with daemon-reexec, not a full container restart
          service="systemd-manager"
+      elif [[ "$path_suffix" =~ /([^/]+\.service)/init\.scope$ ]]; then
+         # User session systemd instance, e.g. user@N.service/init.scope
+         service="${BASH_REMATCH[1]}"
       elif [[ "$path_suffix" =~ /([^/]+\.service)$ ]]; then
+         # Standard service unit (last .service in path)
          service="${BASH_REMATCH[1]}"
       elif [[ "$path_suffix" =~ ^([^/]+\.service)$ ]]; then
+         # Service at top level of the namespace
+         service="${BASH_REMATCH[1]}"
+      elif [[ "$path_suffix" =~ (user@[0-9]+\.service) ]]; then
+         # Processes under a user session (scopes, etc.) - map to the
+         # user service since that is the restartable unit
+         service="${BASH_REMATCH[1]}"
+      elif [[ "$path_suffix" =~ user-([0-9]+)\.slice ]]; then
+         # Session scopes under user.slice/user-N.slice but not under
+         # user@N.service - map to the user service for restartability
+         service="user@${BASH_REMATCH[1]}.service"
+      elif [[ "$path_suffix" =~ /([^/]+\.scope)$ ]]; then
+         # Scope unit (login sessions, tmux, podman, etc.) - not directly
+         # restartable but should still be detected and reported
          service="${BASH_REMATCH[1]}"
       else
-         continue
+         # Last resort: use the last path component to avoid silently
+         # skipping processes with outdated libraries
+         service="${path_suffix##*/}"
+         [[ -z "$service" ]] && continue
       fi
 
       # Skip excluded services
@@ -371,6 +392,24 @@ restart_services() {
             fi
          else
             printf "  [DRY RUN] Would run: pct exec %s -- systemctl daemon-reexec\n" "$ctid"
+         fi
+         continue
+      fi
+
+      # Scope units cannot be restarted with systemctl restart
+      if [[ "$service" == *.scope ]]; then
+         printf "Container %s (%s): scope %s has outdated processes (cannot auto-restart, consider restarting user service or terminating scope)\n" "$ctid" "$ct_name" "$service"
+         if ! (( DRY_RUN )); then
+            # Try to stop the scope which terminates its processes
+            cmd=("pct" "exec" "$ctid" "--" "systemctl" "stop" "$service")
+            log_verbose "  Stopping scope: ${cmd[*]}"
+            "${cmd[@]}"
+            rc=$?
+            if (( rc )); then
+               log_error "Failed to stop scope $service in container $ctid (exit code: $rc)"
+            fi
+         else
+            printf "  [DRY RUN] Would run: pct exec %s -- systemctl stop %s\n" "$ctid" "$service"
          fi
          continue
       fi
