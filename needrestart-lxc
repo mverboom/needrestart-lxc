@@ -268,6 +268,16 @@ scan_containers() {
       elif [[ "$path_suffix" =~ /([^/]+\.service)/init\.scope$ ]]; then
          # User session systemd instance, e.g. user@N.service/init.scope
          service="${BASH_REMATCH[1]}"
+      elif [[ "$path_suffix" =~ /([^/]+\.scope)$ ]]; then
+         # Scope unit (login sessions, tmux, podman, etc.) - not directly
+         # restartable but should still be detected and reported.
+         # IMPORTANT: This must be checked before the user@N.service and
+         # user-N.slice patterns below, because a process in e.g.
+         # user.slice/user-110.slice/session-c2.scope is in a session scope
+         # that is a SIBLING of user@110.service, not a child. Restarting
+         # user@110.service does NOT kill session scope processes, but
+         # stopping the scope does.
+         service="${BASH_REMATCH[1]}"
       elif [[ "$path_suffix" =~ /([^/]+\.service)$ ]]; then
          # Standard service unit (last .service in path)
          service="${BASH_REMATCH[1]}"
@@ -275,17 +285,13 @@ scan_containers() {
          # Service at top level of the namespace
          service="${BASH_REMATCH[1]}"
       elif [[ "$path_suffix" =~ (user@[0-9]+\.service) ]]; then
-         # Processes under a user session (scopes, etc.) - map to the
-         # user service since that is the restartable unit
+         # Processes under a user session cgroup subtree that aren't in
+         # a specific service or scope - map to the user service
          service="${BASH_REMATCH[1]}"
       elif [[ "$path_suffix" =~ user-([0-9]+)\.slice ]]; then
-         # Session scopes under user.slice/user-N.slice but not under
-         # user@N.service - map to the user service for restartability
+         # Processes in user-N.slice but not in a specific scope or service.
+         # Map to user@N.service for restartability.
          service="user@${BASH_REMATCH[1]}.service"
-      elif [[ "$path_suffix" =~ /([^/]+\.scope)$ ]]; then
-         # Scope unit (login sessions, tmux, podman, etc.) - not directly
-         # restartable but should still be detected and reported
-         service="${BASH_REMATCH[1]}"
       else
          # Last resort: use the last path component to avoid silently
          # skipping processes with outdated libraries

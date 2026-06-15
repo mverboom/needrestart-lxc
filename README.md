@@ -55,8 +55,10 @@ reports them as services needing restart. This covers cases where `needrestart` 
 entire container for reboot because of outdated libraries in user session processes.
 
 For login session scopes and other scope units that cannot be restarted with `systemctl restart`,
-the script maps them to their parent `user@N.service` when possible, since that is the
-restartable unit.
+the script identifies them as scope units and stops them with `systemctl stop`, which
+terminates their processes. This is necessary because session scopes (e.g., `session-c2.scope`)
+are siblings of `user@N.service` in the cgroup hierarchy — restarting `user@N.service`
+does not kill processes in session scopes.
 
 ### Deep scan
 
