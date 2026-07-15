@@ -334,8 +334,30 @@ scan_containers() {
 }
 
 # ------------------------------------------------------------------------------
-# Output and restart functions
+# Verification and restart functions
 # ------------------------------------------------------------------------------
+
+# Check whether a service in a container still has processes using outdated
+# shared libraries. Used to verify that a restart actually cleared the stale
+# processes (systemctl restart respects KillMode and may leave child processes
+# running, e.g. cron.service with KillMode=process leaves daemonized jobs alive).
+# Returns 0 if stale processes remain, 1 if the service is clear.
+service_is_stale() {
+   local ctid="$1"
+   local service="$2"
+   local pid cgroup
+
+   while IFS=' ' read -r pid cgroup; do
+      [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]] || continue
+      [[ "${BASH_REMATCH[1]}" != "$ctid" ]] && continue
+      [[ "$cgroup" == *"/${service}"* ]] || continue
+      [[ -r "/proc/${pid}/maps" ]] || continue
+      if check_process_fast "$pid"; then
+         return 0
+      fi
+   done < <(ps -eo pid,cgroup 2>/dev/null)
+   return 1
+}
 
 print_results() {
    local key ctid service ct_name libs
@@ -421,17 +443,64 @@ restart_services() {
       fi
 
       printf "Container %s (%s): restarting service %s\n" "$ctid" "$ct_name" "$service"
-      if ! (( DRY_RUN )); then
-         cmd=("pct" "exec" "$ctid" "--" "systemctl" "restart" "$service")
-         log_verbose "  Running: ${cmd[*]}"
-         "${cmd[@]}"
-         rc=$?
-         if (( rc )); then
-            log_error "Failed to restart $service in container $ctid (exit code: $rc)"
-            log_verbose "$(pct exec "$ctid" -- systemctl status "$service" 2>&1 | tail -5)"
-         fi
-      else
+      if (( DRY_RUN )); then
          printf "  [DRY RUN] Would run: pct exec %s -- systemctl restart %s\n" "$ctid" "$service"
+         printf "  [DRY RUN] Would verify; if stale, escalate to: pct exec %s -- systemctl kill %s && systemctl start %s\n" "$ctid" "$service" "$service"
+         continue
+      fi
+
+      # Step 1: normal restart. This works for services with the default
+      # KillMode=control-group, which kills all processes in the cgroup.
+      cmd=("pct" "exec" "$ctid" "--" "systemctl" "restart" "$service")
+      log_verbose "  Running: ${cmd[*]}"
+      "${cmd[@]}"
+      rc=$?
+      if (( rc )); then
+         log_error "Failed to restart $service in container $ctid (exit code: $rc)"
+         log_verbose "$(pct exec "$ctid" -- systemctl status "$service" 2>&1 | tail -5)"
+         continue
+      fi
+
+      # Step 2: verify the restart actually cleared the stale processes.
+      # systemctl restart respects KillMode; services with KillMode=process
+      # (e.g. cron.service) leave child processes such as daemons spawned by
+      # cron jobs running with outdated libraries, so the reported "restart"
+      # would otherwise look successful while the stale process persists.
+      if ! service_is_stale "$ctid" "$service"; then
+         log_verbose "  Restart cleared stale processes for $service"
+         continue
+      fi
+
+      # Step 3: escalate. systemctl kill sends the signal to ALL processes in
+      # the cgroup regardless of KillMode, then systemctl start brings the main
+      # daemon back up.
+      printf "  -> Restart did not clear all processes (likely KillMode=process); escalating to systemctl kill + start\n"
+      cmd=("pct" "exec" "$ctid" "--" "systemctl" "kill" "$service")
+      log_verbose "  Running: ${cmd[*]}"
+      "${cmd[@]}"
+      sleep 1
+      cmd=("pct" "exec" "$ctid" "--" "systemctl" "start" "$service")
+      log_verbose "  Running: ${cmd[*]}"
+      "${cmd[@]}"
+
+      if ! service_is_stale "$ctid" "$service"; then
+         printf "  -> Cleared via systemctl kill + start\n"
+         continue
+      fi
+
+      # Step 4: SIGTERM was not enough; force kill.
+      printf "  -> Processes survived SIGTERM; forcing SIGKILL\n"
+      cmd=("pct" "exec" "$ctid" "--" "systemctl" "kill" "--signal=SIGKILL" "$service")
+      log_verbose "  Running: ${cmd[*]}"
+      "${cmd[@]}"
+      sleep 1
+      cmd=("pct" "exec" "$ctid" "--" "systemctl" "start" "$service")
+      log_verbose "  Running: ${cmd[*]}"
+      "${cmd[@]}"
+      if service_is_stale "$ctid" "$service"; then
+         log_error "Service $service in container $ctid still has stale processes after kill + start"
+      else
+         printf "  -> Cleared via SIGKILL + start\n"
       fi
    done
 }

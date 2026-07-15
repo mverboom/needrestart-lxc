@@ -15,6 +15,21 @@ This is the same as starting the script with the list (-l, --list) option.
 
 The script can restart the services that need to be restarted. This requires the -r or --restart option.
 
+For regular services the script runs `systemctl restart`. It then verifies that
+the outdated processes are actually gone. Some services use `KillMode=process`
+(e.g. `cron.service` on Debian/Ubuntu), which means `systemctl restart` only
+kills the main daemon and leaves child processes — such as long-running daemons
+spawned by a cron job — alive with outdated libraries. When the script detects
+that stale processes remain after the restart, it automatically escalates to
+`systemctl kill <service>` (which sends the signal to **all** processes in the
+cgroup regardless of `KillMode`) followed by `systemctl start <service>`. If
+processes survive `SIGTERM`, a final `SIGKILL` is sent. Each escalation step is
+reported on stderr/stdout.
+
+Scope units (`*.scope`) are stopped with `systemctl stop` (which terminates
+their processes), and the container's own systemd (`systemd-manager`) is
+re-executed with `systemctl daemon-reexec`.
+
 ### Dry run
 
 To review the commands that would be executed the script can be run in dry run mode with -n or --dry-run.
