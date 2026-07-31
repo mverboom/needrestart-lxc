@@ -38,6 +38,25 @@ readonly BLACKLIST_PATTERNS=(
    "^/usr/bin/apt-get"
 )
 
+# Services that register well-known D-Bus names on the system bus.
+# When dbus.service is restarted, these services lose their connection to
+# the old dbus-daemon but keep running, causing D-Bus activation timeouts
+# (e.g. pam_systemd.so hanging for 25s during SSH login via systemd-logind).
+# They must be restarted after dbus to re-register their D-Bus names.
+readonly DBUS_DEPENDENT_SERVICES=(
+   "systemd-logind.service"
+   "polkit.service"
+   "avahi-daemon.service"
+   "systemd-networkd.service"
+   "systemd-resolved.service"
+   "wpa_supplicant.service"
+   "NetworkManager.service"
+   "rtkit-daemon.service"
+   "colord.service"
+   "accounts-daemon.service"
+   "ModemManager.service"
+)
+
 # Modes of operation
 MODE="list"
 VERBOSE=0
@@ -423,6 +442,37 @@ print_results() {
    done
 }
 
+# Restart services that lost their D-Bus connection after dbus was
+# restarted. Called after a successful dbus.service restart in a container.
+# Only restarts services that are actually running and not already in the
+# stale-library restart list (those will be handled by the main loop).
+restart_dbus_dependents() {
+   local ctid="$1"
+   local ct_name="$2"
+   local dep rc key
+
+   for dep in "${DBUS_DEPENDENT_SERVICES[@]}"; do
+      # Skip if not running in this container
+      pct exec "$ctid" -- systemctl is-active --quiet "$dep" 2>/dev/null || continue
+
+      # Skip if already in the restart list (will be handled by main loop)
+      for key in "${!CONT_SERVICES[@]}"; do
+         [[ "$key" == "${ctid}::${dep}" ]] && continue 2
+      done
+
+      printf "Container %s (%s): restarting D-Bus dependent %s (lost connection after dbus restart)\n" "$ctid" "$ct_name" "$dep"
+      if (( DRY_RUN )); then
+         printf "  [DRY RUN] Would run: pct exec %s -- systemctl restart %s\n" "$ctid" "$dep"
+         continue
+      fi
+      pct exec "$ctid" -- systemctl restart "$dep"
+      rc=$?
+      if (( rc )); then
+         log_error "Failed to restart $dep in container $ctid (exit code: $rc)"
+      fi
+   done
+}
+
 restart_services() {
    local key ctid service ct_name cmd rc user_uid _rest username
 
@@ -567,6 +617,15 @@ restart_services() {
          log_error "Failed to restart $service in container $ctid (exit code: $rc)"
          log_verbose "$(pct exec "$ctid" -- systemctl status "$service" 2>&1 | tail -5)"
          continue
+      fi
+
+      # After restarting dbus.service, restart services that registered
+      # D-Bus names and lost their connection to the old daemon. Without
+      # this, services like systemd-logind keep running but are invisible
+      # on the new D-Bus, causing activation timeouts (e.g. 25s SSH delay
+      # via pam_systemd.so).
+      if [[ "$service" == "dbus.service" ]]; then
+         restart_dbus_dependents "$ctid" "$ct_name"
       fi
 
       # Step 2: verify the restart actually cleared the stale processes.
