@@ -245,7 +245,7 @@ ${path} (inode mismatch)"
 # ------------------------------------------------------------------------------
 
 scan_containers() {
-   local pid cgroup ctid service path_suffix key init_pid
+   local pid cgroup ctid service path_suffix key init_pid user_uid
 
    log_verbose "Scanning container processes for outdated libraries..."
 
@@ -258,6 +258,18 @@ scan_containers() {
 
       # Apply container filter
       [[ -n "$CONTAINER_FILTER" ]] && [[ "$ctid" != "$CONTAINER_FILTER" ]] && continue
+
+      # Detect whether this process lives inside a user session manager
+      # subtree (user@N.service/<slice>/<unit>). Units there are managed by
+      # the user's systemd, not PID 1, so they must be restarted with
+      # `systemctl --user` as the owning user rather than `systemctl restart`
+      # (which would hit the same-named *system* unit and leave the user
+      # session processes untouched). The user manager's own init.scope is
+      # excluded (it requires a further path component after the service).
+      user_uid=""
+      if [[ "$path_suffix" =~ user@([0-9]+)\.service/[^/]+/ ]]; then
+         user_uid="${BASH_REMATCH[1]}"
+      fi
 
       # Extract service name from cgroup path
       # Try patterns in order of specificity (most specific first)
@@ -302,8 +314,11 @@ scan_containers() {
       # Skip excluded services
       is_excluded "$service" && continue
 
-      # Deduplicate: skip if we already checked this container+service
-      key="${ctid}:${service}"
+      # Deduplicate: skip if we already checked this container+service.
+      # The key encodes the owning user UID (empty for system services) so a
+      # system unit and a same-named user session unit (e.g. system
+      # dbus.service vs the session dbus.service) are tracked separately.
+      key="${ctid}:${user_uid}:${service}"
       [[ -n "${CONT_SERVICES[$key]+x}" ]] && continue
 
       # Get init PID for container root filesystem access
@@ -345,13 +360,24 @@ scan_containers() {
 service_is_stale() {
    local ctid="$1"
    local service="$2"
+   local user_uid="$3"
    local pid cgroup
 
    while IFS=' ' read -r pid cgroup; do
       [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]] || continue
       [[ "${BASH_REMATCH[1]}" != "$ctid" ]] && continue
-      [[ "$cgroup" == *"/${service}"* ]] || continue
       [[ -r "/proc/${pid}/maps" ]] || continue
+      if [[ -n "$user_uid" ]]; then
+         # User session unit: only match processes inside this user's
+         # session subtree whose cgroup ends with the unit name.
+         [[ "$cgroup" == *"user@${user_uid}.service/"* ]] || continue
+         [[ "$cgroup" == *"/${service}" ]] || continue
+      else
+         # System unit: match cgroups ending with the unit, but ignore
+         # same-named user session units (different unit, different owner).
+         [[ "$cgroup" == *"/${service}" ]] || continue
+         [[ "$cgroup" == *"user@"* ]] && continue
+      fi
       if check_process_fast "$pid"; then
          return 0
       fi
@@ -360,7 +386,7 @@ service_is_stale() {
 }
 
 print_results() {
-   local key ctid service ct_name libs
+   local key ctid service ct_name libs user_uid _rest svc_display
 
    if (( ${#CONT_SERVICES[@]} == 0 )); then
       printf "No containers have services needing restart.\n"
@@ -375,23 +401,30 @@ print_results() {
 
    for key in "${sorted_keys[@]}"; do
       ctid="${key%%:*}"
-      service="${key#*:}"
+      _rest="${key#*:}"
+      user_uid="${_rest%%:*}"
+      service="${_rest#*:}"
       ct_name="${CT_NAMES[$ctid]:-unknown}"
       libs="${CONT_SERVICES[$key]}"
+      if [[ -n "$user_uid" ]]; then
+         svc_display="$service [user session UID $user_uid]"
+      else
+         svc_display="$service"
+      fi
       if (( VERBOSE )); then
-         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$service"
+         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$svc_display"
          local lib
          while IFS= read -r lib; do
             [[ -n "$lib" ]] && printf "  - %s\n" "$lib"
          done <<< "$libs"
       else
-         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$service"
+         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$svc_display"
       fi
    done
 }
 
 restart_services() {
-   local key ctid service ct_name cmd rc
+   local key ctid service ct_name cmd rc user_uid _rest username
 
    if (( ${#CONT_SERVICES[@]} == 0 )); then
       printf "No containers have services needing restart.\n"
@@ -406,7 +439,9 @@ restart_services() {
 
    for key in "${sorted_keys[@]}"; do
       ctid="${key%%:*}"
-      service="${key#*:}"
+      _rest="${key#*:}"
+      user_uid="${_rest%%:*}"
+      service="${_rest#*:}"
       ct_name="${CT_NAMES[$ctid]:-unknown}"
 
       # systemd-manager can be restarted with daemon-reexec, no container reboot needed
@@ -426,10 +461,23 @@ restart_services() {
 
       # Scope units cannot be restarted with systemctl restart
       if [[ "$service" == *.scope ]]; then
-         printf "Container %s (%s): scope %s has outdated processes (cannot auto-restart, consider restarting user service or terminating scope)\n" "$ctid" "$ct_name" "$service"
+         if [[ -n "$user_uid" ]]; then
+            printf "Container %s (%s): user session scope %s has outdated processes (stopping via systemctl --user stop)\n" "$ctid" "$ct_name" "$service"
+         else
+            printf "Container %s (%s): scope %s has outdated processes (cannot auto-restart, consider restarting user service or terminating scope)\n" "$ctid" "$ct_name" "$service"
+         fi
          if ! (( DRY_RUN )); then
             # Try to stop the scope which terminates its processes
-            cmd=("pct" "exec" "$ctid" "--" "systemctl" "stop" "$service")
+            if [[ -n "$user_uid" ]]; then
+               username=$(pct exec "$ctid" -- getent passwd "$user_uid" 2>/dev/null | cut -d: -f1)
+               if [[ -z "$username" ]]; then
+                  log_error "Could not resolve username for UID $user_uid in container $ctid; skipping $service"
+                  continue
+               fi
+               cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "stop" "$service")
+            else
+               cmd=("pct" "exec" "$ctid" "--" "systemctl" "stop" "$service")
+            fi
             log_verbose "  Stopping scope: ${cmd[*]}"
             "${cmd[@]}"
             rc=$?
@@ -437,7 +485,67 @@ restart_services() {
                log_error "Failed to stop scope $service in container $ctid (exit code: $rc)"
             fi
          else
-            printf "  [DRY RUN] Would run: pct exec %s -- systemctl stop %s\n" "$ctid" "$service"
+            if [[ -n "$user_uid" ]]; then
+               printf "  [DRY RUN] Would run: pct exec %s -- runuser -u <user> -- env XDG_RUNTIME_DIR=/run/user/%s systemctl --user stop %s\n" "$ctid" "$user_uid" "$service"
+            else
+               printf "  [DRY RUN] Would run: pct exec %s -- systemctl stop %s\n" "$ctid" "$service"
+            fi
+         fi
+         continue
+      fi
+
+      # User session service (a unit managed by the user's systemd, under
+      # user@N.service): restart via `systemctl --user` as the owning user.
+      # Restarting the same-named system unit (the old behaviour) does not
+      # touch these processes, so they were left stale after `-r`.
+      if [[ -n "$user_uid" ]]; then
+         printf "Container %s (%s): restarting user session service %s (UID %s)\n" "$ctid" "$ct_name" "$service" "$user_uid"
+         if (( DRY_RUN )); then
+            printf "  [DRY RUN] Would run: pct exec %s -- runuser -u <user> -- env XDG_RUNTIME_DIR=/run/user/%s systemctl --user restart %s\n" "$ctid" "$user_uid" "$service"
+            printf "  [DRY RUN] Would verify; if stale, escalate to: systemctl --user kill %s && systemctl --user start %s\n" "$service" "$service"
+            continue
+         fi
+         username=$(pct exec "$ctid" -- getent passwd "$user_uid" 2>/dev/null | cut -d: -f1)
+         if [[ -z "$username" ]]; then
+            log_error "Could not resolve username for UID $user_uid in container $ctid; skipping $service"
+            continue
+         fi
+         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "restart" "$service")
+         log_verbose "  Running: ${cmd[*]}"
+         "${cmd[@]}"
+         rc=$?
+         if (( rc )); then
+            log_error "Failed to restart user service $service in container $ctid (exit code: $rc)"
+            continue
+         fi
+         if ! service_is_stale "$ctid" "$service" "$user_uid"; then
+            log_verbose "  Restart cleared stale processes for user service $service"
+            continue
+         fi
+         printf "  -> Restart did not clear all processes (likely KillMode=process); escalating to systemctl --user kill + start\n"
+         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "kill" "$service")
+         log_verbose "  Running: ${cmd[*]}"
+         "${cmd[@]}"
+         sleep 1
+         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "start" "$service")
+         log_verbose "  Running: ${cmd[*]}"
+         "${cmd[@]}"
+         if ! service_is_stale "$ctid" "$service" "$user_uid"; then
+            printf "  -> Cleared via systemctl --user kill + start\n"
+            continue
+         fi
+         printf "  -> Processes survived SIGTERM; forcing SIGKILL\n"
+         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "kill" "--signal=SIGKILL" "$service")
+         log_verbose "  Running: ${cmd[*]}"
+         "${cmd[@]}"
+         sleep 1
+         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "start" "$service")
+         log_verbose "  Running: ${cmd[*]}"
+         "${cmd[@]}"
+         if service_is_stale "$ctid" "$service" "$user_uid"; then
+            log_error "User service $service in container $ctid still has stale processes after kill + start"
+         else
+            printf "  -> Cleared via SIGKILL + start\n"
          fi
          continue
       fi
@@ -466,7 +574,7 @@ restart_services() {
       # (e.g. cron.service) leave child processes such as daemons spawned by
       # cron jobs running with outdated libraries, so the reported "restart"
       # would otherwise look successful while the stale process persists.
-      if ! service_is_stale "$ctid" "$service"; then
+      if ! service_is_stale "$ctid" "$service" ""; then
          log_verbose "  Restart cleared stale processes for $service"
          continue
       fi
@@ -483,7 +591,7 @@ restart_services() {
       log_verbose "  Running: ${cmd[*]}"
       "${cmd[@]}"
 
-      if ! service_is_stale "$ctid" "$service"; then
+      if ! service_is_stale "$ctid" "$service" ""; then
          printf "  -> Cleared via systemctl kill + start\n"
          continue
       fi
@@ -497,7 +605,7 @@ restart_services() {
       cmd=("pct" "exec" "$ctid" "--" "systemctl" "start" "$service")
       log_verbose "  Running: ${cmd[*]}"
       "${cmd[@]}"
-      if service_is_stale "$ctid" "$service"; then
+      if service_is_stale "$ctid" "$service" ""; then
          log_error "Service $service in container $ctid still has stale processes after kill + start"
       else
          printf "  -> Cleared via SIGKILL + start\n"

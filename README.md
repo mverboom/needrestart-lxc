@@ -69,11 +69,25 @@ The script detects outdated processes in user session cgroups (e.g., `user@N.ser
 reports them as services needing restart. This covers cases where `needrestart` would flag an
 entire container for reboot because of outdated libraries in user session processes.
 
+Services that live *inside* a user session manager subtree (units under
+`user@N.service/`, such as the session `dbus.service`, `pipewire.service`,
+or `wireplumber.service`) are managed by the user's own systemd instance,
+not PID 1. They are restarted granularly with `systemctl --user` invoked as
+the owning user (`runuser -u <user> -- env XDG_RUNTIME_DIR=/run/user/<uid>
+systemctl --user restart <unit>`). Restarting the *system* unit of the same
+name (the previous behaviour) did not touch these processes, so they were
+left stale after `-r`. The owning user is resolved inside the container from
+the UID found in the cgroup path. As with system services, the script verifies
+that the stale processes are actually gone and escalates to `systemctl --user
+kill` (+ start) and finally `SIGKILL` if needed.
+
 For login session scopes and other scope units that cannot be restarted with `systemctl restart`,
 the script identifies them as scope units and stops them with `systemctl stop`, which
-terminates their processes. This is necessary because session scopes (e.g., `session-c2.scope`)
-are siblings of `user@N.service` in the cgroup hierarchy — restarting `user@N.service`
-does not kill processes in session scopes.
+terminates their processes. Session scopes (e.g., `session-c2.scope`) are siblings of
+`user@N.service` in the cgroup hierarchy and are stopped at the system level; user-session
+scopes (under `user@N.service/`) are stopped with `systemctl --user stop`. This is necessary
+because session scopes are siblings of `user@N.service` in the cgroup hierarchy — restarting
+`user@N.service` does not kill processes in session scopes.
 
 ### Deep scan
 
