@@ -12,6 +12,11 @@
 # containers. It is a standalone tool that complements the host-side
 # needrestart by providing per-service granularity for LXC containers.
 
+# Ensure core tools (pct, ps, date, ...) are found even when the script is
+# run from a minimal environment such as cron (PATH=/usr/bin:/bin), where
+# /usr/sbin (pct) is missing and container names would silently be lost.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 readonly PROGNAME="needrestart-lxc"
 
 # Global configuration

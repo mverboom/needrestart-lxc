@@ -1,0 +1,4 @@
+# Optional: allow the zabbix user to run the scan manually for debugging.
+# Not required for the Zabbix agent check (the agent reads the JSON file that
+# cron generates).
+zabbix ALL=(root) NOPASSWD:/usr/local/bin/needrestart-lxc

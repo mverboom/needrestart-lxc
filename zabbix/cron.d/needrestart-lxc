@@ -1,0 +1,6 @@
+# needrestart-lxc: pre-generate the Zabbix JSON so the agent check stays fast.
+# The full scan (including the CVE analysis) takes several seconds and would
+# exceed the Zabbix server Timeout if run synchronously by the agent.
+#
+# The Zabbix master item polls every hour; this cron keeps the file fresh.
+*/15 * * * * root /usr/local/bin/needrestart-lxc --zabbix > /var/cache/needrestart-lxc/zabbix.json
