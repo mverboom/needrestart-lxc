@@ -94,6 +94,62 @@ because session scopes are siblings of `user@N.service` in the cgroup hierarchy 
 The deep scan takes longer and checks all open files for a container for changed inodes. This can be invoked
 by -d or --deep.
 
+### Security scan (CVE analysis)
+
+The security scan (`-s` or `--security`) goes one step further: for every stale library it determines the
+owning dpkg package, the version the stale process is actually running, and whether the pending update is
+a security fix — including how many CVEs it addresses.
+
+With `-s` alone the output stays on a single line and appends the total CVE count:
+
+```
+needrestart-lxc -c 100 -s
+Container 100 (gw.cnw.verboom.net): service unbound.service needs restart (1 CVE)
+```
+
+With `-s -v` the per-package details are shown below the service line:
+
+```
+needrestart-lxc -c 100 -s -v
+Container 100 (gw.cnw.verboom.net): service unbound.service needs restart
+  - /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+  [security] libssl3 3.0.11-1~deb12u1 -> 3.0.11-1~deb12u2: SECURITY update, fixes 1 CVE (CVE-2023-5363) [OSV]
+```
+
+How it works:
+
+1. **Package mapping** — each stale library path is resolved against the container's dpkg file-list
+database (`/var/lib/dpkg/info/*.list`), which works even though the file on disk was deleted/replaced.
+2. **Old version** — the version the stale process is running is derived from the container's `dpkg.log`
+upgrade/install timestamps matched against the process start time (`/proc/<pid>` on the host). This
+is more accurate than assuming "last upgrade": a long-running daemon can be several versions behind.
+`/var/log/apt/history.log` is used as a fallback when `dpkg.log` is unavailable.
+3. **CVE lookup** — the version delta is checked against security data, queried online and cached for
+24h in `/var/cache/needrestart-lxc`:
+   - **Debian**: the [OSV](https://osv.dev) API (per-package query by version, filtered to the
+     container's Debian release).
+   - **Ubuntu**: the [Ubuntu Security API](https://ubuntu.com/security/api/docs) (`cves.json` per
+     source package, filtered by release codename and `released` status; includes CVSS scores).
+   - **Fallback (offline)**: the package's `changelog.Debian.gz` inside the container is parsed for
+     CVE references between the old and new versions. Security uploads are detected by the
+     `-security`/`-updates` suite marker in the changelog entry headers.
+4. **Output** — with `-s` alone each service line gets a `(N CVEs)` suffix (the total across all
+packages of that service); with `-s -v` the per-package verdicts are printed below the line. The same
+applies in `-r`/`-n` (restart/dry-run) mode, right before the restart.
+
+Caveats:
+
+- Only dpkg-based containers (Debian/Ubuntu) are analyzed; other distros are reported and skipped.
+- Online lookups require outbound HTTPS from the Proxmox host and `curl` + `python3`; the Ubuntu API
+  is rate-limited, so the script paces requests and retries on HTTP 429. Everything is cached for 24h.
+- The old version can only be determined if the relevant `dpkg.log`/`apt history.log` entries are still
+  retained (log rotation). Otherwise the latest changelog entry is reported with an
+  "old version unknown" note.
+- Log timestamps are interpreted with the container's timezone (`/etc/timezone`) — containers that
+  override the host timezone may yield an imprecise old version.
+- The CVE count is per package, not per service: restarting one service may fix CVEs that also matter
+  for other services, so treat the number as "what this update fixes", not "what this restart fixes".
+
 ### Verbose
 
 Using verbose mode with -v or --verbose will provide more information about the specific libraries.
@@ -126,4 +182,26 @@ Container 100 (gw.cnw.verboom.net): service systemd-manager needs restart
 Container 100 (gw.cnw.verboom.net): service unattended-upgrades.service needs restart
   - /usr/lib/x86_64-linux-gnu/libcrypto.so.3
   - /usr/lib/x86_64-linux-gnu/libssl.so.3
+```
+
+### Zabbix integration
+
+The script can feed Zabbix with per-container restart and CVE alerts. The
+`--zabbix` mode emits a single JSON document (one entry per running container)
+that a Zabbix template turns into per-container items and triggers:
+
+- **WARNING** when a container has services needing restart (no known CVEs)
+- **HIGH** when the pending updates fix CVEs
+
+The problem reads `container: N services need restart` with the CVE count as
+operational data; exactly one problem is open per container at a time.
+
+The scan runs via cron so the agent check stays fast; see
+[`zabbix/README.md`](zabbix/README.md) for the full installation guide,
+the template and the config snippets. Requires Zabbix 7.0 or newer.
+
+```
+needrestart-lxc --zabbix
+{"containers": [{"ctid": "124", "name": "test.lnw.verboom.net",
+  "services": 6, "cves": 15, "details": "..."}, ...]}
 ```

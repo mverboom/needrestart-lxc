@@ -62,13 +62,29 @@ MODE="list"
 VERBOSE=0
 DEEP=0
 DRY_RUN=0
+SECURITY=0
+ZABBIX=0
 CONTAINER_FILTER=""
 EXCLUDE_PATTERNS=()
+
+# Security scan configuration (CVE analysis)
+CACHE_TTL=86400                      # seconds to keep cached API responses
+CACHE_DIR="/var/cache/needrestart-lxc"
+WORKDIR=""                          # per-run temp dir (security mode only)
 
 # Collected data structures
 declare -A CT_NAMES      # CTID -> container name
 declare -A CT_PIDS      # CTID -> init PID
 declare -A CONT_SERVICES # "CTID:service" -> "deleted_lib1,deleted_lib2"
+declare -A CONT_PID       # "CTID:service" -> PID of first stale process
+declare -A CONT_CVES      # "CTID:service" -> security analysis lines (security)
+declare -A CONT_CVE_COUNTS # "CTID:service" -> total CVEs fixed (security)
+declare -A CONT_UPDATE_COUNTS # "CTID|srcpkg|old|new" -> CVEs fixed by this update
+declare -A CT_OS_ID       # CTID -> os id from os-release (debian/ubuntu/...)
+declare -A CT_OS_RELEASE  # CTID -> VERSION_ID (e.g. 12, 22.04)
+declare -A CT_OS_CODENAME # CTID -> VERSION_CODENAME (e.g. bookworm, jammy)
+declare -A EXT_VERDICTS   # "CTID|srcpkg|old|new" -> cached verdict line
+declare -A CT_NOTES       # CTID -> reason why analysis was skipped
 
 # ------------------------------------------------------------------------------
 # Utility functions
@@ -89,7 +105,13 @@ Options:
   -c, --container ID  Only check a specific container (by CTID)
   -e, --exclude PAT   Exclude services matching regex (can be repeated)
   -d, --deep          Also check for inode mismatches (slower but thorough)
-  -v, --verbose       Show verbose output including affected libraries
+  -s, --security      Security analysis: report whether pending updates are
+                      security fixes and how many CVEs they address (online
+                      lookup with in-container changelog fallback)
+  --zabbix            Machine-readable output for Zabbix: a single JSON
+                      document with per-container restart/CVE data (implies -s)
+  -v, --verbose       Show verbose output: affected libraries and, with -s,
+                      the per-package security details
   -h, --help          Show this help message
 
 Examples:
@@ -99,6 +121,7 @@ Examples:
   $PROGNAME -n -r               # Show what would be restarted (dry run)
   $PROGNAME -c 100              # Only check container 100
   $PROGNAME -d                   # Deep scan including inode comparison
+  $PROGNAME -s                   # Security scan with CVE analysis
   $PROGNAME -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
 EOF
 }
@@ -109,6 +132,17 @@ log_verbose() {
 
 log_error() {
    printf "ERROR: %s\n" "$*" >&2
+}
+
+# Sort the keys of an associative array (by name) into stdout, one per line.
+# Unlike "printf '%s\n' ${!arr[@]}" this emits nothing for empty arrays,
+# which would otherwise produce a bogus empty key.
+sorted_keys_of() {
+   local -n ref="$1"
+   local key
+   for key in "${!ref[@]}"; do
+      printf '%s\n' "$key"
+   done | sort ${2:+"$2"}
 }
 
 # Check if a library path should be blacklisted
@@ -362,6 +396,7 @@ scan_containers() {
 
       if [[ -n "$FOUND_LIBS" ]]; then
          CONT_SERVICES["$key"]="$FOUND_LIBS"
+         [[ -n "${CONT_PID[$key]+x}" ]] || CONT_PID["$key"]="$pid"
          log_verbose "  -> Service $service in CT $ctid needs restart"
       fi
    done < <(ps -eo pid,cgroup 2>/dev/null)
@@ -430,14 +465,16 @@ print_results() {
       else
          svc_display="$service"
       fi
+      printf "Container %s (%s): service %s needs restart" "$ctid" "$ct_name" "$svc_display"
+      print_security_annotation "$key"
       if (( VERBOSE )); then
-         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$svc_display"
          local lib
          while IFS= read -r lib; do
             [[ -n "$lib" ]] && printf "  - %s\n" "$lib"
          done <<< "$libs"
-      else
-         printf "Container %s (%s): service %s needs restart\n" "$ctid" "$ct_name" "$svc_display"
+      fi
+      if (( SECURITY )) && (( VERBOSE )); then
+         print_security_info "$key"
       fi
    done
 }
@@ -496,7 +533,11 @@ restart_services() {
 
       # systemd-manager can be restarted with daemon-reexec, no container reboot needed
       if [[ "$service" == "systemd-manager" ]]; then
-         printf "Container %s (%s): systemd needs reexec (systemctl daemon-reexec)\n" "$ctid" "$ct_name"
+         printf "Container %s (%s): systemd needs reexec (systemctl daemon-reexec)" "$ctid" "$ct_name"
+         print_security_annotation "$key"
+         if (( SECURITY )) && (( VERBOSE )); then
+            print_security_info "$key"
+         fi
          if ! (( DRY_RUN )); then
             pct exec "$ctid" -- systemctl daemon-reexec
             rc=$?
@@ -512,9 +553,13 @@ restart_services() {
       # Scope units cannot be restarted with systemctl restart
       if [[ "$service" == *.scope ]]; then
          if [[ -n "$user_uid" ]]; then
-            printf "Container %s (%s): user session scope %s has outdated processes (stopping via systemctl --user stop)\n" "$ctid" "$ct_name" "$service"
+            printf "Container %s (%s): user session scope %s has outdated processes (stopping via systemctl --user stop)" "$ctid" "$ct_name" "$service"
          else
-            printf "Container %s (%s): scope %s has outdated processes (cannot auto-restart, consider restarting user service or terminating scope)\n" "$ctid" "$ct_name" "$service"
+            printf "Container %s (%s): scope %s has outdated processes (cannot auto-restart, consider restarting user service or terminating scope)" "$ctid" "$ct_name" "$service"
+         fi
+         print_security_annotation "$key"
+         if (( SECURITY )) && (( VERBOSE )); then
+            print_security_info "$key"
          fi
          if ! (( DRY_RUN )); then
             # Try to stop the scope which terminates its processes
@@ -549,7 +594,11 @@ restart_services() {
       # Restarting the same-named system unit (the old behaviour) does not
       # touch these processes, so they were left stale after `-r`.
       if [[ -n "$user_uid" ]]; then
-         printf "Container %s (%s): restarting user session service %s (UID %s)\n" "$ctid" "$ct_name" "$service" "$user_uid"
+         printf "Container %s (%s): restarting user session service %s (UID %s)" "$ctid" "$ct_name" "$service" "$user_uid"
+         print_security_annotation "$key"
+         if (( SECURITY )) && (( VERBOSE )); then
+            print_security_info "$key"
+         fi
          if (( DRY_RUN )); then
             printf "  [DRY RUN] Would run: pct exec %s -- runuser -u <user> -- env XDG_RUNTIME_DIR=/run/user/%s systemctl --user restart %s\n" "$ctid" "$user_uid" "$service"
             printf "  [DRY RUN] Would verify; if stale, escalate to: systemctl --user kill %s && systemctl --user start %s\n" "$service" "$service"
@@ -600,7 +649,11 @@ restart_services() {
          continue
       fi
 
-      printf "Container %s (%s): restarting service %s\n" "$ctid" "$ct_name" "$service"
+      printf "Container %s (%s): restarting service %s" "$ctid" "$ct_name" "$service"
+      print_security_annotation "$key"
+      if (( SECURITY )) && (( VERBOSE )); then
+         print_security_info "$key"
+      fi
       if (( DRY_RUN )); then
          printf "  [DRY RUN] Would run: pct exec %s -- systemctl restart %s\n" "$ctid" "$service"
          printf "  [DRY RUN] Would verify; if stale, escalate to: pct exec %s -- systemctl kill %s && systemctl start %s\n" "$ctid" "$service" "$service"
@@ -673,6 +726,765 @@ restart_services() {
 }
 
 # ------------------------------------------------------------------------------
+# Security scan: CVE analysis (-s, --security)
+#
+# Maps each stale library to its owning dpkg package, determines the version the
+# stale process is running (dpkg.log timestamps vs process start time), and
+# reports whether the pending update is a security fix and how many CVEs it
+# addresses. Online data is queried first (OSV for Debian, Ubuntu Security API
+# for Ubuntu) and cached in $CACHE_DIR; if the network is unavailable or the
+# package is not tracked, the package's changelog inside the container is used
+# as an offline fallback. All container data is read via /proc/<init>/root, so
+# no pct exec round-trips are needed.
+# ------------------------------------------------------------------------------
+
+# Return the host-side path to a container's root filesystem
+ct_root() {
+   printf '/proc/%s/root' "${CT_PIDS[$1]}"
+}
+
+# Read /etc/os-release of a container into the CT_OS_* maps
+load_ct_os() {
+   local ctid="$1" root="$2" key val
+   [[ -f "$root/etc/os-release" ]] || return 1
+   while IFS='=' read -r key val; do
+      [[ -z "$key" ]] && continue
+      val="${val//\"/}"
+      case "$key" in
+         ID) CT_OS_ID["$ctid"]="$val" ;;
+         VERSION_ID) CT_OS_RELEASE["$ctid"]="$val" ;;
+         VERSION_CODENAME) CT_OS_CODENAME["$ctid"]="$val" ;;
+      esac
+   done < "$root/etc/os-release"
+   [[ -n "${CT_OS_ID[$ctid]+x}" ]]
+}
+
+# Parse a container's dpkg status into "pkg<TAB>version<TAB>source" lines,
+# cached per container in $WORKDIR. Returns 1 if there is no dpkg database.
+parse_dpkg_status() {
+   local ctid="$1" root="$2"
+   local out="$WORKDIR/status-$ctid.tsv"
+   [[ -f "$out" ]] && return 0
+   [[ -f "$root/var/lib/dpkg/status" ]] || return 1
+   awk -F': ' '
+      $1 == "Package" { pkg = $2; sub(/^ +/, "", pkg) }
+      $1 == "Version" { ver = $2; sub(/^ +/, "", ver) }
+      $1 == "Source"  { src = $2; sub(/^ +/, "", src); sub(/ .*/, "", src) }
+      $1 == "Status"  { st = $2 }
+      /^$/ {
+         if (pkg != "" && st ~ /^install/) print pkg "\t" ver "\t" src
+         pkg = ""; ver = ""; src = ""; st = ""
+      }
+   ' "$root/var/lib/dpkg/status" > "$out" 2>/dev/null || return 1
+   return 0
+}
+
+# Print "version<TAB>source" for a binary package from the parsed status file
+status_lookup() {
+   local ctid="$1" binpkg="$2"
+   awk -F '\t' -v pkg="$binpkg" '$1 == pkg { print $2 "\t" $3; exit }' \
+      "$WORKDIR/status-$ctid.tsv" 2>/dev/null
+}
+
+# List binary packages owning a file path (dpkg file-list database lookup;
+# works even when the file was deleted or replaced)
+pkgs_for_path() {
+   local root="$1" path="$2" list_file binpkg
+   [[ "$path" =~ ^/[A-Za-z0-9._+~/-]+$ ]] || return 0
+   for list_file in "$root"/var/lib/dpkg/info/*.list; do
+      [[ -f "$list_file" ]] || continue
+      grep -qxF "$path" "$list_file" 2>/dev/null || continue
+      binpkg="$(basename "$list_file")"
+      binpkg="${binpkg%.list}"
+      binpkg="${binpkg%%:*}"
+      printf '%s\n' "$binpkg"
+   done | sort -u
+}
+
+# Debian-style version comparison; echoes -1, 0 or 1 (dpkg semantics)
+ver_cmp() {
+   local a="$1" b="$2"
+   if dpkg --compare-versions "$a" eq "$b" 2>/dev/null; then
+      printf '0'
+   elif dpkg --compare-versions "$a" gt "$b" 2>/dev/null; then
+      printf '1'
+   else
+      printf -- '-1'
+   fi
+}
+
+# Determine the package version in effect when a process started, by matching
+# dpkg.log upgrade/install timestamps against the process start time (epoch).
+version_at_start() {
+   local root="$1" binpkg="$2" start_epoch="$3"
+   local f all="" filtered line ts version best_ts=0 best="" tz
+   for f in "$root"/var/log/dpkg.log*; do
+      [[ -f "$f" ]] || continue
+      if [[ "$f" == *.gz ]]; then
+         all+="$(zcat "$f" 2>/dev/null)"$'\n'
+      else
+         all+="$(cat "$f" 2>/dev/null)"$'\n'
+      fi
+   done
+   [[ -n "$all" ]] || return 0
+   filtered="$(awk -v pkg="$binpkg" '
+      $3 == "upgrade" || $3 == "install" {
+         p = $4; sub(/:.*/, "", p)
+         if (p == pkg) {
+            v = ($3 == "upgrade") ? $6 : $5
+            if (v != "") print $1 " " $2 " " v
+         }
+      }' <<<"$all")"
+   tz="$(tr -d ' \n' < "$root/etc/timezone" 2>/dev/null)"
+   while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      ts="$(TZ="$tz" date -d "${line:0:19}" +%s 2>/dev/null)" || continue
+      (( ts <= start_epoch )) || continue
+      (( ts < best_ts )) && continue
+      best="${line:20}"
+      best_ts="$ts"
+   done <<<"$filtered"
+   printf '%s' "$best"
+}
+
+# Fallback old-version lookup using /var/log/apt/history.log blocks
+version_at_start_apt() {
+   local root="$1" binpkg="$2" start_epoch="$3"
+   local f all="" line block_ts="" entry new_ver best_ts=0 best="" tz
+   for f in "$root"/var/log/apt/history.log*; do
+      [[ -f "$f" ]] || continue
+      if [[ "$f" == *.gz ]]; then
+         all+="$(zcat "$f" 2>/dev/null)"$'\n'
+      else
+         all+="$(cat "$f" 2>/dev/null)"$'\n'
+      fi
+   done
+   [[ -n "$all" ]] || return 0
+   tz="$(tr -d ' \n' < "$root/etc/timezone" 2>/dev/null)"
+   while IFS= read -r line; do
+      if [[ "$line" == Start-Date:* ]]; then
+         block_ts="$(TZ="$tz" date -d "${line#Start-Date: }" +%s 2>/dev/null)"
+         continue
+      fi
+      [[ -n "$block_ts" ]] || continue
+      [[ "$line" == Upgrade:* ]] || continue
+      (( block_ts > start_epoch )) && continue
+      (( block_ts < best_ts )) && continue
+      entry="$(grep -oE "${binpkg}(:[A-Za-z0-9]+)? \([^)]*\)" <<<"$line" | head -1)"
+      [[ -n "$entry" ]] || continue
+      new_ver="$(sed -E 's/^.*\([^,]+, *([^)]*)\).*$/\1/' <<<"$entry")"
+      [[ -n "$new_ver" ]] || continue
+      best="$new_ver"
+      best_ts="$block_ts"
+   done <<<"$all"
+   printf '%s' "$best"
+}
+
+# Print changelog entries as ENTRY markers plus verbatim body lines, so the
+# caller can reconstruct each entry's version, suite and body text
+parse_changelog() {
+   local file="$1"
+   if [[ "$file" == *.gz ]]; then
+      zcat "$file" 2>/dev/null
+   else
+      cat "$file" 2>/dev/null
+   fi | awk '
+      /^[A-Za-z0-9.+~_-]+ \([^)]+\) [^;]+; urgency=/ {
+         line = $0
+         version = line; sub(/^[^ ]+ \(/, "", version); sub(/\)[^)]*/, "", version)
+         suite = line; sub(/^[^ ]+ \([^)]+\) /, "", suite); sub(/;.*/, "", suite)
+         print "ENTRY\t" version "\t" suite
+         next
+      }
+      /^ -- / { next }
+      { print }
+   '
+}
+
+# Offline verdict from the package changelog: counts CVE references in the
+# changelog entries between old and new versions. If old is empty, only the
+# newest entry is considered (old version could not be determined).
+changelog_verdict() {
+   local root="$1" binpkg="$2" srcpkg="$3" old="$4" new="$5"
+   local docpkg file line version suite tmpcve
+   local -a cves=()
+   local sec_count=0 want_entry=0 top_entry=0 n shown=0 list="" sep="" id
+
+   for docpkg in "$binpkg" "$srcpkg"; do
+      for file in \
+         "$root/usr/share/doc/$docpkg/changelog.Debian.gz" \
+         "$root/usr/share/doc/$docpkg/changelog.Debian" \
+         "$root/usr/share/doc/$docpkg/changelog.gz" \
+         "$root/usr/share/doc/$docpkg/changelog"; do
+         [[ -f "$file" ]] && break 2
+      done
+   done
+   [[ -f "$file" ]] || return 1
+
+   tmpcve="$(mktemp "$WORKDIR/changelog-cves.XXXXXX")"
+   while IFS= read -r line; do
+      if [[ "$line" == ENTRY* ]]; then
+         if (( top_entry )); then
+            break
+         fi
+         IFS=$'\t' read -r _ version suite <<<"$line"
+         want_entry=0
+         if [[ -n "$old" ]]; then
+            [[ "$(ver_cmp "$version" "$old")" -gt 0 && "$(ver_cmp "$version" "$new")" -le 0 ]] && want_entry=1
+         else
+            want_entry=1
+            top_entry=1
+         fi
+         if (( want_entry )) && [[ "$suite" == *-security* || "$suite" == *-updates* ]]; then
+            sec_count=$((sec_count + 1))
+         fi
+      elif (( want_entry )); then
+         grep -oE 'CVE-[0-9]{4}-[0-9]+' <<<"$line" >> "$tmpcve" 2>/dev/null
+      fi
+   done < <(parse_changelog "$file")
+   mapfile -t cves < <(sort -u "$tmpcve" 2>/dev/null)
+   rm -f "$tmpcve"
+
+   n="${#cves[@]}"
+   for id in "${cves[@]}"; do
+      if (( shown < 6 )); then
+         list+="$sep$id"
+         sep=", "
+      fi
+      ((shown++))
+   done
+   (( shown > 6 )) && list+=", and $((shown - 6)) more"
+
+   local plural="s" secpart=""
+   (( n == 1 )) && plural=""
+   (( sec_count > 0 )) && secpart=", security upload"
+   if [[ -n "$old" ]]; then
+      if (( n > 0 )); then
+         printf '%d\t%s %s -> %s: fixes %d CVE%s (%s)%s [changelog]' \
+            "$n" "$binpkg" "$old" "$new" "$n" "$plural" "$list" "$secpart"
+      else
+         printf '%d\t%s %s -> %s: no CVEs listed in changelog for this update [changelog]' \
+            "$n" "$binpkg" "$old" "$new"
+      fi
+   else
+      if (( n > 0 )); then
+         printf '%d\t%s -> %s (old version unknown): latest changelog entry lists %d CVE%s (%s)%s [changelog]' \
+            "$n" "$binpkg" "$new" "$n" "$plural" "$list" "$secpart"
+      else
+         printf '%d\t%s -> %s (old version unknown): latest changelog entry lists no CVEs [changelog]' \
+            "$n" "$binpkg" "$new"
+      fi
+   fi
+}
+
+# Strip descriptive suffixes from library paths found in /proc/*/maps
+clean_lib_path() {
+   local p="$1"
+   p="${p% (executable)}"
+   p="${p% (inode mismatch)}"
+   p="${p% (deleted)}"
+   printf '%s' "$p"
+}
+
+# Query (cached) the OSV API for a Debian package version; emits
+# "CVE-ID<TAB>fixed-version" lines. Returns 1 on network failure.
+osv_collect() {
+   local srcpkg="$1" version="$2" release="$3" cache_name
+   version="$(sed -E 's/\+b[0-9]+$//' <<<"$version")"
+   cache_name="$(printf '%s' "$release-$srcpkg-$version" | tr -c 'A-Za-z0-9._-' '_')"
+   CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/osv_filter.py" \
+      "$srcpkg" "$version" "$release" "$CACHE_DIR/osv-$cache_name.json" 2>/dev/null
+}
+
+# Query (cached) the Ubuntu Security API for all CVEs of a source package;
+# emits "CVE-ID<TAB>fixed-version<TAB>cvss3" lines for one release codename
+# with status "released". Returns 1 on network failure.
+ubuntu_collect() {
+   local srcpkg="$1" codename="$2" cache_name
+   cache_name="$(printf '%s' "ubuntu-$srcpkg" | tr -c 'A-Za-z0-9._-' '_')"
+   CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/ubuntu_cves.py" \
+      "$srcpkg" "$codename" "$CACHE_DIR/$cache_name.json" 2>/dev/null
+}
+
+# Produce the security verdict for one source package update; results are
+# cached in EXT_VERDICTS so shared libraries in the same container are only
+# analyzed once
+security_analysis() {
+   local ctid="$1" srcpkg="$2" binpkg="$3" old="$4" new="$5"
+   local verdict_key="$ctid|$srcpkg|$old|$new"
+   local root verdict result line cve_id fixed cvss3 _
+   local -a cves=() cvss_list=()
+   local -A seen_cves=()
+   local count=0 online_ok=0 src_label=""
+
+   if [[ -n "${EXT_VERDICTS[$verdict_key]+x}" ]]; then
+      printf '%s' "${EXT_VERDICTS[$verdict_key]}"
+      return 0
+   fi
+
+   root="$(ct_root "$ctid")"
+
+   if [[ -z "$old" ]]; then
+      # Old version unknown: report the latest changelog entry only
+      result="$(changelog_verdict "$root" "$binpkg" "$srcpkg" "" "$new")"
+      if [[ -n "$result" ]]; then
+         count="${result%%$'\t'*}"
+         verdict="${result#*$'\t'}"
+      else
+         verdict="$binpkg -> $new (old version unknown): no changelog available"
+      fi
+   elif [[ "$(ver_cmp "$old" "$new")" -ge 0 ]]; then
+      verdict="$binpkg $old -> $new: no version change since process start"
+   else
+      if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+         case "${CT_OS_ID[$ctid]}" in
+            debian)
+               if [[ -n "${CT_OS_RELEASE[$ctid]}" ]] && \
+                  osv_collect "$srcpkg" "$old" "Debian:${CT_OS_RELEASE[$ctid]}" \
+                     > "$WORKDIR/online.out" 2>/dev/null; then
+                  online_ok=1
+                  src_label="OSV"
+               fi
+               ;;
+            ubuntu)
+               if [[ -n "${CT_OS_CODENAME[$ctid]}" ]] && \
+                  ubuntu_collect "$srcpkg" "${CT_OS_CODENAME[$ctid]}" \
+                     > "$WORKDIR/online.out" 2>/dev/null; then
+                  online_ok=1
+                  src_label="Ubuntu Security API"
+               fi
+               ;;
+         esac
+      fi
+
+      if (( online_ok )); then
+         while IFS=$'\t' read -r cve_id fixed cvss3 _; do
+            [[ -n "$cve_id" && -n "$fixed" ]] || continue
+            [[ "$(ver_cmp "$old" "$fixed")" -lt 0 && "$(ver_cmp "$fixed" "$new")" -le 0 ]] || continue
+            [[ -n "${seen_cves[$cve_id]+x}" ]] && continue
+            seen_cves["$cve_id"]=1
+            count=$((count + 1))
+            cves+=("$cve_id")
+            [[ -n "$cvss3" ]] && cvss_list+=("$cvss3")
+         done < "$WORKDIR/online.out"
+         if (( count > 0 )); then
+            local list="" sep="" cvss="" id shown=0 plural="s"
+            for id in "${cves[@]}"; do
+               if (( shown < 6 )); then
+                  list+="$sep$id"
+                  sep=", "
+               fi
+               ((shown++))
+            done
+            (( shown > 6 )) && list+=", and $((shown - 6)) more"
+            (( count == 1 )) && plural=""
+            if (( ${#cvss_list[@]} > 0 )); then
+               cvss=", CVSS $(printf '%s\n' "${cvss_list[@]}" | paste -sd, -)"
+            fi
+            verdict="$binpkg $old -> $new: SECURITY update, fixes $count CVE$plural ($list$cvss) [$src_label]"
+         else
+            verdict="$binpkg $old -> $new: no security-relevant CVEs found [$src_label]"
+         fi
+      else
+         # Online lookup unavailable or failed: use the in-container changelog
+         result="$(changelog_verdict "$root" "$binpkg" "$srcpkg" "$old" "$new")"
+         if [[ -n "$result" ]]; then
+            count="${result%%$'\t'*}"
+            verdict="${result#*$'\t'}"
+         else
+            verdict="$binpkg $old -> $new: security data unavailable (offline?)"
+         fi
+      fi
+   fi
+
+   EXT_VERDICTS["$verdict_key"]="$count"$'\t'"$verdict"
+   printf '%d\t%s' "$count" "$verdict"
+}
+
+# Analyze all stale libraries of one service and append verdict lines to
+# CONT_CVES for the service key
+analyze_service_libs() {
+   local ctid="$1" key="$2" root="$3" start_epoch="$4" libs="$5"
+   local line path binpkg status_out curver srcpkg old verdict result count vkey
+   local -a binpkgs=()
+   local -A seen_pkgs=() seen_verdicts=()
+
+   while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      path="$(clean_lib_path "$line")"
+      while IFS= read -r binpkg; do
+         [[ -n "$binpkg" ]] || continue
+         [[ -n "${seen_pkgs[$binpkg]+x}" ]] && continue
+         seen_pkgs["$binpkg"]=1
+         binpkgs+=("$binpkg")
+      done < <(pkgs_for_path "$root" "$path")
+   done <<< "$libs"
+
+   if (( ${#binpkgs[@]} == 0 )); then
+      CONT_CVES["$key"]="no owning dpkg package found for stale libraries"
+      return 0
+   fi
+
+   for binpkg in "${binpkgs[@]}"; do
+      status_out="$(status_lookup "$ctid" "$binpkg")"
+      if [[ -z "$status_out" ]]; then
+         CONT_CVES["$key"]+="${CONT_CVES[$key]:+$'\n'}no dpkg status entry for $binpkg"
+         continue
+      fi
+      curver="${status_out%%$'\t'*}"
+      srcpkg="${status_out#*$'\t'}"
+      [[ -n "$srcpkg" ]] || srcpkg="$binpkg"
+
+      old=""
+      if [[ -n "$start_epoch" ]]; then
+         old="$(version_at_start "$root" "$binpkg" "$start_epoch")"
+         [[ -n "$old" ]] || old="$(version_at_start_apt "$root" "$binpkg" "$start_epoch")"
+      fi
+
+      # Skip if this exact update was already analyzed for this service
+      # (e.g. libssl3 and openssl both belong to the openssl source package)
+      vkey="$ctid|$srcpkg|$old|$curver"
+      [[ -n "${seen_verdicts[$vkey]+x}" ]] && continue
+      seen_verdicts["$vkey"]=1
+
+      result="$(security_analysis "$ctid" "$srcpkg" "$binpkg" "$old" "$curver")"
+      count="${result%%$'\t'*}"
+      verdict="${result#*$'\t'}"
+      [[ "$count" =~ ^[0-9]+$ ]] || count=0
+      CONT_UPDATE_COUNTS["$vkey"]="$count"
+      CONT_CVES["$key"]+="${CONT_CVES[$key]:+$'\n'}$verdict"
+      CONT_CVE_COUNTS["$key"]=$(( ${CONT_CVE_COUNTS[$key]:-0} + count ))
+   done
+}
+
+# Print the security analysis lines for a service key, if any
+print_security_info() {
+   local key="$1" line
+   [[ -n "${CONT_CVES[$key]+x}" ]] || return 0
+   while IFS= read -r line; do
+      [[ -n "$line" ]] && printf '  [security] %s\n' "$line"
+   done <<< "${CONT_CVES[$key]}"
+}
+
+# Append "(N CVEs)" to the current line when running with -s (without -v);
+# prints nothing when the count is zero or unknown
+print_cve_count_suffix() {
+   local key="$1" cve_count plural="s"
+   (( SECURITY )) || return 0
+   (( VERBOSE )) && return 0
+   cve_count="${CONT_CVE_COUNTS[$key]:-0}"
+   (( cve_count > 0 )) || return 0
+   (( cve_count == 1 )) && plural=""
+   printf " (%d CVE%s)" "$cve_count" "$plural"
+}
+
+# Terminate a service line: with -s -v just end the line (the detailed
+# security lines are printed separately); with -s alone append the
+# "(N CVEs)" count suffix to the current line
+print_security_annotation() {
+   local key="$1"
+   if (( SECURITY )) && (( VERBOSE )); then
+      printf "\n"
+   else
+      print_cve_count_suffix "$key"
+      printf "\n"
+   fi
+}
+
+# Emit the Zabbix master JSON: one entry per running container with the
+# number of services needing restart, the unique CVEs fixed by pending
+# updates and human-readable details. Each update (srcpkg+old+new) is counted
+# once per container, even when several services share it. The details are
+# written to a TSV and aggregated by the zabbix_json.py helper (which also
+# handles JSON escaping).
+zabbix_output() {
+   local ctid key user_uid service svc_display details cves _rest vl
+   local -a sorted_keys=() sorted_cts=()
+   local tsv="$WORKDIR/zabbix.tsv"
+   local services="" ukey
+
+   : > "$tsv"
+   mapfile -t sorted_keys < <(sorted_keys_of CONT_SERVICES)
+   mapfile -t sorted_cts < <(sorted_keys_of CT_PIDS -n)
+
+   for ctid in "${sorted_cts[@]}"; do
+      services=0
+      cves=0
+      details=""
+      for key in "${sorted_keys[@]}"; do
+         [[ "$key" == "$ctid:"* ]] || continue
+         services=$((services + 1))
+         _rest="${key#*:}"
+         user_uid="${_rest%%:*}"
+         service="${_rest#*:}"
+         if [[ -n "$user_uid" ]]; then
+            svc_display="$service [user session UID $user_uid]"
+         else
+            svc_display="$service"
+         fi
+         if [[ -n "${CONT_CVES[$key]+x}" ]]; then
+            while IFS= read -r vl; do
+               [[ -n "$vl" ]] || continue
+               details+="${details:+$'\x1e'}$svc_display: $vl"
+            done <<< "${CONT_CVES[$key]}"
+         else
+            details+="${details:+$'\x1e'}$svc_display: needs restart"
+         fi
+      done
+      # CVEs are counted once per update, not once per affected service
+      for ukey in "${!CONT_UPDATE_COUNTS[@]}"; do
+         [[ "$ukey" == "$ctid|"* ]] || continue
+         cves=$((cves + ${CONT_UPDATE_COUNTS[$ukey]}))
+      done
+      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+         "$ctid" "${CT_NAMES[$ctid]:-unknown}" "$services" "$cves" "$details" >> "$tsv"
+   done
+
+   CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/zabbix_json.py" "$tsv"
+}
+
+# Generate the small python helpers used for API queries
+write_python_helpers() {
+   cat > "$WORKDIR/osv_filter.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Query (cached) the OSV API for CVEs affecting a Debian package version and
+emit "CVE-ID<TAB>fixed-version" lines for one Debian release. Exit 1 on
+network failure."""
+import json
+import os
+import sys
+import time
+import urllib.request
+
+CACHE_TTL = int(os.environ.get("CVE_CACHE_TTL", "86400"))
+API = "https://api.osv.dev/v1/query"
+
+
+def fetch(pkg, version):
+   body = json.dumps({"package": {"name": pkg, "ecosystem": "Debian"},
+                      "version": version})
+   req = urllib.request.Request(API, data=body.encode(),
+                                headers={"Content-Type": "application/json",
+                                         "User-Agent": "needrestart-lxc"})
+   with urllib.request.urlopen(req, timeout=30) as resp:
+      return json.load(resp)
+
+
+def main():
+   pkg, version, release, cache = sys.argv[1:5]
+   data = None
+   if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
+      try:
+         with open(cache, "r") as fh:
+            data = json.load(fh)
+      except (OSError, ValueError):
+         data = None
+   if data is None:
+      try:
+         data = fetch(pkg, version)
+      except Exception:
+         return 1
+      tmp = cache + ".tmp"
+      with open(tmp, "w") as fh:
+         json.dump(data, fh)
+      os.replace(tmp, cache)
+   for vuln in data.get("vulns", []):
+      fixed = None
+      for affected in vuln.get("affected", []):
+         package = affected.get("package", {})
+         if package.get("name") != pkg:
+            continue
+         ecosystem = package.get("ecosystem", "")
+         if ecosystem != release and not ecosystem.startswith(release + ":"):
+            continue
+         for rng in affected.get("ranges", []):
+            if rng.get("type") != "ECOSYSTEM":
+               continue
+            for event in rng.get("events", []):
+               if event.get("fixed") not in (None, "", "0"):
+                  fixed = event["fixed"]
+      if fixed:
+         cve = (vuln.get("upstream") or [vuln.get("id", "")])[0]
+         print(f"{cve}\t{fixed}")
+
+
+if __name__ == "__main__":
+   sys.exit(main())
+PYEOF
+
+   cat > "$WORKDIR/ubuntu_cves.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Fetch (cached) all CVEs for an Ubuntu source package from ubuntu.com and
+emit "CVE-ID<TAB>fixed-version<TAB>cvss3" lines for one release codename
+where the package status is "released". Exit 1 on network failure."""
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+
+CACHE_TTL = int(os.environ.get("CVE_CACHE_TTL", "86400"))
+BASE = "https://ubuntu.com/security/cves.json"
+PAGE = 20          # max limit accepted by the API (100 is rejected with 422)
+PAGE_SLEEP = 2.0   # be gentle: the API rate-limits aggressive bursts (429)
+MAX_PAGES = 100    # safety cap (2000 CVEs)
+
+
+def fetch(url):
+   req = urllib.request.Request(url, headers={"User-Agent": "needrestart-lxc"})
+   with urllib.request.urlopen(req, timeout=30) as resp:
+      return json.load(resp)
+
+
+def fetch_all(pkg, cache):
+   merged = []
+   offset = 0
+   total = 1
+   pages = 0
+   while offset < total and pages < MAX_PAGES:
+      url = f"{BASE}?package={pkg}&limit={PAGE}&offset={offset}"
+      data = None
+      for attempt in range(3):
+         try:
+            data = fetch(url)
+            break
+         except urllib.error.HTTPError as err:
+            if err.code == 429 and attempt < 2:
+               time.sleep(60)
+               continue
+            raise
+      if data is None:
+         raise RuntimeError("no response")
+      cves = data.get("cves", [])
+      merged.extend(cves)
+      total = data.get("total_results", 0) or len(merged)
+      if len(cves) < PAGE:
+         break
+      offset += PAGE
+      pages += 1
+      time.sleep(PAGE_SLEEP)
+   tmp = cache + ".tmp"
+   with open(tmp, "w") as fh:
+      json.dump({"cves": merged, "total_results": total}, fh)
+   os.replace(tmp, cache)
+   return merged
+
+
+def main():
+   pkg, codename, cache = sys.argv[1:4]
+   data = None
+   if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
+      try:
+         with open(cache, "r") as fh:
+            data = json.load(fh)
+      except (OSError, ValueError):
+         data = None
+   try:
+      cves = data.get("cves") if data else fetch_all(pkg, cache)
+   except Exception:
+      return 1
+   for cve in cves:
+      for entry in cve.get("packages", []):
+         if entry.get("name") != pkg:
+            continue
+         for status in entry.get("statuses", []):
+            if status.get("release_codename") != codename:
+               continue
+            if status.get("status") != "released":
+               continue
+            fixed = (status.get("description") or "").strip()
+            if not fixed:
+               continue
+            print(f"{cve.get('id', '')}\t{fixed}\t{cve.get('cvss3') or ''}")
+            break
+
+
+if __name__ == "__main__":
+   sys.exit(main())
+PYEOF
+
+   cat > "$WORKDIR/zabbix_json.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Convert the per-service TSV dump (fields separated by \x1f, details lines
+by \x1e) into the Zabbix master JSON document."""
+import json
+import sys
+
+containers = {}
+with open(sys.argv[1], "r") as fh:
+   for line in fh:
+      line = line.rstrip("\n")
+      if not line:
+         continue
+      ctid, name, services, cves, details = line.split("\x1f")
+      details = details.replace("\x1e", "\n")
+      entry = containers.setdefault(
+         ctid,
+         {"ctid": ctid, "name": name, "services": 0, "cves": 0, "details": ""},
+      )
+      entry["name"] = name
+      entry["services"] += int(services)
+      entry["cves"] += int(cves)
+      if details:
+         entry["details"] = entry["details"] + "\n" + details if entry["details"] else details
+
+out = {"containers": [containers[k] for k in sorted(containers, key=int)]}
+json.dump(out, sys.stdout)
+PYEOF
+}
+
+# Main entry point for the security scan: analyze every stale service,
+# then report containers that could not be analyzed
+security_scan() {
+   local key ctid pid root libs start_epoch lstart
+   local -a sorted_keys=()
+   mapfile -t sorted_keys < <(sorted_keys_of CONT_SERVICES)
+
+   for key in "${sorted_keys[@]}"; do
+      ctid="${key%%:*}"
+      pid="${CONT_PID[$key]:-}"
+      [[ -n "$pid" ]] || continue
+      root="$(ct_root "$ctid")"
+      [[ -d "$root" ]] || continue
+
+      if [[ -z "${CT_OS_ID[$ctid]+x}" ]]; then
+         if ! load_ct_os "$ctid" "$root"; then
+            CT_NOTES["$ctid"]="no /etc/os-release found in container"
+            continue
+         fi
+      fi
+      case "${CT_OS_ID[$ctid]}" in
+         debian|ubuntu) ;;
+         *)
+            CT_NOTES["$ctid"]="CVE analysis not supported for distro ${CT_OS_ID[$ctid]}"
+            continue
+            ;;
+      esac
+      if ! parse_dpkg_status "$ctid" "$root"; then
+         CT_NOTES["$ctid"]="no dpkg database found in container"
+         continue
+      fi
+
+      lstart="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
+      start_epoch=""
+      [[ -n "$lstart" ]] && start_epoch="$(date -d "$lstart" +%s 2>/dev/null)"
+
+      log_verbose "Extended security analysis for CT $ctid, service ${key#*:} (PID $pid)..."
+      analyze_service_libs "$ctid" "$key" "$root" "$start_epoch" "${CONT_SERVICES[$key]}"
+   done
+
+   # Report containers that were skipped for analysis
+   for ctid in "${!CT_NOTES[@]}"; do
+      if (( ZABBIX )); then
+         printf 'Container %s (%s): %s\n' "$ctid" "${CT_NAMES[$ctid]:-unknown}" "${CT_NOTES[$ctid]}" >&2
+      else
+         printf 'Container %s (%s): %s\n' "$ctid" "${CT_NAMES[$ctid]:-unknown}" "${CT_NOTES[$ctid]}"
+      fi
+   done
+}
+
+# ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
 
@@ -703,6 +1515,16 @@ main() {
             ;;
          -d|--deep)
             DEEP=1
+            shift
+            ;;
+         -s|--security)
+            SECURITY=1
+            shift
+            ;;
+         --zabbix)
+            ZABBIX=1
+            MODE="zabbix"
+            SECURITY=1
             shift
             ;;
          -v|--verbose)
@@ -738,12 +1560,25 @@ main() {
       exit 1
    fi
 
+   # Prepare per-run workspace and API cache for security mode
+   if (( SECURITY )); then
+      WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/needrestart-lxc.XXXXXX")"
+      trap 'rm -rf "$WORKDIR"' EXIT
+      mkdir -p "$CACHE_DIR"
+      write_python_helpers
+   fi
+
    # Load container information
    load_container_names
    get_container_pids
 
    # Scan for outdated libraries
    scan_containers
+
+   # Optional security analysis (CVE lookup)
+   if (( SECURITY )); then
+      security_scan
+   fi
 
    # Output results
    case "$MODE" in
@@ -752,6 +1587,9 @@ main() {
          ;;
       restart)
          restart_services
+         ;;
+      zabbix)
+         zabbix_output
          ;;
       *)
          print_results
