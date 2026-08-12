@@ -34,9 +34,9 @@ minutes, so data is at most ~1 hour old.
 
 The scan (including the CVE analysis) takes several seconds on a host with
 many containers and would exceed the Zabbix server `Timeout` (default 4s) if
-the agent ran it synchronously. The scan therefore runs from cron as root and
-writes `/var/cache/needrestart-lxc/zabbix.json`; the agent check only reads
-that file (instant).
+the agent ran it synchronously. The scan therefore runs from cron as root; the
+script writes `/var/cache/needrestart-lxc/zabbix.json` itself (creating the
+directory if needed), and the agent check only reads that file (instant).
 
 ## Installation (per Proxmox host)
 
@@ -58,10 +58,11 @@ that file (instant).
 The script exports its own PATH so the cron job finds `/usr/sbin/pct` even
 though cron runs with a minimal environment.
 
-3. Generate the JSON once and restart the agent:
+3. Generate the JSON once and restart the agent (the script creates
+   `/var/cache/needrestart-lxc` and writes `zabbix.json` itself):
 
    ```
-   /usr/local/bin/needrestart-lxc --zabbix > /var/cache/needrestart-lxc/zabbix.json
+   /usr/local/bin/needrestart-lxc --zabbix
    systemctl restart zabbix-agent2
    ```
 

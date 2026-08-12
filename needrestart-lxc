@@ -1245,7 +1245,19 @@ zabbix_output() {
          "$ctid" "${CT_NAMES[$ctid]:-unknown}" "$services" "$cves" "$details" >> "$tsv"
    done
 
-   CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/zabbix_json.py" "$tsv"
+   # Generate the JSON, publish it to the cache file the Zabbix agent reads,
+   # and also print it to stdout for manual inspection. The script creates the
+   # cache directory itself, so the cron job needs no shell redirect (which
+   # would fail on a fresh install before the directory exists). On failure the
+   # previous cache file is left untouched.
+   if CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/zabbix_json.py" "$tsv" > "$WORKDIR/zabbix.json"; then
+      mkdir -p "$CACHE_DIR"
+      cp "$WORKDIR/zabbix.json" "$CACHE_DIR/zabbix.json"
+      chmod 644 "$CACHE_DIR/zabbix.json"
+      cat "$WORKDIR/zabbix.json"
+   else
+      return 1
+   fi
 }
 
 # Generate the small python helpers used for API queries

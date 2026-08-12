@@ -3,4 +3,6 @@
 # exceed the Zabbix server Timeout if run synchronously by the agent.
 #
 # The Zabbix master item polls every hour; this cron keeps the file fresh.
-*/15 * * * * root /usr/local/bin/needrestart-lxc --zabbix > /var/cache/needrestart-lxc/zabbix.json
+# The script writes /var/cache/needrestart-lxc/zabbix.json itself (creating the
+# directory if needed), so no shell redirect is required here.
+*/15 * * * * root /usr/local/bin/needrestart-lxc --zabbix
