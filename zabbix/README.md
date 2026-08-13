@@ -46,13 +46,12 @@ directory if needed), and the agent check only reads that file (instant).
    install -m 750 -o root -g root needrestart-lxc /usr/local/bin/needrestart-lxc
    ```
 
-2. Install the wrapper, agent config, cron job and (optional) sudoers:
+2. Install the wrapper, agent config and cron job:
 
    ```
    install -m 755 zabbix/needrestart-lxc-zabbix-cat /usr/local/bin/
    install -m 644 zabbix/zabbix_agent2.d/needrestart-lxc.conf /etc/zabbix/zabbix_agent2.d/
    install -m 644 zabbix/cron.d/needrestart-lxc /etc/cron.d/
-   install -m 440 zabbix/sudoers.d/zabbix-needrestart-lxc /etc/sudoers.d/   # optional
    ```
 
 The script exports its own PATH so the cron job finds `/usr/sbin/pct` even
@@ -80,8 +79,9 @@ The template group `Templates` must exist (it does on a default install).
 
 Notes:
 
-- The CVE lookup requires outbound HTTPS from the Proxmox host (`curl` +
-  `python3`); results are cached for 24h in `/var/cache/needrestart-lxc`.
+- The CVE lookup requires outbound HTTPS from the Proxmox host and a `python3`
+  interpreter (stdlib `urllib`, no extra packages); results are cached for 24h
+  in `/var/cache/needrestart-lxc`.
 - Only dpkg-based containers (Debian/Ubuntu) get CVE analysis; others are
   reported with `cves` = 0 (the restart trigger still applies).
 - The `cves` count is the number of *unique* CVEs fixed across the pending

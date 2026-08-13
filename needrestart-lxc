@@ -1,103 +1,110 @@
-#!/usr/bin/env bash
-# needrestart-lxc - Check LXC containers on Proxmox for processes using
-# outdated shared libraries, and optionally restart specific services
-# inside containers without restarting the entire container.
-#
-# This script reads /proc/*/maps from the host to detect processes in
-# containers that are using deleted/replaced shared libraries. It maps
-# those processes to their container and systemd service using cgroup
-# information, and can restart individual services via `pct exec`.
-#
-# It does NOT modify or depend on needrestart being installed inside
-# containers. It is a standalone tool that complements the host-side
-# needrestart by providing per-service granularity for LXC containers.
+#!/usr/bin/env python3
+"""needrestart-lxc - Check LXC containers on Proxmox for processes using
+outdated shared libraries, and optionally restart specific services
+inside containers without restarting the entire container.
 
-# Ensure core tools (pct, ps, date, ...) are found even when the script is
-# run from a minimal environment such as cron (PATH=/usr/bin:/bin), where
-# /usr/sbin (pct) is missing and container names would silently be lost.
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+This script reads /proc/*/maps from the host to detect processes in
+containers that are using deleted/replaced shared libraries. It maps
+those processes to their container and systemd service using cgroup
+information, and can restart individual services via `pct exec`.
 
-readonly PROGNAME="needrestart-lxc"
+It does NOT modify or depend on needrestart being installed inside
+containers. It is a standalone tool that complements the host-side
+needrestart by providing per-service granularity for LXC containers.
+"""
 
-# Global configuration
-readonly CGROUP_LXC_PATTERN="^0::/lxc/([0-9]+)/ns/(.+)$"
-readonly BLACKLIST_PATTERNS=(
-   # Special device paths (needrestart: blacklist_mappings)
-   "^/memfd:"
-   "^/dev/"
-   "^/(SYSV00000000"
-   # aio(7) mappings
-   "^/\\[aio\\]"
-   # General bracket-enclosed mappings ([heap], [stack], [vdso], etc.)
-   "^\\["
-   # Temporary directories (Tcl bytecode, JNA, etc.)
-   "^(/var)?/tmp/"
-   "^(/var)?/run/"
-   # Oil Runtime Compiler JIT files
-   "/orcexec\\.[\\w\\d]+( \\(deleted\\))?$"
-   # Java Native Access temp files
-   "/jna[0-9]+\\.tmp( \\(deleted\\))?$"
-   "/\\.cache/JNA/"
-   # Binaries that are not daemons (needrestart: blacklist)
-   "^/usr/bin/sudo"
-   "^/usr/bin/apt-get"
+import gzip
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+# Ensure pct (in /usr/sbin) is found even when run from a minimal
+# environment such as cron (PATH=/usr/bin:/bin), where /usr/sbin is missing
+# and container names would silently be lost.
+os.environ["PATH"] = (
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    + ":" + os.environ.get("PATH", "")
 )
 
-# Services that register well-known D-Bus names on the system bus.
-# When dbus.service is restarted, these services lose their connection to
-# the old dbus-daemon but keep running, causing D-Bus activation timeouts
-# (e.g. pam_systemd.so hanging for 25s during SSH login via systemd-logind).
-# They must be restarted after dbus to re-register their D-Bus names.
-readonly DBUS_DEPENDENT_SERVICES=(
-   "systemd-logind.service"
-   "polkit.service"
-   "avahi-daemon.service"
-   "systemd-networkd.service"
-   "systemd-resolved.service"
-   "wpa_supplicant.service"
-   "NetworkManager.service"
-   "rtkit-daemon.service"
-   "colord.service"
-   "accounts-daemon.service"
-   "ModemManager.service"
-)
+PROGNAME = "needrestart-lxc"
 
-# Modes of operation
-MODE="list"
-VERBOSE=0
-DEEP=0
-DRY_RUN=0
-SECURITY=0
-ZABBIX=0
-CONTAINER_FILTER=""
-EXCLUDE_PATTERNS=()
+# cgroup v2 path of a process inside an LXC container (after the "0::" marker)
+CGROUP_RE = re.compile(r"^/lxc/(\d+)/ns/(.+)$")
+
+# Special device / tmp paths to ignore (needrestart: blacklist_mappings, etc.)
+BLACKLIST_PATTERNS = [re.compile(p) for p in (
+    r"^/memfd:",
+    r"^/dev/",
+    r"^/\(SYSV00000000",
+    r"^/\[aio\]",
+    r"^\[",
+    r"^(/var)?/tmp/",
+    r"^(/var)?/run/",
+    r"/orcexec\.[\w\d]+( \(deleted\))?$",      # Oil Runtime Compiler JIT
+    r"/jna[0-9]+\.tmp( \(deleted\))?$",        # Java Native Access temp files
+    r"/\.cache/JNA/",
+    r"^/usr/bin/sudo",                          # not daemons
+    r"^/usr/bin/apt-get",
+)]
+
+# Services that register well-known D-Bus names on the system bus. When
+# dbus.service is restarted they lose their connection to the old daemon but
+# keep running, causing D-Bus activation timeouts (e.g. pam_systemd.so hanging
+# 25s during SSH login via systemd-logind). Restart them after dbus.
+DBUS_DEPENDENT_SERVICES = [
+    "systemd-logind.service",
+    "polkit.service",
+    "avahi-daemon.service",
+    "systemd-networkd.service",
+    "systemd-resolved.service",
+    "wpa_supplicant.service",
+    "NetworkManager.service",
+    "rtkit-daemon.service",
+    "colord.service",
+    "accounts-daemon.service",
+    "ModemManager.service",
+]
 
 # Security scan configuration (CVE analysis)
-CACHE_TTL=86400                      # seconds to keep cached API responses
-CACHE_DIR="/var/cache/needrestart-lxc"
-WORKDIR=""                          # per-run temp dir (security mode only)
+CACHE_TTL = 86400                     # seconds to keep cached API responses
+CACHE_DIR = "/var/cache/needrestart-lxc"
+
+# Modes / flags
+MODE = "list"
+VERBOSE = 0
+DEEP = 0
+DRY_RUN = 0
+SECURITY = 0
+ZABBIX = 0
+CONTAINER_FILTER = ""
+EXCLUDE_PATTERNS = []
+WORKDIR = ""
 
 # Collected data structures
-declare -A CT_NAMES      # CTID -> container name
-declare -A CT_PIDS      # CTID -> init PID
-declare -A CONT_SERVICES # "CTID:service" -> "deleted_lib1,deleted_lib2"
-declare -A CONT_PID       # "CTID:service" -> PID of first stale process
-declare -A CONT_CVES      # "CTID:service" -> security analysis lines (security)
-declare -A CONT_CVE_COUNTS # "CTID:service" -> total CVEs fixed (security)
-declare -A CONT_UPDATE_COUNTS # "CTID|srcpkg|old|new" -> CVEs fixed by this update
-declare -A CT_OS_ID       # CTID -> os id from os-release (debian/ubuntu/...)
-declare -A CT_OS_RELEASE  # CTID -> VERSION_ID (e.g. 12, 22.04)
-declare -A CT_OS_CODENAME # CTID -> VERSION_CODENAME (e.g. bookworm, jammy)
-declare -A EXT_VERDICTS   # "CTID|srcpkg|old|new" -> cached verdict line
-declare -A CT_NOTES       # CTID -> reason why analysis was skipped
+CT_NAMES = {}          # ctid -> container name
+CT_PIDS = {}           # ctid -> init PID
+CONT_SERVICES = {}     # "ctid:user_uid:service" -> "deleted_lib1,deleted_lib2"
+CONT_PID = {}          # "ctid:user_uid:service" -> PID of first stale process
+CONT_CVES = {}         # key -> security analysis lines
+CONT_CVE_COUNTS = {}   # key -> total CVEs fixed
+CONT_UPDATE_COUNTS = {}  # "ctid|srcpkg|old|new" -> CVEs fixed by this update
+CT_OS_ID = {}          # ctid -> os id (debian/ubuntu/...)
+CT_OS_RELEASE = {}     # ctid -> VERSION_ID (e.g. 12, 22.04)
+CT_OS_CODENAME = {}    # ctid -> VERSION_CODENAME (e.g. bookworm, jammy)
+EXT_VERDICTS = {}      # "ctid|srcpkg|old|new" -> cached verdict line
+CT_NOTES = {}          # ctid -> reason why analysis was skipped
 
-# ------------------------------------------------------------------------------
-# Utility functions
-# ------------------------------------------------------------------------------
 
-print_usage() {
-   cat <<-EOF
-Usage: $PROGNAME [OPTIONS]
+def print_usage(out=sys.stdout):
+    print(f"""Usage: {PROGNAME} [OPTIONS]
 
 Check LXC containers on a Proxmox host for processes using outdated
 shared libraries, and optionally restart specific services inside
@@ -120,1498 +127,1235 @@ Options:
   -h, --help          Show this help message
 
 Examples:
-  $PROGNAME                     # List all containers needing service restarts
-  $PROGNAME -v                  # Show which libraries are outdated
-  $PROGNAME -r                  # Restart affected services in containers
-  $PROGNAME -n -r               # Show what would be restarted (dry run)
-  $PROGNAME -c 100              # Only check container 100
-  $PROGNAME -d                   # Deep scan including inode comparison
-  $PROGNAME -s                   # Security scan with CVE analysis
-  $PROGNAME -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
-EOF
-}
+  {PROGNAME}                     # List all containers needing service restarts
+  {PROGNAME} -v                  # Show which libraries are outdated
+  {PROGNAME} -r                  # Restart affected services in containers
+  {PROGNAME} -n -r               # Show what would be restarted (dry run)
+  {PROGNAME} -c 100              # Only check container 100
+  {PROGNAME} -d                   # Deep scan including inode comparison
+  {PROGNAME} -s                   # Security scan with CVE analysis
+  {PROGNAME} -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
+""", file=out)
 
-log_verbose() {
-   (( VERBOSE )) && printf "%s\n" "$*" >&2
-}
 
-log_error() {
-   printf "ERROR: %s\n" "$*" >&2
-}
+def log_verbose(msg):
+    if VERBOSE:
+        print(msg, file=sys.stderr)
 
-# Sort the keys of an associative array (by name) into stdout, one per line.
-# Unlike "printf '%s\n' ${!arr[@]}" this emits nothing for empty arrays,
-# which would otherwise produce a bogus empty key.
-sorted_keys_of() {
-   local -n ref="$1"
-   local key
-   for key in "${!ref[@]}"; do
-      printf '%s\n' "$key"
-   done | sort ${2:+"$2"}
-}
 
-# Check if a library path should be blacklisted
-is_blacklisted() {
-   local path="$1"
-   local pattern
-   for pattern in "${BLACKLIST_PATTERNS[@]}"; do
-      [[ "$path" =~ $pattern ]] && return 0
-   done
-   return 1
-}
+def log_error(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
 
-# Check if a service name should be excluded
-is_excluded() {
-   local service="$1"
-   local pattern
-   for pattern in "${EXCLUDE_PATTERNS[@]}"; do
-      [[ "$service" =~ $pattern ]] && return 0
-   done
-   return 1
-}
 
-# ------------------------------------------------------------------------------
+def is_blacklisted(path):
+    for pat in BLACKLIST_PATTERNS:
+        if pat.search(path):
+            return True
+    return False
+
+
+def is_excluded(service):
+    for pat in EXCLUDE_PATTERNS:
+        if re.search(pat, service):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Container discovery
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-load_container_names() {
-   local ctid name
-   while IFS=' ' read -r ctid name; do
-      CT_NAMES["$ctid"]="$name"
-   done < <(pct list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1, $NF}')
-   log_verbose "Loaded ${#CT_NAMES[@]} container names"
-}
+def read_procs():
+    """Yield (pid, cgroup_path) pairs for processes in the cgroup v2 tree.
 
-get_container_pids() {
-   local pid cgroup ctid
-   while IFS=' ' read -r pid cgroup; do
-      if [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]]; then
-         ctid="${BASH_REMATCH[1]}"
-         if [[ "$cgroup" == */ns/init.scope ]]; then
-            CT_PIDS["$ctid"]="$pid"
-         fi
-      fi
-   done < <(ps -eo pid,cgroup 2>/dev/null)
-   log_verbose "Found ${#CT_PIDS[@]} running containers"
-}
+    cgroup_path is the path after the '0::' marker (e.g. /lxc/100/ns/init.scope).
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return
+    for e in entries:
+        if not e.isdigit():
+            continue
+        try:
+            with open(f"/proc/{e}/cgroup") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        for line in data.splitlines():
+            if line.startswith("0::"):
+                yield e, line[3:]
+                break
 
-# ------------------------------------------------------------------------------
-# Library freshness checking (fast scan)
-# ------------------------------------------------------------------------------
 
-# Fast check: look for (deleted) in /proc/<pid>/maps and check /proc/<pid>/exe
-# Returns 0 if process needs restart, 1 otherwise.
-# Sets FOUND_LIBS global with the list of affected libraries.
-FOUND_LIBS=""
-check_process_fast() {
-   local pid="$1"
-   local exe_path raw_line clean_path
-   local -a libs_found=()
+def load_container_names():
+    try:
+        r = subprocess.run(["pct", "list"], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].isdigit():
+            CT_NAMES[parts[0]] = parts[-1]
+    log_verbose(f"Loaded {len(CT_NAMES)} container names")
 
-   FOUND_LIBS=""
 
-   # Check if executable was replaced
-   exe_path=$(readlink "/proc/${pid}/exe" 2>/dev/null) || return 1
-   if [[ "$exe_path" == *" (deleted)" ]]; then
-      local clean_exe="${exe_path% (deleted)}"
-      if ! is_blacklisted "$clean_exe"; then
-         FOUND_LIBS="${clean_exe} (executable)"
-         return 0
-      fi
-   fi
+def get_container_pids():
+    for pid, path in read_procs():
+        m = CGROUP_RE.match(path)
+        if m and path.endswith("/ns/init.scope"):
+            CT_PIDS[m.group(1)] = pid
+    log_verbose(f"Found {len(CT_PIDS)} running containers")
 
-   # Extract r-xp deleted mappings from maps, filter through blacklist
-   while IFS= read -r raw_line; do
-      [[ -z "$raw_line" ]] && continue
-      # Remove (deleted) suffix for blacklist check
-      clean_path="${raw_line% (deleted)}"
-      if ! is_blacklisted "$clean_path"; then
-         libs_found+=("$clean_path")
-      fi
-   done < <(grep -E 'r-xp.*\(deleted\)' "/proc/${pid}/maps" 2>/dev/null \
-      | awk '{for(i=6;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}' \
-      | sort -u)
 
-   if (( ${#libs_found[@]} > 0 )); then
-      FOUND_LIBS="$(printf '%s\n' "${libs_found[@]}")"
-      return 0
-   fi
+# ---------------------------------------------------------------------------
+# Library freshness checking
+# ---------------------------------------------------------------------------
 
-   return 1
-}
+def parse_map_line(line):
+    parts = line.split()
+    # fields: addr perms offset dev inode path...
+    if len(parts) < 6:
+        return "", "", "", ""
+    return parts[1], parts[3], parts[4], " ".join(parts[5:])
 
-# Deep check: also compare inode numbers for shared libraries
-# Returns 0 if process needs restart, 1 otherwise.
-# Sets FOUND_LIBS global with the list of affected libraries.
-check_process_deep() {
-   local pid="$1"
-   local init_pid="$2"
-   local line path perms maps_inode maps_dev disk_path
-   local disk_stat disk_inode disk_dev maps_dev_clean disk_dev_clean
-   local found_libs=""
 
-   # First do the fast check
-   if check_process_fast "$pid"; then
-      found_libs="$FOUND_LIBS"
-   fi
+def read_maps(pid):
+    try:
+        with open(f"/proc/{pid}/maps") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        return []
 
-   # Now check for inode mismatches on shared libraries
-   while IFS= read -r line; do
-      perms=$(echo "$line" | awk '{print $2}')
-      [[ "$perms" != *x* ]] && continue
 
-      path=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}')
+def check_process_fast(pid):
+    """Fast check: look for (deleted) in /proc/<pid>/maps and /proc/<pid>/exe.
+    Returns (needs_restart, found_libs)."""
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return False, None
+    if exe.endswith(" (deleted)"):
+        clean = exe[:-len(" (deleted)")]
+        if not is_blacklisted(clean):
+            return True, clean + " (executable)"
 
-      [[ -z "$path" ]] && continue
-      is_blacklisted "$path" && continue
-      [[ "$path" == *" (deleted)" ]] && continue
-      [[ "$path" != *.so* ]] && continue
+    libs = set()
+    for line in read_maps(pid):
+        perms, _dev, _ino, path = parse_map_line(line)
+        if not path:
+            continue
+        if "r-xp" in perms and "(deleted)" in path:
+            clean = path[:-len(" (deleted)")] if path.endswith(" (deleted)") else path
+            if not is_blacklisted(clean):
+                libs.add(clean)
+    if libs:
+        return True, "\n".join(sorted(libs))
+    return False, None
 
-      maps_inode=$(echo "$line" | awk '{print $5}')
-      maps_dev=$(echo "$line" | awk '{print $4}')
-      [[ "$maps_inode" == "0" ]] && continue
 
-      disk_path="/proc/${init_pid}/root${path}"
-      [[ -e "$disk_path" ]] || continue
+def check_process_deep(pid, init_pid):
+    """Deep check: also compare inode numbers for shared libraries.
+    Returns (needs_restart, found_libs)."""
+    found = []
+    ok, libs = check_process_fast(pid)
+    if ok and libs:
+        found.append(libs)
 
-      disk_stat=$(stat -c '%d:%i' "$disk_path" 2>/dev/null) || continue
-      disk_inode=$(echo "$disk_stat" | cut -d: -f2)
-      disk_dev=$(echo "$disk_stat" | cut -d: -f1)
+    for line in read_maps(pid):
+        perms, dev, inode, path = parse_map_line(line)
+        if not path:
+            continue
+        if "x" not in perms:
+            continue
+        if is_blacklisted(path):
+            continue
+        if path.endswith(" (deleted)"):
+            continue
+        if ".so" not in path:
+            continue
+        try:
+            inode_int = int(inode)
+        except ValueError:
+            continue
+        if inode_int == 0:
+            continue
 
-      maps_dev_clean=$(echo "$maps_dev" | sed 's/^0*//;s/:0*/:/')
-      disk_dev_clean=$(echo "$disk_dev" | sed 's/^0*//;s/:0*/:/')
+        disk_path = f"/proc/{init_pid}/root{path}"
+        if not os.path.exists(disk_path):
+            continue
+        try:
+            st = os.stat(disk_path)
+        except OSError:
+            continue
+        disk_inode = st.st_ino
+        disk_dev = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
 
-      if [[ "$maps_inode" != "$disk_inode" ]] && [[ "$maps_dev_clean" == "$disk_dev_clean" ]]; then
-         if [[ -n "$found_libs" ]]; then
-            found_libs="${found_libs}
-${path} (inode mismatch)"
-         else
-            found_libs="${path} (inode mismatch)"
-         fi
-      fi
-   done < "/proc/${pid}/maps"
+        maps_dev_clean = norm_dev(dev)
+        disk_dev_clean = norm_dev(disk_dev)
+        if inode_int != disk_inode and maps_dev_clean == disk_dev_clean:
+            found.append(path + " (inode mismatch)")
 
-   if [[ -n "$found_libs" ]]; then
-      FOUND_LIBS="$found_libs"
-      return 0
-   fi
-   return 1
-}
+    if found:
+        return True, "\n".join(found)
+    return False, None
 
-# ------------------------------------------------------------------------------
+
+def norm_dev(dev):
+    parts = dev.split(":")
+    if len(parts) != 2:
+        return dev
+    return f"{parts[0].lstrip('0') or '0'}:{parts[1].lstrip('0') or '0'}"
+
+
+# ---------------------------------------------------------------------------
+# Service extraction from a cgroup path
+# ---------------------------------------------------------------------------
+
+def service_from_path(path_suffix):
+    """Map a cgroup path suffix to a systemd unit name, most specific first."""
+    if path_suffix == "init.scope":
+        return "systemd-manager"
+    m = re.search(r"/([^/]+\.service)/init\.scope$", path_suffix)
+    if m:
+        return m.group(1)
+    m = re.search(r"/([^/]+\.scope)$", path_suffix)
+    if m:
+        return m.group(1)
+    m = re.search(r"/([^/]+\.service)$", path_suffix)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([^/]+\.service)$", path_suffix)
+    if m:
+        return m.group(1)
+    m = re.search(r"(user@[0-9]+\.service)", path_suffix)
+    if m:
+        return m.group(1)
+    m = re.search(r"user-([0-9]+)\.slice", path_suffix)
+    if m:
+        return f"user@{m.group(1)}.service"
+    return path_suffix.rstrip("/").rsplit("/", 1)[-1]
+
+
+# ---------------------------------------------------------------------------
 # Main scanning logic
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-scan_containers() {
-   local pid cgroup ctid service path_suffix key init_pid user_uid
+def scan_containers():
+    log_verbose("Scanning container processes for outdated libraries...")
+    for pid, path in read_procs():
+        m = CGROUP_RE.match(path)
+        if not m:
+            continue
+        ctid = m.group(1)
+        path_suffix = m.group(2)
 
-   log_verbose "Scanning container processes for outdated libraries..."
+        if CONTAINER_FILTER and ctid != CONTAINER_FILTER:
+            continue
 
-   while IFS=' ' read -r pid cgroup; do
-      # Check if this process is in an LXC container
-      [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]] || continue
+        # Detect processes inside a user session manager subtree
+        # (user@N.service/<slice>/<unit>). Those units are managed by the
+        # user's systemd, not PID 1, and must be restarted with
+        # `systemctl --user` as the owning user.
+        user_uid = ""
+        mu = re.search(r"user@(\d+)\.service/[^/]+/", path_suffix)
+        if mu:
+            user_uid = mu.group(1)
 
-      ctid="${BASH_REMATCH[1]}"
-      path_suffix="${BASH_REMATCH[2]}"
+        service = service_from_path(path_suffix)
+        if not service:
+            continue
+        if is_excluded(service):
+            continue
 
-      # Apply container filter
-      [[ -n "$CONTAINER_FILTER" ]] && [[ "$ctid" != "$CONTAINER_FILTER" ]] && continue
+        # Deduplicate: key encodes owning user UID (empty for system units)
+        key = f"{ctid}:{user_uid}:{service}"
+        if key in CONT_SERVICES:
+            continue
 
-      # Detect whether this process lives inside a user session manager
-      # subtree (user@N.service/<slice>/<unit>). Units there are managed by
-      # the user's systemd, not PID 1, so they must be restarted with
-      # `systemctl --user` as the owning user rather than `systemctl restart`
-      # (which would hit the same-named *system* unit and leave the user
-      # session processes untouched). The user manager's own init.scope is
-      # excluded (it requires a further path component after the service).
-      user_uid=""
-      if [[ "$path_suffix" =~ user@([0-9]+)\.service/[^/]+/ ]]; then
-         user_uid="${BASH_REMATCH[1]}"
-      fi
+        init_pid = CT_PIDS.get(ctid, "")
+        if not init_pid:
+            for p2, pth2 in read_procs():
+                m2 = CGROUP_RE.match(pth2)
+                if m2 and m2.group(1) == ctid and pth2.endswith("/ns/init.scope"):
+                    init_pid = p2
+                    CT_PIDS[ctid] = p2
+                    break
 
-      # Extract service name from cgroup path
-      # Try patterns in order of specificity (most specific first)
-      if [[ "$path_suffix" == "init.scope" ]]; then
-         # Container's PID 1 (systemd) - handled as "systemd-manager" which
-         # can be restarted with daemon-reexec, not a full container restart
-         service="systemd-manager"
-      elif [[ "$path_suffix" =~ /([^/]+\.service)/init\.scope$ ]]; then
-         # User session systemd instance, e.g. user@N.service/init.scope
-         service="${BASH_REMATCH[1]}"
-      elif [[ "$path_suffix" =~ /([^/]+\.scope)$ ]]; then
-         # Scope unit (login sessions, tmux, podman, etc.) - not directly
-         # restartable but should still be detected and reported.
-         # IMPORTANT: This must be checked before the user@N.service and
-         # user-N.slice patterns below, because a process in e.g.
-         # user.slice/user-110.slice/session-c2.scope is in a session scope
-         # that is a SIBLING of user@110.service, not a child. Restarting
-         # user@110.service does NOT kill session scope processes, but
-         # stopping the scope does.
-         service="${BASH_REMATCH[1]}"
-      elif [[ "$path_suffix" =~ /([^/]+\.service)$ ]]; then
-         # Standard service unit (last .service in path)
-         service="${BASH_REMATCH[1]}"
-      elif [[ "$path_suffix" =~ ^([^/]+\.service)$ ]]; then
-         # Service at top level of the namespace
-         service="${BASH_REMATCH[1]}"
-      elif [[ "$path_suffix" =~ (user@[0-9]+\.service) ]]; then
-         # Processes under a user session cgroup subtree that aren't in
-         # a specific service or scope - map to the user service
-         service="${BASH_REMATCH[1]}"
-      elif [[ "$path_suffix" =~ user-([0-9]+)\.slice ]]; then
-         # Processes in user-N.slice but not in a specific scope or service.
-         # Map to user@N.service for restartability.
-         service="user@${BASH_REMATCH[1]}.service"
-      else
-         # Last resort: use the last path component to avoid silently
-         # skipping processes with outdated libraries
-         service="${path_suffix##*/}"
-         [[ -z "$service" ]] && continue
-      fi
+        if not os.access(f"/proc/{pid}/maps", os.R_OK):
+            continue
+        if not os.access(f"/proc/{pid}/exe", os.R_OK):
+            continue
 
-      # Skip excluded services
-      is_excluded "$service" && continue
+        log_verbose(f"Checking PID {pid} (CT {ctid}, {service})...")
+        if DEEP:
+            ok, libs = check_process_deep(pid, init_pid)
+        else:
+            ok, libs = check_process_fast(pid)
 
-      # Deduplicate: skip if we already checked this container+service.
-      # The key encodes the owning user UID (empty for system services) so a
-      # system unit and a same-named user session unit (e.g. system
-      # dbus.service vs the session dbus.service) are tracked separately.
-      key="${ctid}:${user_uid}:${service}"
-      [[ -n "${CONT_SERVICES[$key]+x}" ]] && continue
+        if ok and libs:
+            CONT_SERVICES[key] = libs
+            if key not in CONT_PID:
+                CONT_PID[key] = pid
+            log_verbose(f"  -> Service {service} in CT {ctid} needs restart")
 
-      # Get init PID for container root filesystem access
-      if [[ -n "${CT_PIDS[$ctid]+x}" ]]; then
-         init_pid="${CT_PIDS[$ctid]}"
-      else
-         init_pid=$(ps -eo pid,cgroup 2>/dev/null | command grep "lxc/${ctid}/ns/init.scope" | head -1 | awk '{print $1}')
-         [[ -n "$init_pid" ]] && CT_PIDS["$ctid"]="$init_pid"
-      fi
 
-      # Skip inaccessible processes
-      [[ -r "/proc/${pid}/maps" ]] || continue
-      [[ -r "/proc/${pid}/exe" ]] || continue
-
-      log_verbose "Checking PID $pid (CT $ctid, $service)..."
-
-      if (( DEEP )); then
-         check_process_deep "$pid" "$init_pid"
-      else
-         check_process_fast "$pid"
-      fi
-
-      if [[ -n "$FOUND_LIBS" ]]; then
-         CONT_SERVICES["$key"]="$FOUND_LIBS"
-         [[ -n "${CONT_PID[$key]+x}" ]] || CONT_PID["$key"]="$pid"
-         log_verbose "  -> Service $service in CT $ctid needs restart"
-      fi
-   done < <(ps -eo pid,cgroup 2>/dev/null)
-}
-
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Verification and restart functions
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-# Check whether a service in a container still has processes using outdated
-# shared libraries. Used to verify that a restart actually cleared the stale
-# processes (systemctl restart respects KillMode and may leave child processes
-# running, e.g. cron.service with KillMode=process leaves daemonized jobs alive).
-# Returns 0 if stale processes remain, 1 if the service is clear.
-service_is_stale() {
-   local ctid="$1"
-   local service="$2"
-   local user_uid="$3"
-   local pid cgroup
-
-   while IFS=' ' read -r pid cgroup; do
-      [[ "$cgroup" =~ $CGROUP_LXC_PATTERN ]] || continue
-      [[ "${BASH_REMATCH[1]}" != "$ctid" ]] && continue
-      [[ -r "/proc/${pid}/maps" ]] || continue
-      if [[ -n "$user_uid" ]]; then
-         # User session unit: only match processes inside this user's
-         # session subtree whose cgroup ends with the unit name.
-         [[ "$cgroup" == *"user@${user_uid}.service/"* ]] || continue
-         [[ "$cgroup" == *"/${service}" ]] || continue
-      else
-         # System unit: match cgroups ending with the unit, but ignore
-         # same-named user session units (different unit, different owner).
-         [[ "$cgroup" == *"/${service}" ]] || continue
-         [[ "$cgroup" == *"user@"* ]] && continue
-      fi
-      if check_process_fast "$pid"; then
-         return 0
-      fi
-   done < <(ps -eo pid,cgroup 2>/dev/null)
-   return 1
-}
-
-print_results() {
-   local key ctid service ct_name libs user_uid _rest svc_display
-
-   if (( ${#CONT_SERVICES[@]} == 0 )); then
-      printf "No containers have services needing restart.\n"
-      return 0
-   fi
-
-   local -a sorted_keys=()
-   for key in "${!CONT_SERVICES[@]}"; do
-      sorted_keys+=("$key")
-   done
-   mapfile -t sorted_keys < <(printf '%s\n' "${sorted_keys[@]}" | sort)
-
-   for key in "${sorted_keys[@]}"; do
-      ctid="${key%%:*}"
-      _rest="${key#*:}"
-      user_uid="${_rest%%:*}"
-      service="${_rest#*:}"
-      ct_name="${CT_NAMES[$ctid]:-unknown}"
-      libs="${CONT_SERVICES[$key]}"
-      if [[ -n "$user_uid" ]]; then
-         svc_display="$service [user session UID $user_uid]"
-      else
-         svc_display="$service"
-      fi
-      printf "Container %s (%s): service %s needs restart" "$ctid" "$ct_name" "$svc_display"
-      print_security_annotation "$key"
-      if (( VERBOSE )); then
-         local lib
-         while IFS= read -r lib; do
-            [[ -n "$lib" ]] && printf "  - %s\n" "$lib"
-         done <<< "$libs"
-      fi
-      if (( SECURITY )) && (( VERBOSE )); then
-         print_security_info "$key"
-      fi
-   done
-}
-
-# Restart services that lost their D-Bus connection after dbus was
-# restarted. Called after a successful dbus.service restart in a container.
-# Only restarts services that are actually running and not already in the
-# stale-library restart list (those will be handled by the main loop).
-restart_dbus_dependents() {
-   local ctid="$1"
-   local ct_name="$2"
-   local dep rc key
-
-   for dep in "${DBUS_DEPENDENT_SERVICES[@]}"; do
-      # Skip if not running in this container
-      pct exec "$ctid" -- systemctl is-active --quiet "$dep" 2>/dev/null || continue
-
-      # Skip if already in the restart list (will be handled by main loop)
-      for key in "${!CONT_SERVICES[@]}"; do
-         [[ "$key" == "${ctid}::${dep}" ]] && continue 2
-      done
-
-      printf "Container %s (%s): restarting D-Bus dependent %s (lost connection after dbus restart)\n" "$ctid" "$ct_name" "$dep"
-      if (( DRY_RUN )); then
-         printf "  [DRY RUN] Would run: pct exec %s -- systemctl restart %s\n" "$ctid" "$dep"
-         continue
-      fi
-      pct exec "$ctid" -- systemctl restart "$dep"
-      rc=$?
-      if (( rc )); then
-         log_error "Failed to restart $dep in container $ctid (exit code: $rc)"
-      fi
-   done
-}
-
-restart_services() {
-   local key ctid service ct_name cmd rc user_uid _rest username
-
-   if (( ${#CONT_SERVICES[@]} == 0 )); then
-      printf "No containers have services needing restart.\n"
-      return 0
-   fi
-
-   local -a sorted_keys=()
-   for key in "${!CONT_SERVICES[@]}"; do
-      sorted_keys+=("$key")
-   done
-   mapfile -t sorted_keys < <(printf '%s\n' "${sorted_keys[@]}" | sort)
-
-   for key in "${sorted_keys[@]}"; do
-      ctid="${key%%:*}"
-      _rest="${key#*:}"
-      user_uid="${_rest%%:*}"
-      service="${_rest#*:}"
-      ct_name="${CT_NAMES[$ctid]:-unknown}"
-
-      # systemd-manager can be restarted with daemon-reexec, no container reboot needed
-      if [[ "$service" == "systemd-manager" ]]; then
-         printf "Container %s (%s): systemd needs reexec (systemctl daemon-reexec)" "$ctid" "$ct_name"
-         print_security_annotation "$key"
-         if (( SECURITY )) && (( VERBOSE )); then
-            print_security_info "$key"
-         fi
-         if ! (( DRY_RUN )); then
-            pct exec "$ctid" -- systemctl daemon-reexec
-            rc=$?
-            if (( rc )); then
-               log_error "Failed to daemon-reexec in container $ctid (exit code: $rc)"
-            fi
-         else
-            printf "  [DRY RUN] Would run: pct exec %s -- systemctl daemon-reexec\n" "$ctid"
-         fi
-         continue
-      fi
-
-      # Scope units cannot be restarted with systemctl restart
-      if [[ "$service" == *.scope ]]; then
-         if [[ -n "$user_uid" ]]; then
-            printf "Container %s (%s): user session scope %s has outdated processes (stopping via systemctl --user stop)" "$ctid" "$ct_name" "$service"
-         else
-            printf "Container %s (%s): scope %s has outdated processes (cannot auto-restart, consider restarting user service or terminating scope)" "$ctid" "$ct_name" "$service"
-         fi
-         print_security_annotation "$key"
-         if (( SECURITY )) && (( VERBOSE )); then
-            print_security_info "$key"
-         fi
-         if ! (( DRY_RUN )); then
-            # Try to stop the scope which terminates its processes
-            if [[ -n "$user_uid" ]]; then
-               username=$(pct exec "$ctid" -- getent passwd "$user_uid" 2>/dev/null | cut -d: -f1)
-               if [[ -z "$username" ]]; then
-                  log_error "Could not resolve username for UID $user_uid in container $ctid; skipping $service"
-                  continue
-               fi
-               cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "stop" "$service")
-            else
-               cmd=("pct" "exec" "$ctid" "--" "systemctl" "stop" "$service")
-            fi
-            log_verbose "  Stopping scope: ${cmd[*]}"
-            "${cmd[@]}"
-            rc=$?
-            if (( rc )); then
-               log_error "Failed to stop scope $service in container $ctid (exit code: $rc)"
-            fi
-         else
-            if [[ -n "$user_uid" ]]; then
-               printf "  [DRY RUN] Would run: pct exec %s -- runuser -u <user> -- env XDG_RUNTIME_DIR=/run/user/%s systemctl --user stop %s\n" "$ctid" "$user_uid" "$service"
-            else
-               printf "  [DRY RUN] Would run: pct exec %s -- systemctl stop %s\n" "$ctid" "$service"
-            fi
-         fi
-         continue
-      fi
-
-      # User session service (a unit managed by the user's systemd, under
-      # user@N.service): restart via `systemctl --user` as the owning user.
-      # Restarting the same-named system unit (the old behaviour) does not
-      # touch these processes, so they were left stale after `-r`.
-      if [[ -n "$user_uid" ]]; then
-         printf "Container %s (%s): restarting user session service %s (UID %s)" "$ctid" "$ct_name" "$service" "$user_uid"
-         print_security_annotation "$key"
-         if (( SECURITY )) && (( VERBOSE )); then
-            print_security_info "$key"
-         fi
-         if (( DRY_RUN )); then
-            printf "  [DRY RUN] Would run: pct exec %s -- runuser -u <user> -- env XDG_RUNTIME_DIR=/run/user/%s systemctl --user restart %s\n" "$ctid" "$user_uid" "$service"
-            printf "  [DRY RUN] Would verify; if stale, escalate to: systemctl --user kill %s && systemctl --user start %s\n" "$service" "$service"
+def service_is_stale(ctid, service, user_uid):
+    """Return True if any process for this service still uses outdated
+    libraries (restart respected KillMode and left children running)."""
+    for pid, path in read_procs():
+        m = CGROUP_RE.match(path)
+        if not m or m.group(1) != ctid:
             continue
-         fi
-         username=$(pct exec "$ctid" -- getent passwd "$user_uid" 2>/dev/null | cut -d: -f1)
-         if [[ -z "$username" ]]; then
-            log_error "Could not resolve username for UID $user_uid in container $ctid; skipping $service"
+        if not os.access(f"/proc/{pid}/maps", os.R_OK):
             continue
-         fi
-         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "restart" "$service")
-         log_verbose "  Running: ${cmd[*]}"
-         "${cmd[@]}"
-         rc=$?
-         if (( rc )); then
-            log_error "Failed to restart user service $service in container $ctid (exit code: $rc)"
+        if user_uid:
+            if f"user@{user_uid}.service/" not in path:
+                continue
+            if not path.endswith("/" + service):
+                continue
+        else:
+            if not path.endswith("/" + service):
+                continue
+            if "user@" in path:      # same-named user unit, different owner
+                continue
+        ok, _ = check_process_fast(pid)
+        if ok:
+            return True
+    return False
+
+
+def restart_dbus_dependents(ctid, ct_name):
+    for dep in DBUS_DEPENDENT_SERVICES:
+        try:
+            r = subprocess.run(
+                ["pct", "exec", ctid, "--", "systemctl", "is-active", "--quiet", dep],
+                capture_output=True)
+            if r.returncode != 0:
+                continue
+        except Exception:
             continue
-         fi
-         if ! service_is_stale "$ctid" "$service" "$user_uid"; then
-            log_verbose "  Restart cleared stale processes for user service $service"
+        # Already in the restart list (handled by the main loop)
+        if f"{ctid}::{dep}" in CONT_SERVICES:
             continue
-         fi
-         printf "  -> Restart did not clear all processes (likely KillMode=process); escalating to systemctl --user kill + start\n"
-         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "kill" "$service")
-         log_verbose "  Running: ${cmd[*]}"
-         "${cmd[@]}"
-         sleep 1
-         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "start" "$service")
-         log_verbose "  Running: ${cmd[*]}"
-         "${cmd[@]}"
-         if ! service_is_stale "$ctid" "$service" "$user_uid"; then
-            printf "  -> Cleared via systemctl --user kill + start\n"
+        print(f"Container {ctid} ({ct_name}): restarting D-Bus dependent {dep} "
+              f"(lost connection after dbus restart)")
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl restart {dep}")
             continue
-         fi
-         printf "  -> Processes survived SIGTERM; forcing SIGKILL\n"
-         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "kill" "--signal=SIGKILL" "$service")
-         log_verbose "  Running: ${cmd[*]}"
-         "${cmd[@]}"
-         sleep 1
-         cmd=("pct" "exec" "$ctid" "--" "runuser" "-u" "$username" "--" "env" "XDG_RUNTIME_DIR=/run/user/$user_uid" "systemctl" "--user" "start" "$service")
-         log_verbose "  Running: ${cmd[*]}"
-         "${cmd[@]}"
-         if service_is_stale "$ctid" "$service" "$user_uid"; then
-            log_error "User service $service in container $ctid still has stale processes after kill + start"
-         else
-            printf "  -> Cleared via SIGKILL + start\n"
-         fi
-         continue
-      fi
+        r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "restart", dep])
+        if r.returncode:
+            log_error(f"Failed to restart {dep} in container {ctid} "
+                      f"(exit code: {r.returncode})")
 
-      printf "Container %s (%s): restarting service %s" "$ctid" "$ct_name" "$service"
-      print_security_annotation "$key"
-      if (( SECURITY )) && (( VERBOSE )); then
-         print_security_info "$key"
-      fi
-      if (( DRY_RUN )); then
-         printf "  [DRY RUN] Would run: pct exec %s -- systemctl restart %s\n" "$ctid" "$service"
-         printf "  [DRY RUN] Would verify; if stale, escalate to: pct exec %s -- systemctl kill %s && systemctl start %s\n" "$ctid" "$service" "$service"
-         continue
-      fi
 
-      # Step 1: normal restart. This works for services with the default
-      # KillMode=control-group, which kills all processes in the cgroup.
-      cmd=("pct" "exec" "$ctid" "--" "systemctl" "restart" "$service")
-      log_verbose "  Running: ${cmd[*]}"
-      "${cmd[@]}"
-      rc=$?
-      if (( rc )); then
-         log_error "Failed to restart $service in container $ctid (exit code: $rc)"
-         log_verbose "$(pct exec "$ctid" -- systemctl status "$service" 2>&1 | tail -5)"
-         continue
-      fi
+def resolve_user(ctid, user_uid):
+    r = subprocess.run(
+        ["pct", "exec", ctid, "--", "getent", "passwd", user_uid],
+        capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout:
+        return r.stdout.split(":", 1)[0]
+    return ""
 
-      # After restarting dbus.service, restart services that registered
-      # D-Bus names and lost their connection to the old daemon. Without
-      # this, services like systemd-logind keep running but are invisible
-      # on the new D-Bus, causing activation timeouts (e.g. 25s SSH delay
-      # via pam_systemd.so).
-      if [[ "$service" == "dbus.service" ]]; then
-         restart_dbus_dependents "$ctid" "$ct_name"
-      fi
 
-      # Step 2: verify the restart actually cleared the stale processes.
-      # systemctl restart respects KillMode; services with KillMode=process
-      # (e.g. cron.service) leave child processes such as daemons spawned by
-      # cron jobs running with outdated libraries, so the reported "restart"
-      # would otherwise look successful while the stale process persists.
-      if ! service_is_stale "$ctid" "$service" ""; then
-         log_verbose "  Restart cleared stale processes for $service"
-         continue
-      fi
+def systemctl_cmd(ctid, action, service, user_uid="", username=""):
+    cmd = ["pct", "exec", ctid, "--"]
+    if user_uid:
+        cmd += ["runuser", "-u", username, "--", "env",
+                f"XDG_RUNTIME_DIR=/run/user/{user_uid}",
+                "systemctl", "--user", action, service]
+    else:
+        cmd += ["systemctl", action, service]
+    return cmd
 
-      # Step 3: escalate. systemctl kill sends the signal to ALL processes in
-      # the cgroup regardless of KillMode, then systemctl start brings the main
-      # daemon back up.
-      printf "  -> Restart did not clear all processes (likely KillMode=process); escalating to systemctl kill + start\n"
-      cmd=("pct" "exec" "$ctid" "--" "systemctl" "kill" "$service")
-      log_verbose "  Running: ${cmd[*]}"
-      "${cmd[@]}"
-      sleep 1
-      cmd=("pct" "exec" "$ctid" "--" "systemctl" "start" "$service")
-      log_verbose "  Running: ${cmd[*]}"
-      "${cmd[@]}"
 
-      if ! service_is_stale "$ctid" "$service" ""; then
-         printf "  -> Cleared via systemctl kill + start\n"
-         continue
-      fi
+def restart_with_escalation(ctid, ct_name, service, user_uid="", username=""):
+    """restart a service, verify stale processes are gone, and escalate to
+    kill + start, then SIGKILL + start if KillMode leaves children behind."""
+    tool = "systemctl --user" if user_uid else "systemctl"
 
-      # Step 4: SIGTERM was not enough; force kill.
-      printf "  -> Processes survived SIGTERM; forcing SIGKILL\n"
-      cmd=("pct" "exec" "$ctid" "--" "systemctl" "kill" "--signal=SIGKILL" "$service")
-      log_verbose "  Running: ${cmd[*]}"
-      "${cmd[@]}"
-      sleep 1
-      cmd=("pct" "exec" "$ctid" "--" "systemctl" "start" "$service")
-      log_verbose "  Running: ${cmd[*]}"
-      "${cmd[@]}"
-      if service_is_stale "$ctid" "$service" ""; then
-         log_error "Service $service in container $ctid still has stale processes after kill + start"
-      else
-         printf "  -> Cleared via SIGKILL + start\n"
-      fi
-   done
-}
+    def run(action, extra=()):
+        cmd = systemctl_cmd(ctid, action, service, user_uid, username)
+        if action == "kill" and extra:
+            cmd = ["pct", "exec", ctid, "--"]
+            if user_uid:
+                cmd += ["runuser", "-u", username, "--", "env",
+                        f"XDG_RUNTIME_DIR=/run/user/{user_uid}",
+                        "systemctl", "--user", action, *extra, service]
+            else:
+                cmd += ["systemctl", action, *extra, service]
+        log_verbose("  Running: " + " ".join(cmd))
+        return subprocess.run(cmd).returncode
 
-# ------------------------------------------------------------------------------
+    # Step 1: normal restart (works for default KillMode=control-group)
+    rc = run("restart")
+    if rc:
+        log_error(f"Failed to restart {service} in container {ctid} (exit code: {rc})")
+        if not user_uid:
+            r = subprocess.run(
+                ["pct", "exec", ctid, "--", "systemctl", "status", service],
+                capture_output=True, text=True)
+            log_verbose("\n".join(r.stdout.splitlines()[-5:]))
+        return
+
+    # After restarting dbus.service, re-register its D-Bus dependents.
+    if not user_uid and service == "dbus.service":
+        restart_dbus_dependents(ctid, ct_name)
+
+    # Step 2: verify the restart cleared the stale processes
+    if not service_is_stale(ctid, service, user_uid):
+        log_verbose(f"  Restart cleared stale processes for {service}")
+        return
+
+    # Step 3: escalate to kill + start (kill hits all cgroup processes)
+    print(f"  -> Restart did not clear all processes (likely KillMode=process); "
+          f"escalating to {tool} kill + start")
+    run("kill")
+    time.sleep(1)
+    run("start")
+    if not service_is_stale(ctid, service, user_uid):
+        print(f"  -> Cleared via {tool} kill + start")
+        return
+
+    # Step 4: SIGTERM not enough; force kill
+    print("  -> Processes survived SIGTERM; forcing SIGKILL")
+    run("kill", ("--signal=SIGKILL",))
+    time.sleep(1)
+    run("start")
+    if service_is_stale(ctid, service, user_uid):
+        prefix = "User service" if user_uid else "Service"
+        log_error(f"{prefix} {service} in container {ctid} still has stale "
+                  f"processes after kill + start")
+    else:
+        print("  -> Cleared via SIGKILL + start")
+
+
+def print_security_info(key):
+    if key not in CONT_CVES:
+        return
+    for line in CONT_CVES[key].split("\n"):
+        if line:
+            print(f"  [security] {line}")
+
+
+def print_cve_count_suffix(key):
+    if not SECURITY or VERBOSE:
+        return
+    cve_count = CONT_CVE_COUNTS.get(key, 0)
+    if cve_count <= 0:
+        return
+    plural = "" if cve_count == 1 else "s"
+    print(f" ({cve_count} CVE{plural})", end="")
+
+
+def print_security_annotation(key):
+    if SECURITY and VERBOSE:
+        print()
+    else:
+        print_cve_count_suffix(key)
+        print()
+
+
+def print_results():
+    if not CONT_SERVICES:
+        print("No containers have services needing restart.")
+        return
+    for key in sorted(CONT_SERVICES):
+        ctid, _rest = key.split(":", 1)
+        user_uid, service = _rest.split(":", 1)
+        ct_name = CT_NAMES.get(ctid, "unknown")
+        libs = CONT_SERVICES[key]
+        svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
+        print(f"Container {ctid} ({ct_name}): service {svc_display} needs restart", end="")
+        print_security_annotation(key)
+        if VERBOSE:
+            for lib in libs.split("\n"):
+                if lib:
+                    print(f"  - {lib}")
+        if SECURITY and VERBOSE:
+            print_security_info(key)
+
+
+def restart_services():
+    if not CONT_SERVICES:
+        print("No containers have services needing restart.")
+        return
+    for key in sorted(CONT_SERVICES):
+        ctid, _rest = key.split(":", 1)
+        user_uid, service = _rest.split(":", 1)
+        ct_name = CT_NAMES.get(ctid, "unknown")
+
+        # systemd-manager can be re-exec'd, no container reboot needed
+        if service == "systemd-manager":
+            print(f"Container {ctid} ({ct_name}): systemd needs reexec "
+                  f"(systemctl daemon-reexec)", end="")
+            print_security_annotation(key)
+            if SECURITY and VERBOSE:
+                print_security_info(key)
+            if DRY_RUN:
+                print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl daemon-reexec")
+                continue
+            r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "daemon-reexec"])
+            if r.returncode:
+                log_error(f"Failed to daemon-reexec in container {ctid} "
+                          f"(exit code: {r.returncode})")
+            continue
+
+        # Scope units cannot be restarted with systemctl restart
+        if service.endswith(".scope"):
+            if user_uid:
+                print(f"Container {ctid} ({ct_name}): user session scope {service} "
+                      f"has outdated processes (stopping via systemctl --user stop)", end="")
+            else:
+                print(f"Container {ctid} ({ct_name}): scope {service} has outdated "
+                      f"processes (cannot auto-restart, consider restarting user "
+                      f"service or terminating scope)", end="")
+            print_security_annotation(key)
+            if SECURITY and VERBOSE:
+                print_security_info(key)
+            if DRY_RUN:
+                if user_uid:
+                    print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
+                          f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
+                          f"systemctl --user stop {service}")
+                else:
+                    print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl stop {service}")
+                continue
+            if user_uid:
+                username = resolve_user(ctid, user_uid)
+                if not username:
+                    log_error(f"Could not resolve username for UID {user_uid} in "
+                              f"container {ctid}; skipping {service}")
+                    continue
+                cmd = systemctl_cmd(ctid, "stop", service, user_uid, username)
+            else:
+                cmd = ["pct", "exec", ctid, "--", "systemctl", "stop", service]
+            log_verbose("  Stopping scope: " + " ".join(cmd))
+            r = subprocess.run(cmd)
+            if r.returncode:
+                log_error(f"Failed to stop scope {service} in container {ctid} "
+                          f"(exit code: {r.returncode})")
+            continue
+
+        # User session service (managed by user's systemd under user@N.service):
+        # restart via `systemctl --user` as the owning user.
+        if user_uid:
+            print(f"Container {ctid} ({ct_name}): restarting user session service "
+                  f"{service} (UID {user_uid})", end="")
+            print_security_annotation(key)
+            if SECURITY and VERBOSE:
+                print_security_info(key)
+            if DRY_RUN:
+                print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
+                      f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
+                      f"systemctl --user restart {service}")
+                print(f"  [DRY RUN] Would verify; if stale, escalate to: "
+                      f"systemctl --user kill {service} && systemctl --user start {service}")
+                continue
+            username = resolve_user(ctid, user_uid)
+            if not username:
+                log_error(f"Could not resolve username for UID {user_uid} in "
+                          f"container {ctid}; skipping {service}")
+                continue
+            restart_with_escalation(ctid, ct_name, service, user_uid, username)
+            continue
+
+        # Standard system service
+        print(f"Container {ctid} ({ct_name}): restarting service {service}", end="")
+        print_security_annotation(key)
+        if SECURITY and VERBOSE:
+            print_security_info(key)
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl restart {service}")
+            print(f"  [DRY RUN] Would verify; if stale, escalate to: "
+                  f"pct exec {ctid} -- systemctl kill {service} && systemctl start {service}")
+            continue
+        restart_with_escalation(ctid, ct_name, service)
+
+
+# ---------------------------------------------------------------------------
 # Security scan: CVE analysis (-s, --security)
-#
-# Maps each stale library to its owning dpkg package, determines the version the
-# stale process is running (dpkg.log timestamps vs process start time), and
-# reports whether the pending update is a security fix and how many CVEs it
-# addresses. Online data is queried first (OSV for Debian, Ubuntu Security API
-# for Ubuntu) and cached in $CACHE_DIR; if the network is unavailable or the
-# package is not tracked, the package's changelog inside the container is used
-# as an offline fallback. All container data is read via /proc/<init>/root, so
-# no pct exec round-trips are needed.
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-# Return the host-side path to a container's root filesystem
-ct_root() {
-   printf '/proc/%s/root' "${CT_PIDS[$1]}"
-}
+def ct_root(ctid):
+    return f"/proc/{CT_PIDS[ctid]}/root"
 
-# Read /etc/os-release of a container into the CT_OS_* maps
-load_ct_os() {
-   local ctid="$1" root="$2" key val
-   [[ -f "$root/etc/os-release" ]] || return 1
-   while IFS='=' read -r key val; do
-      [[ -z "$key" ]] && continue
-      val="${val//\"/}"
-      case "$key" in
-         ID) CT_OS_ID["$ctid"]="$val" ;;
-         VERSION_ID) CT_OS_RELEASE["$ctid"]="$val" ;;
-         VERSION_CODENAME) CT_OS_CODENAME["$ctid"]="$val" ;;
-      esac
-   done < "$root/etc/os-release"
-   [[ -n "${CT_OS_ID[$ctid]+x}" ]]
-}
 
-# Parse a container's dpkg status into "pkg<TAB>version<TAB>source" lines,
-# cached per container in $WORKDIR. Returns 1 if there is no dpkg database.
-parse_dpkg_status() {
-   local ctid="$1" root="$2"
-   local out="$WORKDIR/status-$ctid.tsv"
-   [[ -f "$out" ]] && return 0
-   [[ -f "$root/var/lib/dpkg/status" ]] || return 1
-   awk -F': ' '
-      $1 == "Package" { pkg = $2; sub(/^ +/, "", pkg) }
-      $1 == "Version" { ver = $2; sub(/^ +/, "", ver) }
-      $1 == "Source"  { src = $2; sub(/^ +/, "", src); sub(/ .*/, "", src) }
-      $1 == "Status"  { st = $2 }
-      /^$/ {
-         if (pkg != "" && st ~ /^install/) print pkg "\t" ver "\t" src
-         pkg = ""; ver = ""; src = ""; st = ""
-      }
-   ' "$root/var/lib/dpkg/status" > "$out" 2>/dev/null || return 1
-   return 0
-}
+def load_ct_os(ctid, root):
+    osr = os.path.join(root, "etc/os-release")
+    if not os.path.isfile(osr):
+        return False
+    for line in open(osr, errors="ignore"):
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip('"')
+        if k == "ID":
+            CT_OS_ID[ctid] = v
+        elif k == "VERSION_ID":
+            CT_OS_RELEASE[ctid] = v
+        elif k == "VERSION_CODENAME":
+            CT_OS_CODENAME[ctid] = v
+    return ctid in CT_OS_ID
 
-# Print "version<TAB>source" for a binary package from the parsed status file
-status_lookup() {
-   local ctid="$1" binpkg="$2"
-   awk -F '\t' -v pkg="$binpkg" '$1 == pkg { print $2 "\t" $3; exit }' \
-      "$WORKDIR/status-$ctid.tsv" 2>/dev/null
-}
 
-# List binary packages owning a file path (dpkg file-list database lookup;
-# works even when the file was deleted or replaced)
-pkgs_for_path() {
-   local root="$1" path="$2" list_file binpkg
-   [[ "$path" =~ ^/[A-Za-z0-9._+~/-]+$ ]] || return 0
-   for list_file in "$root"/var/lib/dpkg/info/*.list; do
-      [[ -f "$list_file" ]] || continue
-      grep -qxF "$path" "$list_file" 2>/dev/null || continue
-      binpkg="$(basename "$list_file")"
-      binpkg="${binpkg%.list}"
-      binpkg="${binpkg%%:*}"
-      printf '%s\n' "$binpkg"
-   done | sort -u
-}
+def parse_dpkg_status(ctid, root):
+    out = os.path.join(WORKDIR, f"status-{ctid}.tsv")
+    if os.path.isfile(out):
+        return True
+    st = os.path.join(root, "var/lib/dpkg/status")
+    if not os.path.isfile(st):
+        return False
+    rows = []
+    pkg = ver = src = status = ""
+    for line in open(st, errors="ignore"):
+        if line.startswith("Package: "):
+            pkg = line[len("Package: "):].strip()
+        elif line.startswith("Version: "):
+            ver = line[len("Version: "):].strip()
+        elif line.startswith("Source: "):
+            src = line[len("Source: "):].strip().split()[0] if line[len("Source: "):].strip() else ""
+        elif line.startswith("Status: "):
+            status = line[len("Status: "):].strip()
+        elif line == "\n":
+            if pkg and status.startswith("install"):
+                rows.append(f"{pkg}\t{ver}\t{src}")
+            pkg = ver = src = status = ""
+    with open(out, "w") as fh:
+        fh.write("\n".join(rows) + ("\n" if rows else ""))
+    return True
 
-# Debian-style version comparison; echoes -1, 0 or 1 (dpkg semantics)
-ver_cmp() {
-   local a="$1" b="$2"
-   if dpkg --compare-versions "$a" eq "$b" 2>/dev/null; then
-      printf '0'
-   elif dpkg --compare-versions "$a" gt "$b" 2>/dev/null; then
-      printf '1'
-   else
-      printf -- '-1'
-   fi
-}
 
-# Determine the package version in effect when a process started, by matching
-# dpkg.log upgrade/install timestamps against the process start time (epoch).
-version_at_start() {
-   local root="$1" binpkg="$2" start_epoch="$3"
-   local f all="" filtered line ts version best_ts=0 best="" tz
-   for f in "$root"/var/log/dpkg.log*; do
-      [[ -f "$f" ]] || continue
-      if [[ "$f" == *.gz ]]; then
-         all+="$(zcat "$f" 2>/dev/null)"$'\n'
-      else
-         all+="$(cat "$f" 2>/dev/null)"$'\n'
-      fi
-   done
-   [[ -n "$all" ]] || return 0
-   filtered="$(awk -v pkg="$binpkg" '
-      $3 == "upgrade" || $3 == "install" {
-         p = $4; sub(/:.*/, "", p)
-         if (p == pkg) {
-            v = ($3 == "upgrade") ? $6 : $5
-            if (v != "") print $1 " " $2 " " v
-         }
-      }' <<<"$all")"
-   tz="$(tr -d ' \n' < "$root/etc/timezone" 2>/dev/null)"
-   while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      ts="$(TZ="$tz" date -d "${line:0:19}" +%s 2>/dev/null)" || continue
-      (( ts <= start_epoch )) || continue
-      (( ts < best_ts )) && continue
-      best="${line:20}"
-      best_ts="$ts"
-   done <<<"$filtered"
-   printf '%s' "$best"
-}
+def status_lookup(ctid, binpkg):
+    f = os.path.join(WORKDIR, f"status-{ctid}.tsv")
+    try:
+        for line in open(f):
+            p, v, s = line.rstrip("\n").split("\t")
+            if p == binpkg:
+                return f"{v}\t{s}"
+    except (OSError, ValueError):
+        pass
+    return ""
 
-# Fallback old-version lookup using /var/log/apt/history.log blocks
-version_at_start_apt() {
-   local root="$1" binpkg="$2" start_epoch="$3"
-   local f all="" line block_ts="" entry new_ver best_ts=0 best="" tz
-   for f in "$root"/var/log/apt/history.log*; do
-      [[ -f "$f" ]] || continue
-      if [[ "$f" == *.gz ]]; then
-         all+="$(zcat "$f" 2>/dev/null)"$'\n'
-      else
-         all+="$(cat "$f" 2>/dev/null)"$'\n'
-      fi
-   done
-   [[ -n "$all" ]] || return 0
-   tz="$(tr -d ' \n' < "$root/etc/timezone" 2>/dev/null)"
-   while IFS= read -r line; do
-      if [[ "$line" == Start-Date:* ]]; then
-         block_ts="$(TZ="$tz" date -d "${line#Start-Date: }" +%s 2>/dev/null)"
-         continue
-      fi
-      [[ -n "$block_ts" ]] || continue
-      [[ "$line" == Upgrade:* ]] || continue
-      (( block_ts > start_epoch )) && continue
-      (( block_ts < best_ts )) && continue
-      entry="$(grep -oE "${binpkg}(:[A-Za-z0-9]+)? \([^)]*\)" <<<"$line" | head -1)"
-      [[ -n "$entry" ]] || continue
-      new_ver="$(sed -E 's/^.*\([^,]+, *([^)]*)\).*$/\1/' <<<"$entry")"
-      [[ -n "$new_ver" ]] || continue
-      best="$new_ver"
-      best_ts="$block_ts"
-   done <<<"$all"
-   printf '%s' "$best"
-}
 
-# Print changelog entries as ENTRY markers plus verbatim body lines, so the
-# caller can reconstruct each entry's version, suite and body text
-parse_changelog() {
-   local file="$1"
-   if [[ "$file" == *.gz ]]; then
-      zcat "$file" 2>/dev/null
-   else
-      cat "$file" 2>/dev/null
-   fi | awk '
-      /^[A-Za-z0-9.+~_-]+ \([^)]+\) [^;]+; urgency=/ {
-         line = $0
-         version = line; sub(/^[^ ]+ \(/, "", version); sub(/\)[^)]*/, "", version)
-         suite = line; sub(/^[^ ]+ \([^)]+\) /, "", suite); sub(/;.*/, "", suite)
-         print "ENTRY\t" version "\t" suite
-         next
-      }
-      /^ -- / { next }
-      { print }
-   '
-}
+def pkgs_for_path(root, path):
+    if not re.match(r"^/[A-Za-z0-9._+~/-]+$", path):
+        return []
+    pkgs = set()
+    for list_file in glob.glob(root + "/var/lib/dpkg/info/*.list"):
+        if not os.path.isfile(list_file):
+            continue
+        try:
+            with open(list_file, errors="ignore") as fh:
+                lines = set(fh.read().splitlines())
+        except OSError:
+            continue
+        if path in lines:
+            base = os.path.basename(list_file)[:-len(".list")]
+            pkgs.add(base.split(":")[0])
+    return sorted(pkgs)
 
-# Offline verdict from the package changelog: counts CVE references in the
-# changelog entries between old and new versions. If old is empty, only the
-# newest entry is considered (old version could not be determined).
-changelog_verdict() {
-   local root="$1" binpkg="$2" srcpkg="$3" old="$4" new="$5"
-   local docpkg file line version suite tmpcve
-   local -a cves=()
-   local sec_count=0 want_entry=0 top_entry=0 n shown=0 list="" sep="" id
 
-   for docpkg in "$binpkg" "$srcpkg"; do
-      for file in \
-         "$root/usr/share/doc/$docpkg/changelog.Debian.gz" \
-         "$root/usr/share/doc/$docpkg/changelog.Debian" \
-         "$root/usr/share/doc/$docpkg/changelog.gz" \
-         "$root/usr/share/doc/$docpkg/changelog"; do
-         [[ -f "$file" ]] && break 2
-      done
-   done
-   [[ -f "$file" ]] || return 1
+def ver_cmp(a, b):
+    """Debian version comparison; returns -1, 0 or 1 (dpkg semantics)."""
+    if subprocess.run(["dpkg", "--compare-versions", a, "eq", b],
+                      capture_output=True).returncode == 0:
+        return 0
+    if subprocess.run(["dpkg", "--compare-versions", a, "gt", b],
+                      capture_output=True).returncode == 0:
+        return 1
+    return -1
 
-   tmpcve="$(mktemp "$WORKDIR/changelog-cves.XXXXXX")"
-   while IFS= read -r line; do
-      if [[ "$line" == ENTRY* ]]; then
-         if (( top_entry )); then
+
+def epoch_from_date(datestr, tz):
+    cmd = ["date", "-d", datestr, "+%s"]
+    env = dict(os.environ)
+    if tz:
+        env["TZ"] = tz
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10)
+        if r.returncode == 0 and r.stdout.strip().isdigit():
+            return int(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def version_at_start(root, binpkg, start_epoch):
+    """Determine the package version in effect when a process started, by
+    matching dpkg.log upgrade/install timestamps against the process start."""
+    all_data = ""
+    for f in sorted(glob.glob(root + "/var/log/dpkg.log*")):
+        if not os.path.isfile(f):
+            continue
+        try:
+            if f.endswith(".gz"):
+                with gzip.open(f, "rt", errors="ignore") as fh:
+                    all_data += fh.read() + "\n"
+            else:
+                with open(f, "r", errors="ignore") as fh:
+                    all_data += fh.read() + "\n"
+        except OSError:
+            pass
+    if not all_data:
+        return ""
+
+    tz = ""
+    try:
+        tz = re.sub(r"[\s]", "", open(root + "/etc/timezone").read())
+    except OSError:
+        pass
+
+    best = ""
+    best_ts = 0
+    for line in all_data.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[2] not in ("upgrade", "install"):
+            continue
+        p = parts[3].split(":")[0]
+        if p != binpkg:
+            continue
+        if parts[2] == "upgrade" and len(parts) >= 6:
+            v = parts[5]
+        else:
+            v = parts[4]
+        if not v:
+            continue
+        ts = epoch_from_date(line[:19], tz)
+        if ts is None:
+            continue
+        if ts <= start_epoch and ts >= best_ts:
+            best_ts = ts
+            best = v
+    return best
+
+
+def parse_changelog(path):
+    """Yield ("ENTRY", version, suite) and ("BODY", text) tuples."""
+    fh = gzip.open(path, "rt", errors="ignore") if path.endswith(".gz") else open(path, "r", errors="ignore")
+    with fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if re.match(r"^[A-Za-z0-9.+~_-]+ \([^)]+\) [^;]+; urgency=", line):
+                version = re.sub(r"\)[^)]*", "", re.sub(r"^[^ ]+ \(", "", line))
+                suite = re.sub(r";.*", "", re.sub(r"^[^ ]+ \([^)]+\) ", "", line))
+                yield ("ENTRY", version, suite)
+            elif line.startswith("-- "):
+                continue
+            else:
+                yield ("BODY", line)
+
+
+def changelog_verdict(root, binpkg, srcpkg, old, new):
+    """Offline verdict from the package changelog: count CVE references in the
+    entries between old and new versions. If old is empty, only the newest
+    entry is considered. Returns "count<TAB>verdict" or "" if no changelog."""
+    file = None
+    for docpkg in (binpkg, srcpkg):
+        for cand in (
+            f"{root}/usr/share/doc/{docpkg}/changelog.Debian.gz",
+            f"{root}/usr/share/doc/{docpkg}/changelog.Debian",
+            f"{root}/usr/share/doc/{docpkg}/changelog.gz",
+            f"{root}/usr/share/doc/{docpkg}/changelog",
+        ):
+            if os.path.isfile(cand):
+                file = cand
+                break
+        if file:
             break
-         fi
-         IFS=$'\t' read -r _ version suite <<<"$line"
-         want_entry=0
-         if [[ -n "$old" ]]; then
-            [[ "$(ver_cmp "$version" "$old")" -gt 0 && "$(ver_cmp "$version" "$new")" -le 0 ]] && want_entry=1
-         else
-            want_entry=1
-            top_entry=1
-         fi
-         if (( want_entry )) && [[ "$suite" == *-security* || "$suite" == *-updates* ]]; then
-            sec_count=$((sec_count + 1))
-         fi
-      elif (( want_entry )); then
-         grep -oE 'CVE-[0-9]{4}-[0-9]+' <<<"$line" >> "$tmpcve" 2>/dev/null
-      fi
-   done < <(parse_changelog "$file")
-   mapfile -t cves < <(sort -u "$tmpcve" 2>/dev/null)
-   rm -f "$tmpcve"
+    if not file:
+        return ""
 
-   n="${#cves[@]}"
-   for id in "${cves[@]}"; do
-      if (( shown < 6 )); then
-         list+="$sep$id"
-         sep=", "
-      fi
-      ((shown++))
-   done
-   (( shown > 6 )) && list+=", and $((shown - 6)) more"
+    cves = set()
+    sec_count = 0
+    want_entry = False
+    top_entry = False
+    for kind, *fields in parse_changelog(file):
+        if kind == "ENTRY":
+            if top_entry:
+                break
+            version, suite = fields
+            want_entry = False
+            if old:
+                if ver_cmp(version, old) > 0 and ver_cmp(version, new) <= 0:
+                    want_entry = True
+            else:
+                want_entry = True
+                top_entry = True
+            if want_entry and ("-security" in suite or "-updates" in suite):
+                sec_count += 1
+        elif kind == "BODY" and want_entry:
+            for cve in re.findall(r"CVE-\d{4}-\d+", fields[0]):
+                cves.add(cve)
 
-   local plural="s" secpart=""
-   (( n == 1 )) && plural=""
-   (( sec_count > 0 )) && secpart=", security upload"
-   if [[ -n "$old" ]]; then
-      if (( n > 0 )); then
-         printf '%d\t%s %s -> %s: fixes %d CVE%s (%s)%s [changelog]' \
-            "$n" "$binpkg" "$old" "$new" "$n" "$plural" "$list" "$secpart"
-      else
-         printf '%d\t%s %s -> %s: no CVEs listed in changelog for this update [changelog]' \
-            "$n" "$binpkg" "$old" "$new"
-      fi
-   else
-      if (( n > 0 )); then
-         printf '%d\t%s -> %s (old version unknown): latest changelog entry lists %d CVE%s (%s)%s [changelog]' \
-            "$n" "$binpkg" "$new" "$n" "$plural" "$list" "$secpart"
-      else
-         printf '%d\t%s -> %s (old version unknown): latest changelog entry lists no CVEs [changelog]' \
-            "$n" "$binpkg" "$new"
-      fi
-   fi
-}
+    cves = sorted(cves)
+    n = len(cves)
+    shown = 0
+    shown_list = []
+    for cve in cves:
+        if shown < 6:
+            shown_list.append(cve)
+        shown += 1
+    cvelist = ", ".join(shown_list)
+    if shown > 6:
+        cvelist += f", and {shown - 6} more"
+    plural = "" if n == 1 else "s"
+    secpart = ", security upload" if sec_count > 0 else ""
 
-# Strip descriptive suffixes from library paths found in /proc/*/maps
-clean_lib_path() {
-   local p="$1"
-   p="${p% (executable)}"
-   p="${p% (inode mismatch)}"
-   p="${p% (deleted)}"
-   printf '%s' "$p"
-}
-
-# Query (cached) the OSV API for a Debian package version; emits
-# "CVE-ID<TAB>fixed-version" lines. Returns 1 on network failure.
-osv_collect() {
-   local srcpkg="$1" version="$2" release="$3" cache_name
-   version="$(sed -E 's/\+b[0-9]+$//' <<<"$version")"
-   cache_name="$(printf '%s' "$release-$srcpkg-$version" | tr -c 'A-Za-z0-9._-' '_')"
-   CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/osv_filter.py" \
-      "$srcpkg" "$version" "$release" "$CACHE_DIR/osv-$cache_name.json" 2>/dev/null
-}
-
-# Query (cached) the Ubuntu Security API for all CVEs of a source package;
-# emits "CVE-ID<TAB>fixed-version<TAB>cvss3" lines for one release codename
-# with status "released". Returns 1 on network failure.
-ubuntu_collect() {
-   local srcpkg="$1" codename="$2" cache_name
-   cache_name="$(printf '%s' "ubuntu-$srcpkg" | tr -c 'A-Za-z0-9._-' '_')"
-   CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/ubuntu_cves.py" \
-      "$srcpkg" "$codename" "$CACHE_DIR/$cache_name.json" 2>/dev/null
-}
-
-# Produce the security verdict for one source package update; results are
-# cached in EXT_VERDICTS so shared libraries in the same container are only
-# analyzed once
-security_analysis() {
-   local ctid="$1" srcpkg="$2" binpkg="$3" old="$4" new="$5"
-   local verdict_key="$ctid|$srcpkg|$old|$new"
-   local root verdict result line cve_id fixed cvss3 _
-   local -a cves=() cvss_list=()
-   local -A seen_cves=()
-   local count=0 online_ok=0 src_label=""
-
-   if [[ -n "${EXT_VERDICTS[$verdict_key]+x}" ]]; then
-      printf '%s' "${EXT_VERDICTS[$verdict_key]}"
-      return 0
-   fi
-
-   root="$(ct_root "$ctid")"
-
-   if [[ -z "$old" ]]; then
-      # Old version unknown: report the latest changelog entry only
-      result="$(changelog_verdict "$root" "$binpkg" "$srcpkg" "" "$new")"
-      if [[ -n "$result" ]]; then
-         count="${result%%$'\t'*}"
-         verdict="${result#*$'\t'}"
-      else
-         verdict="$binpkg -> $new (old version unknown): no changelog available"
-      fi
-   elif [[ "$(ver_cmp "$old" "$new")" -ge 0 ]]; then
-      verdict="$binpkg $old -> $new: no version change since process start"
-   else
-      if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-         case "${CT_OS_ID[$ctid]}" in
-            debian)
-               if [[ -n "${CT_OS_RELEASE[$ctid]}" ]] && \
-                  osv_collect "$srcpkg" "$old" "Debian:${CT_OS_RELEASE[$ctid]}" \
-                     > "$WORKDIR/online.out" 2>/dev/null; then
-                  online_ok=1
-                  src_label="OSV"
-               fi
-               ;;
-            ubuntu)
-               if [[ -n "${CT_OS_CODENAME[$ctid]}" ]] && \
-                  ubuntu_collect "$srcpkg" "${CT_OS_CODENAME[$ctid]}" \
-                     > "$WORKDIR/online.out" 2>/dev/null; then
-                  online_ok=1
-                  src_label="Ubuntu Security API"
-               fi
-               ;;
-         esac
-      fi
-
-      if (( online_ok )); then
-         while IFS=$'\t' read -r cve_id fixed cvss3 _; do
-            [[ -n "$cve_id" && -n "$fixed" ]] || continue
-            [[ "$(ver_cmp "$old" "$fixed")" -lt 0 && "$(ver_cmp "$fixed" "$new")" -le 0 ]] || continue
-            [[ -n "${seen_cves[$cve_id]+x}" ]] && continue
-            seen_cves["$cve_id"]=1
-            count=$((count + 1))
-            cves+=("$cve_id")
-            [[ -n "$cvss3" ]] && cvss_list+=("$cvss3")
-         done < "$WORKDIR/online.out"
-         if (( count > 0 )); then
-            local list="" sep="" cvss="" id shown=0 plural="s"
-            for id in "${cves[@]}"; do
-               if (( shown < 6 )); then
-                  list+="$sep$id"
-                  sep=", "
-               fi
-               ((shown++))
-            done
-            (( shown > 6 )) && list+=", and $((shown - 6)) more"
-            (( count == 1 )) && plural=""
-            if (( ${#cvss_list[@]} > 0 )); then
-               cvss=", CVSS $(printf '%s\n' "${cvss_list[@]}" | paste -sd, -)"
-            fi
-            verdict="$binpkg $old -> $new: SECURITY update, fixes $count CVE$plural ($list$cvss) [$src_label]"
-         else
-            verdict="$binpkg $old -> $new: no security-relevant CVEs found [$src_label]"
-         fi
-      else
-         # Online lookup unavailable or failed: use the in-container changelog
-         result="$(changelog_verdict "$root" "$binpkg" "$srcpkg" "$old" "$new")"
-         if [[ -n "$result" ]]; then
-            count="${result%%$'\t'*}"
-            verdict="${result#*$'\t'}"
-         else
-            verdict="$binpkg $old -> $new: security data unavailable (offline?)"
-         fi
-      fi
-   fi
-
-   EXT_VERDICTS["$verdict_key"]="$count"$'\t'"$verdict"
-   printf '%d\t%s' "$count" "$verdict"
-}
-
-# Analyze all stale libraries of one service and append verdict lines to
-# CONT_CVES for the service key
-analyze_service_libs() {
-   local ctid="$1" key="$2" root="$3" start_epoch="$4" libs="$5"
-   local line path binpkg status_out curver srcpkg old verdict result count vkey
-   local -a binpkgs=()
-   local -A seen_pkgs=() seen_verdicts=()
-
-   while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      path="$(clean_lib_path "$line")"
-      while IFS= read -r binpkg; do
-         [[ -n "$binpkg" ]] || continue
-         [[ -n "${seen_pkgs[$binpkg]+x}" ]] && continue
-         seen_pkgs["$binpkg"]=1
-         binpkgs+=("$binpkg")
-      done < <(pkgs_for_path "$root" "$path")
-   done <<< "$libs"
-
-   if (( ${#binpkgs[@]} == 0 )); then
-      CONT_CVES["$key"]="no owning dpkg package found for stale libraries"
-      return 0
-   fi
-
-   for binpkg in "${binpkgs[@]}"; do
-      status_out="$(status_lookup "$ctid" "$binpkg")"
-      if [[ -z "$status_out" ]]; then
-         CONT_CVES["$key"]+="${CONT_CVES[$key]:+$'\n'}no dpkg status entry for $binpkg"
-         continue
-      fi
-      curver="${status_out%%$'\t'*}"
-      srcpkg="${status_out#*$'\t'}"
-      [[ -n "$srcpkg" ]] || srcpkg="$binpkg"
-
-      old=""
-      if [[ -n "$start_epoch" ]]; then
-         old="$(version_at_start "$root" "$binpkg" "$start_epoch")"
-         [[ -n "$old" ]] || old="$(version_at_start_apt "$root" "$binpkg" "$start_epoch")"
-      fi
-
-      # Skip if this exact update was already analyzed for this service
-      # (e.g. libssl3 and openssl both belong to the openssl source package)
-      vkey="$ctid|$srcpkg|$old|$curver"
-      [[ -n "${seen_verdicts[$vkey]+x}" ]] && continue
-      seen_verdicts["$vkey"]=1
-
-      result="$(security_analysis "$ctid" "$srcpkg" "$binpkg" "$old" "$curver")"
-      count="${result%%$'\t'*}"
-      verdict="${result#*$'\t'}"
-      [[ "$count" =~ ^[0-9]+$ ]] || count=0
-      CONT_UPDATE_COUNTS["$vkey"]="$count"
-      CONT_CVES["$key"]+="${CONT_CVES[$key]:+$'\n'}$verdict"
-      CONT_CVE_COUNTS["$key"]=$(( ${CONT_CVE_COUNTS[$key]:-0} + count ))
-   done
-}
-
-# Print the security analysis lines for a service key, if any
-print_security_info() {
-   local key="$1" line
-   [[ -n "${CONT_CVES[$key]+x}" ]] || return 0
-   while IFS= read -r line; do
-      [[ -n "$line" ]] && printf '  [security] %s\n' "$line"
-   done <<< "${CONT_CVES[$key]}"
-}
-
-# Append "(N CVEs)" to the current line when running with -s (without -v);
-# prints nothing when the count is zero or unknown
-print_cve_count_suffix() {
-   local key="$1" cve_count plural="s"
-   (( SECURITY )) || return 0
-   (( VERBOSE )) && return 0
-   cve_count="${CONT_CVE_COUNTS[$key]:-0}"
-   (( cve_count > 0 )) || return 0
-   (( cve_count == 1 )) && plural=""
-   printf " (%d CVE%s)" "$cve_count" "$plural"
-}
-
-# Terminate a service line: with -s -v just end the line (the detailed
-# security lines are printed separately); with -s alone append the
-# "(N CVEs)" count suffix to the current line
-print_security_annotation() {
-   local key="$1"
-   if (( SECURITY )) && (( VERBOSE )); then
-      printf "\n"
-   else
-      print_cve_count_suffix "$key"
-      printf "\n"
-   fi
-}
-
-# Emit the Zabbix master JSON: one entry per running container with the
-# number of services needing restart, the unique CVEs fixed by pending
-# updates and human-readable details. Each update (srcpkg+old+new) is counted
-# once per container, even when several services share it. The details are
-# written to a TSV and aggregated by the zabbix_json.py helper (which also
-# handles JSON escaping).
-zabbix_output() {
-   local ctid key user_uid service svc_display details cves _rest vl
-   local -a sorted_keys=() sorted_cts=()
-   local tsv="$WORKDIR/zabbix.tsv"
-   local services="" ukey
-
-   : > "$tsv"
-   mapfile -t sorted_keys < <(sorted_keys_of CONT_SERVICES)
-   mapfile -t sorted_cts < <(sorted_keys_of CT_PIDS -n)
-
-   for ctid in "${sorted_cts[@]}"; do
-      services=0
-      cves=0
-      details=""
-      for key in "${sorted_keys[@]}"; do
-         [[ "$key" == "$ctid:"* ]] || continue
-         services=$((services + 1))
-         _rest="${key#*:}"
-         user_uid="${_rest%%:*}"
-         service="${_rest#*:}"
-         if [[ -n "$user_uid" ]]; then
-            svc_display="$service [user session UID $user_uid]"
-         else
-            svc_display="$service"
-         fi
-         if [[ -n "${CONT_CVES[$key]+x}" ]]; then
-            while IFS= read -r vl; do
-               [[ -n "$vl" ]] || continue
-               details+="${details:+$'\x1e'}$svc_display: $vl"
-            done <<< "${CONT_CVES[$key]}"
-         else
-            details+="${details:+$'\x1e'}$svc_display: needs restart"
-         fi
-      done
-      # CVEs are counted once per update, not once per affected service
-      for ukey in "${!CONT_UPDATE_COUNTS[@]}"; do
-         [[ "$ukey" == "$ctid|"* ]] || continue
-         cves=$((cves + ${CONT_UPDATE_COUNTS[$ukey]}))
-      done
-      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
-         "$ctid" "${CT_NAMES[$ctid]:-unknown}" "$services" "$cves" "$details" >> "$tsv"
-   done
-
-   # Generate the JSON, publish it to the cache file the Zabbix agent reads,
-   # and also print it to stdout for manual inspection. The script creates the
-   # cache directory itself, so the cron job needs no shell redirect (which
-   # would fail on a fresh install before the directory exists). On failure the
-   # previous cache file is left untouched.
-   if CVE_CACHE_TTL="$CACHE_TTL" python3 "$WORKDIR/zabbix_json.py" "$tsv" > "$WORKDIR/zabbix.json"; then
-      mkdir -p "$CACHE_DIR"
-      cp "$WORKDIR/zabbix.json" "$CACHE_DIR/zabbix.json"
-      chmod 644 "$CACHE_DIR/zabbix.json"
-      cat "$WORKDIR/zabbix.json"
-   else
-      return 1
-   fi
-}
-
-# Generate the small python helpers used for API queries
-write_python_helpers() {
-   cat > "$WORKDIR/osv_filter.py" <<'PYEOF'
-#!/usr/bin/env python3
-"""Query (cached) the OSV API for CVEs affecting a Debian package version and
-emit "CVE-ID<TAB>fixed-version" lines for one Debian release. Exit 1 on
-network failure."""
-import json
-import os
-import sys
-import time
-import urllib.request
-
-CACHE_TTL = int(os.environ.get("CVE_CACHE_TTL", "86400"))
-API = "https://api.osv.dev/v1/query"
+    if old:
+        if n > 0:
+            return f"{n}\t{binpkg} {old} -> {new}: fixes {n} CVE{plural} ({cvelist}){secpart} [changelog]"
+        return f"{n}\t{binpkg} {old} -> {new}: no CVEs listed in changelog for this update [changelog]"
+    else:
+        if n > 0:
+            return f"{n}\t{binpkg} -> {new} (old version unknown): latest changelog entry lists {n} CVE{plural} ({cvelist}){secpart} [changelog]"
+        return f"{n}\t{binpkg} -> {new} (old version unknown): latest changelog entry lists no CVEs [changelog]"
 
 
-def fetch(pkg, version):
-   body = json.dumps({"package": {"name": pkg, "ecosystem": "Debian"},
-                      "version": version})
-   req = urllib.request.Request(API, data=body.encode(),
-                                headers={"Content-Type": "application/json",
-                                         "User-Agent": "needrestart-lxc"})
-   with urllib.request.urlopen(req, timeout=30) as resp:
-      return json.load(resp)
+def clean_lib_path(p):
+    for suf in (" (executable)", " (inode mismatch)", " (deleted)"):
+        if p.endswith(suf):
+            p = p[:-len(suf)]
+    return p
 
 
-def main():
-   pkg, version, release, cache = sys.argv[1:5]
-   data = None
-   if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
-      try:
-         with open(cache, "r") as fh:
-            data = json.load(fh)
-      except (OSError, ValueError):
-         data = None
-   if data is None:
-      try:
-         data = fetch(pkg, version)
-      except Exception:
-         return 1
-      tmp = cache + ".tmp"
-      with open(tmp, "w") as fh:
-         json.dump(data, fh)
-      os.replace(tmp, cache)
-   for vuln in data.get("vulns", []):
-      fixed = None
-      for affected in vuln.get("affected", []):
-         package = affected.get("package", {})
-         if package.get("name") != pkg:
+def osv_collect(srcpkg, version, release):
+    """Query (cached) the OSV API for a Debian package version; returns a list
+    of "CVE-ID<TAB>fixed-version" lines, or None on network failure."""
+    version = re.sub(r"\+b\d+$", "", version)
+    cache_name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{release}-{srcpkg}-{version}")
+    cache = os.path.join(CACHE_DIR, f"osv-{cache_name}.json")
+
+    data = load_cache(cache)
+    if data is None:
+        body = json.dumps({"package": {"name": srcpkg, "ecosystem": "Debian"},
+                           "version": version}).encode()
+        try:
+            req = urllib.request.Request(
+                "https://api.osv.dev/v1/query", data=body,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "needrestart-lxc"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.load(resp)
+        except Exception:
+            return None
+        write_cache(cache, data)
+
+    out = []
+    for vuln in data.get("vulns", []):
+        fixed = None
+        for affected in vuln.get("affected", []):
+            package = affected.get("package", {})
+            if package.get("name") != srcpkg:
+                continue
+            ecosystem = package.get("ecosystem", "")
+            if ecosystem != release and not ecosystem.startswith(release + ":"):
+                continue
+            for rng in affected.get("ranges", []):
+                if rng.get("type") != "ECOSYSTEM":
+                    continue
+                for event in rng.get("events", []):
+                    if event.get("fixed") not in (None, "", "0"):
+                        fixed = event["fixed"]
+        if fixed:
+            cve = (vuln.get("upstream") or [vuln.get("id", "")])[0]
+            out.append(f"{cve}\t{fixed}")
+    return out
+
+
+def ubuntu_collect(srcpkg, codename):
+    """Query (cached) the Ubuntu Security API for all CVEs of a source package;
+    returns a list of "CVE-ID<TAB>fixed-version<TAB>cvss3" lines, or None on
+    network failure."""
+    cache_name = re.sub(r"[^A-Za-z0-9._-]", "_", f"ubuntu-{srcpkg}")
+    cache = os.path.join(CACHE_DIR, f"{cache_name}.json")
+
+    data = load_cache(cache)
+    if data is None:
+        try:
+            data = fetch_all_ubuntu(srcpkg, cache)
+        except Exception:
+            return None
+
+    out = []
+    for cve in data.get("cves", []):
+        for entry in cve.get("packages", []):
+            if entry.get("name") != srcpkg:
+                continue
+            for status in entry.get("statuses", []):
+                if status.get("release_codename") != codename:
+                    continue
+                if status.get("status") != "released":
+                    continue
+                fixed = (status.get("description") or "").strip()
+                if not fixed:
+                    continue
+                out.append(f"{cve.get('id', '')}\t{fixed}\t{cve.get('cvss3') or ''}")
+                break
+    return out
+
+
+def fetch_all_ubuntu(pkg, cache):
+    BASE = "https://ubuntu.com/security/cves.json"
+    PAGE = 20          # max accepted by the API
+    PAGE_SLEEP = 2.0   # be gentle; the API rate-limits bursts (429)
+    MAX_PAGES = 100
+    merged = []
+    offset = 0
+    total = 1
+    pages = 0
+    while offset < total and pages < MAX_PAGES:
+        url = f"{BASE}?package={pkg}&limit={PAGE}&offset={offset}"
+        data = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "needrestart-lxc"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.load(resp)
+                break
+            except urllib.error.HTTPError as err:
+                if err.code == 429 and attempt < 2:
+                    time.sleep(60)
+                    continue
+                raise
+        if data is None:
+            raise RuntimeError("no response")
+        cves = data.get("cves", [])
+        merged.extend(cves)
+        total = data.get("total_results", 0) or len(merged)
+        if len(cves) < PAGE:
+            break
+        offset += PAGE
+        pages += 1
+        time.sleep(PAGE_SLEEP)
+    write_cache(cache, {"cves": merged, "total_results": total})
+    return merged
+
+
+def load_cache(cache):
+    if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
+        try:
+            with open(cache) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def write_cache(cache, data):
+    tmp = cache + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, cache)
+
+
+def security_analysis(ctid, srcpkg, binpkg, old, new):
+    """Produce the security verdict for one source package update; results are
+    cached in EXT_VERDICTS so shared libraries in the same container are only
+    analyzed once. Returns "count<TAB>verdict"."""
+    verdict_key = f"{ctid}|{srcpkg}|{old}|{new}"
+    if verdict_key in EXT_VERDICTS:
+        return EXT_VERDICTS[verdict_key]
+
+    root = ct_root(ctid)
+    count = 0
+    verdict = ""
+
+    if not old:
+        result = changelog_verdict(root, binpkg, srcpkg, "", new)
+        if result:
+            count, verdict = result.split("\t", 1)
+        else:
+            verdict = f"{binpkg} -> {new} (old version unknown): no changelog available"
+    elif ver_cmp(old, new) >= 0:
+        verdict = f"{binpkg} {old} -> {new}: no version change since process start"
+    else:
+        online_ok = False
+        src_label = ""
+        rows = []
+        distro = CT_OS_ID.get(ctid)
+        if distro == "debian" and CT_OS_RELEASE.get(ctid):
+            res = osv_collect(srcpkg, old, f"Debian:{CT_OS_RELEASE[ctid]}")
+            if res is not None:
+                online_ok, src_label, rows = True, "OSV", res
+        elif distro == "ubuntu" and CT_OS_CODENAME.get(ctid):
+            res = ubuntu_collect(srcpkg, CT_OS_CODENAME[ctid])
+            if res is not None:
+                online_ok, src_label, rows = True, "Ubuntu Security API", res
+
+        if online_ok:
+            count = 0
+            cves = []
+            cvss_list = []
+            seen = set()
+            for row in rows:
+                parts = row.split("\t")
+                if len(parts) < 2:
+                    continue
+                cve_id, fixed = parts[0], parts[1]
+                cvss3 = parts[2] if len(parts) > 2 else ""
+                if not cve_id or not fixed:
+                    continue
+                if not (ver_cmp(old, fixed) < 0 and ver_cmp(fixed, new) <= 0):
+                    continue
+                if cve_id in seen:
+                    continue
+                seen.add(cve_id)
+                count += 1
+                cves.append(cve_id)
+                if cvss3:
+                    cvss_list.append(cvss3)
+            if count > 0:
+                shown = 0
+                shown_list = []
+                for cve in cves:
+                    if shown < 6:
+                        shown_list.append(cve)
+                    shown += 1
+                cvelist = ", ".join(shown_list)
+                if shown > 6:
+                    cvelist += f", and {shown - 6} more"
+                plural = "" if count == 1 else "s"
+                cvss = f", CVSS {','.join(cvss_list)}" if cvss_list else ""
+                verdict = (f"{binpkg} {old} -> {new}: SECURITY update, fixes "
+                           f"{count} CVE{plural} ({cvelist}{cvss}) [{src_label}]")
+            else:
+                verdict = (f"{binpkg} {old} -> {new}: no security-relevant CVEs "
+                           f"found [{src_label}]")
+        else:
+            result = changelog_verdict(root, binpkg, srcpkg, old, new)
+            if result:
+                count, verdict = result.split("\t", 1)
+            else:
+                verdict = f"{binpkg} {old} -> {new}: security data unavailable (offline?)"
+
+    EXT_VERDICTS[verdict_key] = f"{count}\t{verdict}"
+    return EXT_VERDICTS[verdict_key]
+
+
+def analyze_service_libs(ctid, key, root, start_epoch, libs):
+    binpkgs = []
+    seen_pkgs = set()
+    for line in libs.split("\n"):
+        if not line:
             continue
-         ecosystem = package.get("ecosystem", "")
-         if ecosystem != release and not ecosystem.startswith(release + ":"):
+        path = clean_lib_path(line)
+        for bp in pkgs_for_path(root, path):
+            if bp not in seen_pkgs:
+                seen_pkgs.add(bp)
+                binpkgs.append(bp)
+
+    if not binpkgs:
+        CONT_CVES[key] = "no owning dpkg package found for stale libraries"
+        return
+
+    seen_verdicts = set()
+    for binpkg in binpkgs:
+        status_out = status_lookup(ctid, binpkg)
+        if not status_out:
+            CONT_CVES[key] = (CONT_CVES.get(key, "") +
+                              ("\n" if CONT_CVES.get(key) else "") +
+                              f"no dpkg status entry for {binpkg}")
             continue
-         for rng in affected.get("ranges", []):
-            if rng.get("type") != "ECOSYSTEM":
-               continue
-            for event in rng.get("events", []):
-               if event.get("fixed") not in (None, "", "0"):
-                  fixed = event["fixed"]
-      if fixed:
-         cve = (vuln.get("upstream") or [vuln.get("id", "")])[0]
-         print(f"{cve}\t{fixed}")
+        curver, srcpkg = status_out.split("\t", 1)
+        if not srcpkg:
+            srcpkg = binpkg
+
+        old = ""
+        if start_epoch:
+            old = version_at_start(root, binpkg, start_epoch)
+
+        # Skip if this exact update was already analyzed for this service
+        # (e.g. libssl3 and openssl both belong to the openssl source package)
+        vkey = f"{ctid}|{srcpkg}|{old}|{curver}"
+        if vkey in seen_verdicts:
+            continue
+        seen_verdicts.add(vkey)
+
+        result = security_analysis(ctid, srcpkg, binpkg, old, curver)
+        count, verdict = result.split("\t", 1)
+        if not re.match(r"^\d+$", count):
+            count = "0"
+        CONT_UPDATE_COUNTS[vkey] = int(count)
+        CONT_CVES[key] = (CONT_CVES.get(key, "") +
+                          ("\n" if CONT_CVES.get(key) else "") + verdict)
+        CONT_CVE_COUNTS[key] = CONT_CVE_COUNTS.get(key, 0) + int(count)
+
+
+def security_scan():
+    for key in sorted(CONT_SERVICES):
+        ctid = key.split(":", 1)[0]
+        pid = CONT_PID.get(key)
+        if not pid:
+            continue
+        root = ct_root(ctid)
+        if not os.path.isdir(root):
+            continue
+
+        if ctid not in CT_OS_ID:
+            if not load_ct_os(ctid, root):
+                CT_NOTES[ctid] = "no /etc/os-release found in container"
+                continue
+        distro = CT_OS_ID.get(ctid)
+        if distro not in ("debian", "ubuntu"):
+            CT_NOTES[ctid] = f"CVE analysis not supported for distro {distro}"
+            continue
+        if not parse_dpkg_status(ctid, root):
+            CT_NOTES[ctid] = "no dpkg database found in container"
+            continue
+
+        lstart = subprocess.run(["ps", "-o", "lstart=", "-p", pid],
+                                capture_output=True, text=True).stdout.strip()
+        start_epoch = ""
+        if lstart:
+            r = subprocess.run(["date", "-d", lstart, "+%s"],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                start_epoch = int(r.stdout.strip())
+
+        log_verbose(f"Extended security analysis for CT {ctid}, "
+                    f"service {key.split(':', 1)[1]} (PID {pid})...")
+        analyze_service_libs(ctid, key, root, start_epoch, CONT_SERVICES[key])
+
+    for ctid in sorted(CT_NOTES):
+        msg = f"Container {ctid} ({CT_NAMES.get(ctid, 'unknown')}): {CT_NOTES[ctid]}"
+        if ZABBIX:
+            print(msg, file=sys.stderr)
+        else:
+            print(msg)
+
+
+def zabbix_output():
+    containers = {}
+    sorted_keys = sorted(CONT_SERVICES)
+    for ctid in sorted(CT_PIDS, key=int):
+        services = 0
+        cves = 0
+        details = []
+        for key in sorted_keys:
+            if not key.startswith(ctid + ":"):
+                continue
+            services += 1
+            _rest = key.split(":", 1)[1]
+            user_uid, service = _rest.split(":", 1)
+            svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
+            if key in CONT_CVES:
+                for vl in CONT_CVES[key].split("\n"):
+                    if not vl:
+                        continue
+                    details.append(f"{svc_display}: {vl}")
+            else:
+                details.append(f"{svc_display}: needs restart")
+        # CVEs are counted once per update, not once per affected service
+        for ukey, uc in CONT_UPDATE_COUNTS.items():
+            if ukey.startswith(ctid + "|"):
+                cves += uc
+        containers[ctid] = {
+            "ctid": ctid,
+            "name": CT_NAMES.get(ctid, "unknown"),
+            "services": services,
+            "cves": cves,
+            "details": "\n".join(details),
+        }
+
+    out = {"containers": [containers[k] for k in sorted(containers, key=int)]}
+    text = json.dumps(out)
+
+    # Publish to the cache file the Zabbix agent reads, atomically, creating
+    # the dir if needed (so cron needs no redirect). On failure the previous
+    # cache file is left untouched.
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        target = os.path.join(CACHE_DIR, "zabbix.json")
+        tmp = target + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, target)
+        os.chmod(target, 0o644)
+    except OSError:
+        return 1
+
+    print(text)
+    return 0
+
+
+def _run():
+    global WORKDIR
+    if SECURITY:
+        WORKDIR = tempfile.mkdtemp(prefix="needrestart-lxc.")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+    load_container_names()
+    get_container_pids()
+    scan_containers()
+
+    if SECURITY:
+        security_scan()
+
+    if MODE == "restart":
+        restart_services()
+    elif MODE == "zabbix":
+        return zabbix_output()
+    else:
+        print_results()
+    return 0
+
+
+def main(argv):
+    global MODE, VERBOSE, DEEP, DRY_RUN, SECURITY, ZABBIX, CONTAINER_FILTER
+    args_valid = True
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-l", "--list"):
+            MODE = "list"; i += 1
+        elif a in ("-r", "--restart"):
+            MODE = "restart"; i += 1
+        elif a in ("-n", "--dry-run"):
+            DRY_RUN = 1; i += 1
+        elif a in ("-c", "--container"):
+            CONTAINER_FILTER = argv[i + 1] if i + 1 < len(argv) else ""
+            i += 2
+        elif a in ("-e", "--exclude"):
+            EXCLUDE_PATTERNS.append(argv[i + 1] if i + 1 < len(argv) else "")
+            i += 2
+        elif a in ("-d", "--deep"):
+            DEEP = 1; i += 1
+        elif a in ("-s", "--security"):
+            SECURITY = 1; i += 1
+        elif a == "--zabbix":
+            ZABBIX = 1; MODE = "zabbix"; SECURITY = 1; i += 1
+        elif a in ("-v", "--verbose"):
+            VERBOSE = 1; i += 1
+        elif a in ("-h", "--help"):
+            print_usage()
+            return 0
+        else:
+            log_error(f"Unknown option: {a}")
+            args_valid = False
+            i += 1
+
+    if not args_valid:
+        print_usage(sys.stderr)
+        return 1
+    if CONTAINER_FILTER and not CONTAINER_FILTER.isdigit():
+        log_error(f"Container ID must be numeric, got: {CONTAINER_FILTER}")
+        return 1
+    if os.geteuid() != 0:
+        log_error("This script must be run as root to access /proc/*/maps")
+        return 1
+
+    try:
+        return _run()
+    finally:
+        if WORKDIR and os.path.isdir(WORKDIR):
+            shutil.rmtree(WORKDIR, ignore_errors=True)
 
 
 if __name__ == "__main__":
-   sys.exit(main())
-PYEOF
-
-   cat > "$WORKDIR/ubuntu_cves.py" <<'PYEOF'
-#!/usr/bin/env python3
-"""Fetch (cached) all CVEs for an Ubuntu source package from ubuntu.com and
-emit "CVE-ID<TAB>fixed-version<TAB>cvss3" lines for one release codename
-where the package status is "released". Exit 1 on network failure."""
-import json
-import os
-import sys
-import time
-import urllib.request
-import urllib.error
-
-CACHE_TTL = int(os.environ.get("CVE_CACHE_TTL", "86400"))
-BASE = "https://ubuntu.com/security/cves.json"
-PAGE = 20          # max limit accepted by the API (100 is rejected with 422)
-PAGE_SLEEP = 2.0   # be gentle: the API rate-limits aggressive bursts (429)
-MAX_PAGES = 100    # safety cap (2000 CVEs)
-
-
-def fetch(url):
-   req = urllib.request.Request(url, headers={"User-Agent": "needrestart-lxc"})
-   with urllib.request.urlopen(req, timeout=30) as resp:
-      return json.load(resp)
-
-
-def fetch_all(pkg, cache):
-   merged = []
-   offset = 0
-   total = 1
-   pages = 0
-   while offset < total and pages < MAX_PAGES:
-      url = f"{BASE}?package={pkg}&limit={PAGE}&offset={offset}"
-      data = None
-      for attempt in range(3):
-         try:
-            data = fetch(url)
-            break
-         except urllib.error.HTTPError as err:
-            if err.code == 429 and attempt < 2:
-               time.sleep(60)
-               continue
-            raise
-      if data is None:
-         raise RuntimeError("no response")
-      cves = data.get("cves", [])
-      merged.extend(cves)
-      total = data.get("total_results", 0) or len(merged)
-      if len(cves) < PAGE:
-         break
-      offset += PAGE
-      pages += 1
-      time.sleep(PAGE_SLEEP)
-   tmp = cache + ".tmp"
-   with open(tmp, "w") as fh:
-      json.dump({"cves": merged, "total_results": total}, fh)
-   os.replace(tmp, cache)
-   return merged
-
-
-def main():
-   pkg, codename, cache = sys.argv[1:4]
-   data = None
-   if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
-      try:
-         with open(cache, "r") as fh:
-            data = json.load(fh)
-      except (OSError, ValueError):
-         data = None
-   try:
-      cves = data.get("cves") if data else fetch_all(pkg, cache)
-   except Exception:
-      return 1
-   for cve in cves:
-      for entry in cve.get("packages", []):
-         if entry.get("name") != pkg:
-            continue
-         for status in entry.get("statuses", []):
-            if status.get("release_codename") != codename:
-               continue
-            if status.get("status") != "released":
-               continue
-            fixed = (status.get("description") or "").strip()
-            if not fixed:
-               continue
-            print(f"{cve.get('id', '')}\t{fixed}\t{cve.get('cvss3') or ''}")
-            break
-
-
-if __name__ == "__main__":
-   sys.exit(main())
-PYEOF
-
-   cat > "$WORKDIR/zabbix_json.py" <<'PYEOF'
-#!/usr/bin/env python3
-"""Convert the per-service TSV dump (fields separated by \x1f, details lines
-by \x1e) into the Zabbix master JSON document."""
-import json
-import sys
-
-containers = {}
-with open(sys.argv[1], "r") as fh:
-   for line in fh:
-      line = line.rstrip("\n")
-      if not line:
-         continue
-      ctid, name, services, cves, details = line.split("\x1f")
-      details = details.replace("\x1e", "\n")
-      entry = containers.setdefault(
-         ctid,
-         {"ctid": ctid, "name": name, "services": 0, "cves": 0, "details": ""},
-      )
-      entry["name"] = name
-      entry["services"] += int(services)
-      entry["cves"] += int(cves)
-      if details:
-         entry["details"] = entry["details"] + "\n" + details if entry["details"] else details
-
-out = {"containers": [containers[k] for k in sorted(containers, key=int)]}
-json.dump(out, sys.stdout)
-PYEOF
-}
-
-# Main entry point for the security scan: analyze every stale service,
-# then report containers that could not be analyzed
-security_scan() {
-   local key ctid pid root libs start_epoch lstart
-   local -a sorted_keys=()
-   mapfile -t sorted_keys < <(sorted_keys_of CONT_SERVICES)
-
-   for key in "${sorted_keys[@]}"; do
-      ctid="${key%%:*}"
-      pid="${CONT_PID[$key]:-}"
-      [[ -n "$pid" ]] || continue
-      root="$(ct_root "$ctid")"
-      [[ -d "$root" ]] || continue
-
-      if [[ -z "${CT_OS_ID[$ctid]+x}" ]]; then
-         if ! load_ct_os "$ctid" "$root"; then
-            CT_NOTES["$ctid"]="no /etc/os-release found in container"
-            continue
-         fi
-      fi
-      case "${CT_OS_ID[$ctid]}" in
-         debian|ubuntu) ;;
-         *)
-            CT_NOTES["$ctid"]="CVE analysis not supported for distro ${CT_OS_ID[$ctid]}"
-            continue
-            ;;
-      esac
-      if ! parse_dpkg_status "$ctid" "$root"; then
-         CT_NOTES["$ctid"]="no dpkg database found in container"
-         continue
-      fi
-
-      lstart="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
-      start_epoch=""
-      [[ -n "$lstart" ]] && start_epoch="$(date -d "$lstart" +%s 2>/dev/null)"
-
-      log_verbose "Extended security analysis for CT $ctid, service ${key#*:} (PID $pid)..."
-      analyze_service_libs "$ctid" "$key" "$root" "$start_epoch" "${CONT_SERVICES[$key]}"
-   done
-
-   # Report containers that were skipped for analysis
-   for ctid in "${!CT_NOTES[@]}"; do
-      if (( ZABBIX )); then
-         printf 'Container %s (%s): %s\n' "$ctid" "${CT_NAMES[$ctid]:-unknown}" "${CT_NOTES[$ctid]}" >&2
-      else
-         printf 'Container %s (%s): %s\n' "$ctid" "${CT_NAMES[$ctid]:-unknown}" "${CT_NOTES[$ctid]}"
-      fi
-   done
-}
-
-# ------------------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------------------
-
-main() {
-   local args_valid=1
-
-   while [[ $# -gt 0 ]]; do
-      case "$1" in
-         -l|--list)
-            MODE="list"
-            shift
-            ;;
-         -r|--restart)
-            MODE="restart"
-            shift
-            ;;
-         -n|--dry-run)
-            DRY_RUN=1
-            shift
-            ;;
-         -c|--container)
-            CONTAINER_FILTER="$2"
-            shift 2
-            ;;
-         -e|--exclude)
-            EXCLUDE_PATTERNS+=("$2")
-            shift 2
-            ;;
-         -d|--deep)
-            DEEP=1
-            shift
-            ;;
-         -s|--security)
-            SECURITY=1
-            shift
-            ;;
-         --zabbix)
-            ZABBIX=1
-            MODE="zabbix"
-            SECURITY=1
-            shift
-            ;;
-         -v|--verbose)
-            VERBOSE=1
-            shift
-            ;;
-         -h|--help)
-            print_usage
-            exit 0
-            ;;
-         *)
-            log_error "Unknown option: $1"
-            args_valid=0
-            shift
-            ;;
-      esac
-   done
-
-   if ! (( args_valid )); then
-      print_usage >&2
-      exit 1
-   fi
-
-   # Validate container filter
-   if [[ -n "$CONTAINER_FILTER" ]] && ! [[ "$CONTAINER_FILTER" =~ ^[0-9]+$ ]]; then
-      log_error "Container ID must be numeric, got: $CONTAINER_FILTER"
-      exit 1
-   fi
-
-   # Must run as root
-   if (( EUID != 0 )); then
-      log_error "This script must be run as root to access /proc/*/maps"
-      exit 1
-   fi
-
-   # Prepare per-run workspace and API cache for security mode
-   if (( SECURITY )); then
-      WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/needrestart-lxc.XXXXXX")"
-      trap 'rm -rf "$WORKDIR"' EXIT
-      mkdir -p "$CACHE_DIR"
-      write_python_helpers
-   fi
-
-   # Load container information
-   load_container_names
-   get_container_pids
-
-   # Scan for outdated libraries
-   scan_containers
-
-   # Optional security analysis (CVE lookup)
-   if (( SECURITY )); then
-      security_scan
-   fi
-
-   # Output results
-   case "$MODE" in
-      list)
-         print_results
-         ;;
-      restart)
-         restart_services
-         ;;
-      zabbix)
-         zabbix_output
-         ;;
-      *)
-         print_results
-         ;;
-   esac
-}
-
-main "$@"
+    sys.exit(main(sys.argv[1:]))

@@ -16,10 +16,10 @@
 
 Requires on the monitored host:
   - the needrestart-lxc script (with --zabbix support) at /usr/local/bin/needrestart-lxc
-  - a sudoers entry: zabbix ALL=(root) NOPASSWD:/usr/local/bin/needrestart-lxc
-  - agent2 UserParameter: needrestart.lxc.master,sudo -n /usr/local/bin/needrestart-lxc --zabbix
+  - a cron job that runs it (--zabbix) and writes /var/cache/needrestart-lxc/zabbix.json
+  - agent2 UserParameter: needrestart.lxc.master,/usr/local/bin/needrestart-lxc-zabbix-cat
 
-The master item runs once per hour; the discovery rule and per-container items are dependent on it.</description>
+A cron job refreshes the JSON every 15 minutes; the agent check only reads the file, so it stays well below the Zabbix server Timeout. The master item polls every 15 minutes to match the cron cadence; the discovery rule and per-container items are dependent on it.</description>
             <groups>
                 <group>
                     <name>Templates</name>
@@ -31,7 +31,7 @@ The master item runs once per hour; the discovery rule and per-container items a
                     <name>Needrestart LXC master</name>
                     <type>ZABBIX_PASSIVE</type>
                     <key>needrestart.lxc.master</key>
-                    <delay>1h</delay>
+                    <delay>15m</delay>
                     <history>31d</history>
                     <trends>0</trends>
                     <value_type>TEXT</value_type>

@@ -140,8 +140,9 @@ applies in `-r`/`-n` (restart/dry-run) mode, right before the restart.
 Caveats:
 
 - Only dpkg-based containers (Debian/Ubuntu) are analyzed; other distros are reported and skipped.
-- Online lookups require outbound HTTPS from the Proxmox host and `curl` + `python3`; the Ubuntu API
-  is rate-limited, so the script paces requests and retries on HTTP 429. Everything is cached for 24h.
+- Online lookups require outbound HTTPS from the Proxmox host and a `python3` interpreter (stdlib
+  `urllib`, no extra packages). The Ubuntu API is rate-limited, so the script paces requests and
+  retries on HTTP 429. Everything is cached for 24h.
 - The old version can only be determined if the relevant `dpkg.log`/`apt history.log` entries are still
   retained (log rotation). Otherwise the latest changelog entry is reported with an
   "old version unknown" note.
