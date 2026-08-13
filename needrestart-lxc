@@ -1034,7 +1034,7 @@ def fetch_all_ubuntu(pkg, cache):
         pages += 1
         time.sleep(PAGE_SLEEP)
     write_cache(cache, {"cves": merged, "total_results": total})
-    return merged
+    return {"cves": merged, "total_results": total}
 
 
 def load_cache(cache):
