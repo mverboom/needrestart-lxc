@@ -114,7 +114,7 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                             <description>Number of CVEs fixed by the pending updates that require a service restart in the container.</description>
                         </item_prototype>
                         <item_prototype>
-                            <uuid>7f97196e-3db3-4dc3-8322-23d2338b4ffc</uuid>
+                            <uuid>7f97196e3db34dc3832223d2338b4ffc</uuid>
                             <name>Needrestart LXC {#CTNAME}: CVE data complete</name>
                             <type>DEPENDENT</type>
                             <key>needrestart.lxc.cvesok[{#CTID}]</key>
