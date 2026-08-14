@@ -205,8 +205,14 @@ The script can feed Zabbix with per-container restart and CVE alerts. The
 `--zabbix` mode emits a single JSON document (one entry per running container)
 that a Zabbix template turns into per-container items and triggers:
 
-- **WARNING** when a container has services needing restart (no known CVEs)
+- **WARNING** when a container has services needing restart and CVE analysis
+  confirms a genuine zero (no known CVEs)
 - **HIGH** when the pending updates fix CVEs
+
+The `cvesok` field marks whether the CVE count is trustworthy. If the security
+lookup is indeterminate (online lookup failed and no changelog verdict), no
+trigger fires and the alert is deferred to the next scan, avoiding a false
+WARNING that would later be superseded by a HIGH.
 
 The problem reads `container: N services need restart` with the CVE count as
 operational data; exactly one problem is open per container at a time.
@@ -218,5 +224,5 @@ the template and the config snippets. Requires Zabbix 7.0 or newer.
 ```
 needrestart-lxc --zabbix
 {"containers": [{"ctid": "124", "name": "test.lnw.verboom.net",
-  "services": 6, "cves": 15, "details": "..."}, ...]}
+  "services": 6, "cves": 15, "cves_ok": 1, "details": "..."}, ...]}
 ```

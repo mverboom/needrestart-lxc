@@ -114,6 +114,34 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                             <description>Number of CVEs fixed by the pending updates that require a service restart in the container.</description>
                         </item_prototype>
                         <item_prototype>
+                            <uuid>7f97196e-3db3-4dc3-8322-23d2338b4ffc</uuid>
+                            <name>Needrestart LXC {#CTNAME}: CVE data complete</name>
+                            <type>DEPENDENT</type>
+                            <key>needrestart.lxc.cvesok[{#CTID}]</key>
+                            <delay>0</delay>
+                            <history>31d</history>
+                            <trends>0</trends>
+                            <value_type>UNSIGNED</value_type>
+                            <master_item>
+                                <key>needrestart.lxc.master</key>
+                            </master_item>
+                            <preprocessing>
+                                <step>
+                                    <type>JSONPATH</type>
+                                    <parameters>
+                                <parameter>$.containers[?(@.ctid == "{#CTID}")].first()</parameter>
+                            </parameters>
+                                </step>
+                                <step>
+                                    <type>JSONPATH</type>
+                                    <parameters>
+                                <parameter>$.cves_ok</parameter>
+                            </parameters>
+                                </step>
+                            </preprocessing>
+                            <description>Whether CVE analysis for this container is complete (1) or indeterminate (0). When 0, restart alerts are suppressed to avoid false positives (an unknown CVE count could be 0 or many).</description>
+                        </item_prototype>
+                        <item_prototype>
                             <uuid>92b76670c978402791658419100f6693</uuid>
                             <name>Needrestart LXC {#CTNAME}: details</name>
                             <type>DEPENDENT</type>
@@ -145,11 +173,11 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                     <trigger_prototypes>
                         <trigger_prototype>
                             <uuid>e08734a7cb61418497f02a436e73225b</uuid>
-                            <expression>last(/Template needrestart lxc/needrestart.lxc.services[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.cves[{#CTID}])=0</expression>
+                            <expression>last(/Template needrestart lxc/needrestart.lxc.services[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.cves[{#CTID}])=0 and last(/Template needrestart lxc/needrestart.lxc.cvesok[{#CTID}])=1</expression>
                             <name>{#CTNAME}: {ITEM.VALUE1} services need restart</name>
                             <opdata>{ITEM.VALUE2} CVEs</opdata>
                             <priority>WARNING</priority>
-                            <description>Services inside the container run with outdated shared libraries; no known security fixes are pending. Restart the affected services (see the details item for specifics).</description>
+                            <description>Services inside the container run with outdated shared libraries; no known security fixes are pending (CVE analysis completed with a genuine zero). Restart the affected services (see the details item for specifics).</description>
                         </trigger_prototype>
                         <trigger_prototype>
                             <uuid>279fa24d2697487ebbbc0beb77d7feb0</uuid>

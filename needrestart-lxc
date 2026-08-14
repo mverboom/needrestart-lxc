@@ -96,6 +96,7 @@ CONT_PID = {}          # "ctid:user_uid:service" -> PID of first stale process
 CONT_CVES = {}         # key -> security analysis lines
 CONT_CVE_COUNTS = {}   # key -> total CVEs fixed
 CONT_UPDATE_COUNTS = {}  # "ctid|srcpkg|old|new" -> CVEs fixed by this update
+CT_CVE_UNKNOWN = set()  # ctids where CVE analysis failed (data indeterminate)
 CT_OS_ID = {}          # ctid -> os id (debian/ubuntu/...)
 CT_OS_RELEASE = {}     # ctid -> VERSION_ID (e.g. 12, 22.04)
 CT_OS_CODENAME = {}    # ctid -> VERSION_CODENAME (e.g. bookworm, jammy)
@@ -1108,6 +1109,7 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
             count, verdict = result.split("\t", 1)
         else:
             verdict = f"{binpkg} -> {new} (old version unknown): no changelog available"
+            CT_CVE_UNKNOWN.add(ctid)
     elif ver_cmp(old, new) >= 0:
         verdict = f"{binpkg} {old} -> {new}: no version change since process start"
     else:
@@ -1169,6 +1171,7 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
                 count, verdict = result.split("\t", 1)
             else:
                 verdict = f"{binpkg} {old} -> {new}: security data unavailable (offline?)"
+                CT_CVE_UNKNOWN.add(ctid)
 
     EXT_VERDICTS[verdict_key] = f"{count}\t{verdict}"
     return EXT_VERDICTS[verdict_key]
@@ -1188,6 +1191,7 @@ def analyze_service_libs(ctid, key, root, start_epoch, libs):
 
     if not binpkgs:
         CONT_CVES[key] = "no owning dpkg package found for stale libraries"
+        CT_CVE_UNKNOWN.add(ctid)
         return
 
     seen_verdicts = set()
@@ -1197,6 +1201,7 @@ def analyze_service_libs(ctid, key, root, start_epoch, libs):
             CONT_CVES[key] = (CONT_CVES.get(key, "") +
                               ("\n" if CONT_CVES.get(key) else "") +
                               f"no dpkg status entry for {binpkg}")
+            CT_CVE_UNKNOWN.add(ctid)
             continue
         curver, srcpkg = status_out.split("\t", 1)
         if not srcpkg:
@@ -1296,6 +1301,7 @@ def zabbix_output():
             "name": CT_NAMES.get(ctid, "unknown"),
             "services": services,
             "cves": cves,
+            "cves_ok": 0 if ctid in CT_CVE_UNKNOWN else 1,
             "details": "\n".join(details),
         }
 

@@ -13,16 +13,26 @@ macros). Tested against Zabbix 7.4.
   (unique CVEs fixed by the pending updates) and `details` (human-readable
   per-service breakdown).
 - A discovery rule (`needrestart.lxc.discovery`, dependent on the master)
-  discovers every container; each gets three dependent items:
-  `needrestart.lxc.services[{#CTID}]`, `needrestart.lxc.cves[{#CTID}]` and
+  discovers every container; each gets four dependent items:
+  `needrestart.lxc.services[{#CTID}]`, `needrestart.lxc.cves[{#CTID}]`,
+  `needrestart.lxc.cvesok[{#CTID}]` (whether CVE analysis is complete) and
   `needrestart.lxc.details[{#CTID}]`.
 - Two mutually exclusive trigger prototypes per container (exactly one problem
   is open at a time, so the alert list stays clean):
   - **WARNING** — `{#CTNAME}: {ITEM.VALUE1} services need restart`, opdata
-    `{ITEM.VALUE2} CVEs` — fires when services &gt; 0 and no CVEs are pending
-    (opdata shows `0 CVEs`)
+    `{ITEM.VALUE2} CVEs` — fires when services &gt; 0, CVEs are pending count 0
+    **and** CVE analysis is complete (opdata shows `0 CVEs`)
   - **HIGH** — same name and opdata — fires when the pending updates fix CVEs
     (e.g. `test.lnw.verboom.net: 6 services need restart`, opdata `15 CVEs`)
+
+The `cvesok` item guards against a false WARNING. The CVE count comes from an
+online security lookup with a changelog fallback; if that lookup fails *and*
+no changelog verdict is available the count is unknowable (it could be 0 or
+many). In that indeterminate case `cvesok` = 0 and **no** trigger fires — the
+alert is deferred to the next scan (15 min later) rather than risking a false
+"no CVEs" WARNING that would be superseded by a HIGH once the lookup succeeds.
+Containers where CVE analysis is not applicable (non-Debian/Ubuntu, no dpkg)
+keep `cvesok` = 1 and still get the WARNING when services need a restart.
 
 The severity reflects risk rather than an outage: pending restarts are
 WARNING, pending restarts that fix known CVEs are HIGH.
