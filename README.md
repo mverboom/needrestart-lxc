@@ -44,13 +44,27 @@ Container 100 (test): restarting service systemd-logind.service
 
 ### Specific container
 
-To only do a check for a specific container, the container to be checked can be specified by its numerical
-ID with the -c option.
+To only do a check for a specific container, the container to be checked can be specified with the -c option by its numerical
+ID or by its container name.
 
 ```
 needrestart-lxc -c 100
 Container 100 (test): service systemd-journald.service needs restart
 Container 100 (test): service systemd-logind.service needs restart
+```
+
+A name resolves to the CTID automatically (it must be unique; otherwise the
+script reports the ambiguity and tells you to use the ID instead):
+
+```
+needrestart-lxc -c web1
+```
+
+The same filter applies to `-r`/`--restart` (and `-n -r`), so you can restart
+only one container's flagged services, e.g. from a Zabbix dashboard action:
+
+```
+needrestart-lxc -r -c web1
 ```
 
 ### Excluding services
@@ -157,7 +171,7 @@ Using verbose mode with -v or --verbose will provide more information about the 
 
 ```
 needrestart-lxc -c 100 -d -v
-Loaded 1 container names
+Loaded 1 container names from /etc/pve/lxc
 Found 1 running containers
 Scanning container processes for outdated libraries...
 Checking PID 2148 (CT 100, systemd-manager)...

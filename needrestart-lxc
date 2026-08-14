@@ -114,7 +114,7 @@ Options:
   -l, --list          List containers with services needing restart (default)
   -r, --restart       Restart services inside containers
   -n, --dry-run       Show what would be restarted without doing it
-  -c, --container ID  Only check a specific container (by CTID)
+  -c, --container ID  Only check a specific container (by CTID or name)
   -e, --exclude PAT   Exclude services matching regex (can be repeated)
   -d, --deep          Also check for inode mismatches (slower but thorough)
   -s, --security      Security analysis: report whether pending updates are
@@ -132,6 +132,7 @@ Examples:
   {PROGNAME} -r                  # Restart affected services in containers
   {PROGNAME} -n -r               # Show what would be restarted (dry run)
   {PROGNAME} -c 100              # Only check container 100
+  {PROGNAME} -r -c web1          # Restart services in container named 'web1'
   {PROGNAME} -d                   # Deep scan including inode comparison
   {PROGNAME} -s                   # Security scan with CVE analysis
   {PROGNAME} -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
@@ -189,15 +190,50 @@ def read_procs():
 
 
 def load_container_names():
-    try:
-        r = subprocess.run(["pct", "list"], capture_output=True, text=True, timeout=60)
-    except Exception:
-        return
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].isdigit():
-            CT_NAMES[parts[0]] = parts[-1]
-    log_verbose(f"Loaded {len(CT_NAMES)} container names")
+    # Read names from the per-container config files instead of calling
+    # `pct list`, which is slow (spawns a process and hits the cluster state).
+    # Each /etc/pve/lxc/<CTID>.conf carries the container name in a `hostname:`
+    # field (LXC uses `hostname:`, unlike QEMU's `name:`); the filename gives
+    # the CTID. This is also robust under cron's minimal PATH (no /usr/sbin).
+    for conf in glob.glob("/etc/pve/lxc/*.conf"):
+        ctid = os.path.basename(conf)[:-len(".conf")]
+        if not ctid.isdigit():
+            continue
+        name = ""
+        try:
+            with open(conf, errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("hostname:"):
+                        name = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            continue
+        if name:
+            CT_NAMES[ctid] = name
+    log_verbose(f"Loaded {len(CT_NAMES)} container names from /etc/pve/lxc")
+
+
+def resolve_container_filter():
+    """Resolve a -c/--container filter given as a name to its CTID.
+
+    Numeric filters (CTIDs) are passed through unchanged. Names are resolved
+    against the container list loaded by load_container_names(); this must run
+    before scan_containers(). Returns 0 on success, non-zero on failure."""
+    global CONTAINER_FILTER
+    if not CONTAINER_FILTER or CONTAINER_FILTER.isdigit():
+        return 0
+    name = CONTAINER_FILTER
+    matches = [ctid for ctid, cname in CT_NAMES.items() if cname == name]
+    if not matches:
+        log_error(f"Unknown container name: {name} (no such LXC container)")
+        return 1
+    if len(matches) > 1:
+        log_error(f"Container name is ambiguous ({len(matches)} containers share "
+                  f"the name '{name}'): {', '.join(matches)}; use a CTID instead")
+        return 1
+    CONTAINER_FILTER = matches[0]
+    log_verbose(f"Resolved container name '{name}' to CTID {CONTAINER_FILTER}")
+    return 0
 
 
 def get_container_pids():
@@ -1291,6 +1327,8 @@ def _run():
         os.makedirs(CACHE_DIR, exist_ok=True)
 
     load_container_names()
+    if resolve_container_filter():
+        return 1
     get_container_pids()
     scan_containers()
 
@@ -1342,9 +1380,6 @@ def main(argv):
 
     if not args_valid:
         print_usage(sys.stderr)
-        return 1
-    if CONTAINER_FILTER and not CONTAINER_FILTER.isdigit():
-        log_error(f"Container ID must be numeric, got: {CONTAINER_FILTER}")
         return 1
     if os.geteuid() != 0:
         log_error("This script must be run as root to access /proc/*/maps")
