@@ -1305,7 +1305,29 @@ def zabbix_output():
             "details": "\n".join(details),
         }
 
-    out = {"containers": [containers[k] for k in sorted(containers, key=int)]}
+    out_containers = [containers[k] for k in sorted(containers, key=int)]
+    needing = [c for c in out_containers if c["services"] > 0]
+    total_services = sum(c["services"] for c in needing)
+    total_cves = sum(c["cves"] for c in needing)
+    if needing:
+        lines = [f"- {c['name']}: {c['services']} services, {c['cves']} CVEs"
+                 for c in needing]
+        summary_text = (
+            f"{len(needing)} container(s) need restart "
+            f"({total_services} services, {total_cves} CVEs):\n"
+            + "\n".join(lines)
+        )
+    else:
+        summary_text = "No containers need a restart."
+    out = {
+        "containers": out_containers,
+        "summary": {
+            "needing_restart": len(needing),
+            "total_services": total_services,
+            "cves": total_cves,
+            "text": summary_text,
+        },
+    }
     text = json.dumps(out)
 
     # Publish to the cache file the Zabbix agent reads, atomically, creating

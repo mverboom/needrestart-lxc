@@ -37,6 +37,43 @@ keep `cvesok` = 1 and still get the WARNING when services need a restart.
 The severity reflects risk rather than an outage: pending restarts are
 WARNING, pending restarts that fix known CVEs are HIGH.
 
+### Aggregate alert (one email instead of one per container)
+
+When many containers need a restart at once, the per-container triggers would
+otherwise generate one notification each (e.g. 130 emails). To collapse this
+into a single email while keeping the full impact visible, the JSON also
+carries a `summary` block and the template adds three host-level dependent
+items plus two aggregate triggers:
+
+- `needrestart.lxc.summary.count` — how many containers need a restart
+- `needrestart.lxc.summary.cves` — total CVEs fixed across those containers
+- `needrestart.lxc.summary.text` — a pre-formatted list of every affected
+  container with its service/CVE counts (the email body)
+- **WARNING** aggregate trigger — `{HOST.NAME}: {ITEM.VALUE1} containers need
+  restart`, opdata `{ITEM.VALUE2} CVEs` — fires when count &gt; 0 and no CVEs
+- **HIGH** aggregate trigger — same name/opdata — fires when count &gt; 0 and
+  CVEs &gt; 0
+
+Both aggregate triggers carry the tag `needrestart=aggregate`; the per-container
+triggers carry `needrestart=container`. To get **one email per episode** with
+the full list, configure your notification action to only match the aggregate
+tag:
+
+1. In the action's **Conditions**, add a condition **Tag** = `needrestart`
+   **equals** `aggregate` (so per-container triggers never email).
+2. In the action's **Operations** message, include `{ITEM.VALUE3}` to render the
+   full per-container list, e.g.:
+
+   ```
+   {TRIGGER.NAME}
+   {ITEM.VALUE3}
+   ```
+
+   `{ITEM.VALUE1}` is the container count and `{ITEM.VALUE2}` the CVE count.
+
+The per-container triggers stay active and visible in the Zabbix problem list
+for per-container tracking; they just no longer generate their own emails.
+
 The master item polls every hour; a cron job refreshes the JSON every 15
 minutes, so data is at most ~1 hour old.
 
