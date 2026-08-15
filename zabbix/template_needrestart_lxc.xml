@@ -278,36 +278,6 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                     </lld_macro_paths>
                 </discovery_rule>
             </discovery_rules>
-            <triggers>
-                <trigger>
-                    <uuid>cbe4a7a7060b4efda407ba798e68f9c4</uuid>
-                    <expression>last(/Template needrestart lxc/needrestart.lxc.summary.count)&gt;0 and last(/Template needrestart lxc/needrestart.lxc.summary.cves)=0 and last(/Template needrestart lxc/needrestart.lxc.summary.text)&lt;&gt;''</expression>
-                    <name>{HOST.NAME}: {ITEM.VALUE1} containers need restart</name>
-                    <opdata>{ITEM.VALUE2} CVEs</opdata>
-                    <priority>WARNING</priority>
-                    <description>Aggregate alert: one or more containers have services needing a restart and no known CVEs are pending. The notification message can include the full per-container list via {ITEM.VALUE3}.</description>
-                    <tags>
-                        <tag>
-                            <tag>needrestart</tag>
-                            <value>aggregate</value>
-                        </tag>
-                    </tags>
-                </trigger>
-                <trigger>
-                    <uuid>439ef0ec9b254bcabe4b44fe6464b079</uuid>
-                    <expression>last(/Template needrestart lxc/needrestart.lxc.summary.count)&gt;0 and last(/Template needrestart lxc/needrestart.lxc.summary.cves)&gt;0 and last(/Template needrestart lxc/needrestart.lxc.summary.text)&lt;&gt;''</expression>
-                    <name>{HOST.NAME}: {ITEM.VALUE1} containers need restart</name>
-                    <opdata>{ITEM.VALUE2} CVEs</opdata>
-                    <priority>HIGH</priority>
-                    <description>Aggregate alert: one or more containers have services needing a restart and the pending updates fix known CVEs. The notification message can include the full per-container list via {ITEM.VALUE3}.</description>
-                    <tags>
-                        <tag>
-                            <tag>needrestart</tag>
-                            <value>aggregate</value>
-                        </tag>
-                    </tags>
-                </trigger>
-            </triggers>
         </template>
     </templates>
 </zabbix_export>

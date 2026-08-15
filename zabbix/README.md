@@ -54,6 +54,15 @@ items plus two aggregate triggers:
 - **HIGH** aggregate trigger — same name/opdata — fires when count &gt; 0 and
   CVEs &gt; 0
 
+> **Note:** Zabbix 7.0 does not support template-level triggers in the XML
+> export format (the template schema only allows triggers nested under items
+> or as LLD trigger prototypes). The two aggregate triggers are therefore **not
+> part of `template_needrestart_lxc.xml`** — they are created once on the
+> template via the API (`trigger.create`, expression referencing
+> `needrestart.lxc.summary.count`/`.cves`/`.text`), which propagates them to
+> every linked host. See `zabbix/create_aggregate_triggers.py` for the exact
+> call; re-run it after re-importing the template if the triggers are missing.
+
 Both aggregate triggers carry the tag `needrestart=aggregate`; the per-container
 triggers carry `needrestart=container`. To get **one email per episode** with
 the full list, configure your notification action to only match the aggregate
