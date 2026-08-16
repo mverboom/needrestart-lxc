@@ -350,9 +350,16 @@ def norm_dev(dev):
 # ---------------------------------------------------------------------------
 
 def service_from_path(path_suffix):
-    """Map a cgroup path suffix to a systemd unit name, most specific first."""
+    """Map a cgroup path suffix to a systemd unit name, most specific first.
+
+    Returns None for the container's own root cgroup (named ".lxc"), which
+    holds processes that systemd did not place into a unit cgroup (cron jobs,
+    manually spawned processes). Those are not restartable systemd services,
+    so they are skipped rather than reported as a fake ".lxc" service."""
     if path_suffix == "init.scope":
         return "systemd-manager"
+    if path_suffix == ".lxc":
+        return None
     m = re.search(r"/([^/]+\.service)/init\.scope$", path_suffix)
     if m:
         return m.group(1)
