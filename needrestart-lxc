@@ -805,9 +805,19 @@ def interactive_restart():
                   "restart all services")
         return 1
 
+    # Size the dialog to the terminal so lines fit on screen. whiptail needs a
+    # little margin around the box, and each row reserves ~8 columns for the
+    # checkbox and borders, so long labels are truncated to fit.
+    term = shutil.get_terminal_size()
+    width = max(40, min(term.columns - 2, 100))
+    max_label = max(10, width - 8)
+    height = min(len(CONT_SERVICES) + 8, max(12, term.lines - 2))
+    list_height = min(len(CONT_SERVICES), max(5, height - 8))
+
     # Build the checklist: tag = the 'ctid:user_uid:service' key (no spaces,
     # safe as a whiptail tag), item = human-readable label, status = ON so
-    # every flagged service is pre-selected like needrestart does.
+    # every flagged service is pre-selected like needrestart does. The tag is
+    # hidden with --notags so only the readable label is shown.
     items = []
     for key in sorted(CONT_SERVICES):
         ctid, _rest = key.split(":", 1)
@@ -824,13 +834,12 @@ def interactive_restart():
             if cve_count > 0:
                 plural = "" if cve_count == 1 else "s"
                 label += f" ({cve_count} CVE{plural})"
+        if len(label) > max_label:
+            label = label[:max_label - 3] + "..."
         items.append((key, label, "ON"))
 
-    height = min(len(items) + 8, 20)
-    width = 80
-    list_height = min(len(items), 15)
     cmd = ["whiptail", "--title", "needrestart-lxc: services to restart",
-           "--separate-output", "--checklist",
+           "--notags", "--separate-output", "--checklist",
            "Select services to restart:", str(height), str(width), str(list_height)]
     for tag, label, status in items:
         cmd += [tag, label, status]
