@@ -103,6 +103,28 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                     </preprocessing>
                     <description>Human-readable summary listing every container needing a restart with its service and CVE counts. Reference {ITEM.VALUE3} in the notification message to include the full list.</description>
                 </item>
+                <item>
+                    <uuid>c14d0f2a55e24b5f9a80e4f9b13f6c2a</uuid>
+                    <name>Needrestart LXC summary: alert state</name>
+                    <type>DEPENDENT</type>
+                    <key>needrestart.lxc.summary.state</key>
+                    <delay>0</delay>
+                    <history>31d</history>
+                    <trends>365d</trends>
+                    <value_type>UNSIGNED</value_type>
+                    <master_item>
+                        <key>needrestart.lxc.master</key>
+                    </master_item>
+                    <preprocessing>
+                        <step>
+                            <type>JSONPATH</type>
+                            <parameters>
+                                <parameter>$.summary.state</parameter>
+                            </parameters>
+                        </step>
+                    </preprocessing>
+                    <description>Consolidated alert state for the whole episode: 0 = none, 1 = restart(s) needed with no CVEs, 2 = pending updates fix CVEs. Evaluated as a single value so the aggregate trigger cannot race across separate summary items.</description>
+                </item>
             </items>
             <discovery_rules>
                 <discovery_rule>
@@ -208,6 +230,34 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                             <description>Whether CVE analysis for this container is complete (1) or indeterminate (0). When 0, restart alerts are suppressed to avoid false positives (an unknown CVE count could be 0 or many).</description>
                         </item_prototype>
                         <item_prototype>
+                            <uuid>c8a1b6e2493f4c6d8a7e1234567890ab</uuid>
+                            <name>Needrestart LXC {#CTNAME}: alert state</name>
+                            <type>DEPENDENT</type>
+                            <key>needrestart.lxc.state[{#CTID}]</key>
+                            <delay>0</delay>
+                            <history>31d</history>
+                            <trends>365d</trends>
+                            <value_type>UNSIGNED</value_type>
+                            <master_item>
+                                <key>needrestart.lxc.master</key>
+                            </master_item>
+                            <preprocessing>
+                                <step>
+                                    <type>JSONPATH</type>
+                                    <parameters>
+                                <parameter>$.containers[?(@.ctid == "{#CTID}")].first()</parameter>
+                            </parameters>
+                                </step>
+                                <step>
+                                    <type>JSONPATH</type>
+                                    <parameters>
+                                <parameter>$.state</parameter>
+                            </parameters>
+                                </step>
+                            </preprocessing>
+                            <description>Consolidated alert state for the container: 0 = none or indeterminate, 1 = restart needed with no CVEs, 2 = restart needed fixing CVEs. A single value is used as the trigger source so the trigger cannot see a mixed snapshot across separate dependent items.</description>
+                        </item_prototype>
+                        <item_prototype>
                             <uuid>92b76670c978402791658419100f6693</uuid>
                             <name>Needrestart LXC {#CTNAME}: details</name>
                             <type>DEPENDENT</type>
@@ -239,7 +289,7 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                     <trigger_prototypes>
                         <trigger_prototype>
                             <uuid>e08734a7cb61418497f02a436e73225b</uuid>
-                            <expression>last(/Template needrestart lxc/needrestart.lxc.services[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.cves[{#CTID}])=0 and last(/Template needrestart lxc/needrestart.lxc.cvesok[{#CTID}])=1</expression>
+                            <expression>last(/Template needrestart lxc/needrestart.lxc.services[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.cves[{#CTID}])=0 and last(/Template needrestart lxc/needrestart.lxc.state[{#CTID}])=1</expression>
                             <name>{#CTNAME}: {ITEM.VALUE1} services need restart</name>
                             <opdata>{ITEM.VALUE2} CVEs</opdata>
                             <priority>WARNING</priority>
@@ -253,7 +303,7 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                         </trigger_prototype>
                         <trigger_prototype>
                             <uuid>279fa24d2697487ebbbc0beb77d7feb0</uuid>
-                            <expression>last(/Template needrestart lxc/needrestart.lxc.services[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.cves[{#CTID}])&gt;0</expression>
+                            <expression>last(/Template needrestart lxc/needrestart.lxc.services[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.cves[{#CTID}])&gt;0 and last(/Template needrestart lxc/needrestart.lxc.state[{#CTID}])=2</expression>
                             <name>{#CTNAME}: {ITEM.VALUE1} services need restart</name>
                             <opdata>{ITEM.VALUE2} CVEs</opdata>
                             <priority>HIGH</priority>

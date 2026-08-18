@@ -10,29 +10,41 @@ macros). Tested against Zabbix 7.4.
 
 - A master item (`needrestart.lxc.master`) reads a JSON document with one entry
   per running container: `ctid`, `name`, `services` (needing restart), `cves`
-  (unique CVEs fixed by the pending updates) and `details` (human-readable
-  per-service breakdown).
+  (unique CVEs fixed by the pending updates), `cves_ok` (whether CVE analysis is
+  complete), `state` (0 = no alert, 1 = warning, 2 = high) and `details`
+  (human-readable per-service breakdown).
 - A discovery rule (`needrestart.lxc.discovery`, dependent on the master)
-  discovers every container; each gets four dependent items:
+  discovers every container; each gets dependent items including
   `needrestart.lxc.services[{#CTID}]`, `needrestart.lxc.cves[{#CTID}]`,
-  `needrestart.lxc.cvesok[{#CTID}]` (whether CVE analysis is complete) and
-  `needrestart.lxc.details[{#CTID}]`.
+  `needrestart.lxc.state[{#CTID}]` and `needrestart.lxc.details[{#CTID}]`.
 - Two mutually exclusive trigger prototypes per container (exactly one problem
-  is open at a time, so the alert list stays clean):
+  is open at a time, so the alert list stays clean). Both read the container's
+  single consolidated `state` item (0/1/2) as the firing source:
   - **WARNING** — `{#CTNAME}: {ITEM.VALUE1} services need restart`, opdata
-    `{ITEM.VALUE2} CVEs` — fires when services &gt; 0, CVEs are pending count 0
-    **and** CVE analysis is complete (opdata shows `0 CVEs`)
-  - **HIGH** — same name and opdata — fires when the pending updates fix CVEs
-    (e.g. `test.lnw.verboom.net: 6 services need restart`, opdata `15 CVEs`)
+    `{ITEM.VALUE2} CVEs` — fires when `state` = 1 (restart needed, CVE analysis
+    complete with a genuine zero)
+  - **HIGH** — same name and opdata — fires when `state` = 2 (the pending
+    updates fix known CVEs, e.g. `test.lnw.verbo.net: 16 services need restart`,
+    opdata `15 CVEs`)
 
-The `cvesok` item guards against a false WARNING. The CVE count comes from an
+The `cves_ok` flag guards against a false WARNING. The CVE count comes from an
 online security lookup with a changelog fallback; if that lookup fails *and*
 no changelog verdict is available the count is unknowable (it could be 0 or
-many). In that indeterminate case `cvesok` = 0 and **no** trigger fires — the
-alert is deferred to the next scan (15 min later) rather than risking a false
-"no CVEs" WARNING that would be superseded by a HIGH once the lookup succeeds.
-Containers where CVE analysis is not applicable (non-Debian/Ubuntu, no dpkg)
-keep `cvesok` = 1 and still get the WARNING when services need a restart.
+many). In that indeterminate case `cves_ok` = 0, so `state` = 0 and **no**
+trigger fires — the alert is deferred to the next scan (15 min later) rather
+than risking a false "no CVEs" WARNING that would be superseded by a HIGH once
+the lookup succeeds. Containers where CVE analysis is not applicable
+(non-Debian/Ubuntu, no dpkg) keep `cves_ok` = 1 and still get the WARNING when
+services need a restart.
+
+> **Why the trigger uses `state` instead of combining `services`/`cves`/`cves_ok`:**
+> the old expression compared three separate dependent items. Dependent items
+> update at slightly different moments when the master refreshes, so a trigger
+> using `last()` on several of them could briefly see a *mixed snapshot* (e.g.
+> new `services` count with an old `cves_ok` value) and fire a false problem that
+> immediately recovered — a PROBLEM/OK flap on every scan. Consolidating the
+> decision into one `state` value per container (and one `state` in the summary)
+> makes the trigger atomic and eliminates the race.
 
 The severity reflects risk rather than an outage: pending restarts are
 WARNING, pending restarts that fix known CVEs are HIGH.
@@ -49,10 +61,13 @@ items plus two aggregate triggers:
 - `needrestart.lxc.summary.cves` — total CVEs fixed across those containers
 - `needrestart.lxc.summary.text` — a pre-formatted list of every affected
   container with its service/CVE counts (the email body)
+- `needrestart.lxc.summary.state` — consolidated alert state for the episode
+  (0 = none, 1 = warning, 2 = high)
 - **WARNING** aggregate trigger — `{HOST.NAME}: {ITEM.VALUE1} containers need
-  restart`, opdata `{ITEM.VALUE2} CVEs` — fires when count &gt; 0 and no CVEs
-- **HIGH** aggregate trigger — same name/opdata — fires when count &gt; 0 and
-  CVEs &gt; 0
+  restart`, opdata `{ITEM.VALUE2} CVEs` — fires when `summary.state` = 1
+- **HIGH** aggregate trigger — same name/opdata — fires when `summary.state` = 2
+  (count &gt; 0 and CVEs &gt; 0). Anchored on the single `summary.state` value for the
+  same race-resistance as the per-container triggers.
 
 > **Note:** Zabbix 7.0 does not support template-level triggers in the XML
 > export format (the template schema only allows triggers nested under items

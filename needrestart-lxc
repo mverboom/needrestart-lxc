@@ -1357,12 +1357,28 @@ def zabbix_output():
         for ukey, uc in CONT_UPDATE_COUNTS.items():
             if ukey.startswith(ctid + "|"):
                 cves += uc
+        # Consolidated alert state so the Zabbix trigger reads ONE value.
+        # Reading separate items (services/cves/cvesok) is racy: they are
+        # dependent items that update at slightly different moments on each
+        # master refresh, so a trigger combining them can briefly see a mixed
+        # snapshot and fire a false problem then immediately recover.
+        #   state 0 = no restart alert (clean, or CVE analysis indeterminate)
+        #   state 1 = restart needed, no CVEs pending, analysis complete
+        #   state 2 = restart needed and pending updates fix CVEs
+        cves_ok = 0 if ctid in CT_CVE_UNKNOWN else 1
+        if services > 0 and cves > 0:
+            state = 2
+        elif services > 0 and cves_ok:
+            state = 1
+        else:
+            state = 0
         containers[ctid] = {
             "ctid": ctid,
             "name": CT_NAMES.get(ctid, "unknown"),
             "services": services,
             "cves": cves,
-            "cves_ok": 0 if ctid in CT_CVE_UNKNOWN else 1,
+            "cves_ok": cves_ok,
+            "state": state,
             "details": "\n".join(details),
         }
 
@@ -1380,12 +1396,22 @@ def zabbix_output():
         )
     else:
         summary_text = "No containers need a restart."
+    # Aggregate state (same semantics as per-container state, applied to the
+    # whole episode) so the aggregate trigger also evaluates a single value
+    # instead of racing across summary.count/summary.cves/summary.text.
+    if needing and total_cves > 0:
+        summary_state = 2
+    elif needing:
+        summary_state = 1
+    else:
+        summary_state = 0
     out = {
         "containers": out_containers,
         "summary": {
             "needing_restart": len(needing),
             "total_services": total_services,
             "cves": total_cves,
+            "state": summary_state,
             "text": summary_text,
         },
     }
