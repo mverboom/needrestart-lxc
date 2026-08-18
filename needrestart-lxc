@@ -93,6 +93,7 @@ CT_NAMES = {}          # ctid -> container name
 CT_PIDS = {}           # ctid -> init PID
 CONT_SERVICES = {}     # "ctid:user_uid:service" -> "deleted_lib1,deleted_lib2"
 CONT_PID = {}          # "ctid:user_uid:service" -> PID of first stale process
+NON_SYSTEMD_KEYS = set()  # "ctid:user_uid:service" -> process in the .lxc root cgroup (not a systemd service)
 CONT_CVES = {}         # key -> security analysis lines
 CONT_CVE_COUNTS = {}   # key -> total CVEs fixed
 CONT_UPDATE_COUNTS = {}  # "ctid|srcpkg|old|new" -> CVEs fixed by this update
@@ -381,6 +382,29 @@ def service_from_path(path_suffix):
     return path_suffix.rstrip("/").rsplit("/", 1)[-1]
 
 
+def process_ident(pid):
+    """Return a human-readable identifier (main script/executable) for a
+    process that systemd did not place into a unit cgroup (i.e. the container's
+    root .lxc cgroup). Prefers the script path when the process is launched via
+    an interpreter. Returns None if it cannot be determined or is blacklisted."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            args = fh.read().split(b"\0")
+    except OSError:
+        return None
+    args = [a.decode(errors="replace") for a in args if a]
+    if not args:
+        return None
+    interp = os.path.basename(args[0]).lower()
+    if interp.startswith(("python", "perl", "ruby", "php", "node", "nodejs")):
+        ident = next((a for a in args[1:] if a.startswith("/")), args[0])
+    else:
+        ident = args[0]
+    if is_blacklisted(ident):
+        return None
+    return ident
+
+
 # ---------------------------------------------------------------------------
 # Main scanning logic
 # ---------------------------------------------------------------------------
@@ -406,7 +430,18 @@ def scan_containers():
         if mu:
             user_uid = mu.group(1)
 
-        service = service_from_path(path_suffix)
+        if path_suffix == ".lxc":
+            # Processes in the container's root cgroup are not placed into a
+            # systemd unit cgroup (leftovers from a service restart, manually
+            # spawned processes, cron jobs). They cannot be restarted via
+            # systemctl, so identify them by their main script/executable and
+            # report them as non-systemd so the user can restart manually or
+            # reboot the container.
+            service = process_ident(pid)
+            non_systemd = True
+        else:
+            service = service_from_path(path_suffix)
+            non_systemd = False
         if not service:
             continue
         if is_excluded(service):
@@ -441,7 +476,9 @@ def scan_containers():
             CONT_SERVICES[key] = libs
             if key not in CONT_PID:
                 CONT_PID[key] = pid
-            log_verbose(f"  -> Service {service} in CT {ctid} needs restart")
+            if non_systemd:
+                NON_SYSTEMD_KEYS.add(key)
+            log_verbose(f"  -> {service} in CT {ctid} needs restart")
 
 
 # ---------------------------------------------------------------------------
@@ -613,8 +650,12 @@ def print_results():
         user_uid, service = _rest.split(":", 1)
         ct_name = CT_NAMES.get(ctid, "unknown")
         libs = CONT_SERVICES[key]
-        svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
-        print(f"Container {ctid} ({ct_name}): service {svc_display} needs restart", end="")
+        if key in NON_SYSTEMD_KEYS:
+            print(f"Container {ctid} ({ct_name}): non-systemd process {service} "
+                  f"needs restart (restart it manually or reboot the container)", end="")
+        else:
+            svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
+            print(f"Container {ctid} ({ct_name}): service {svc_display} needs restart", end="")
         print_security_annotation(key)
         if VERBOSE:
             for lib in libs.split("\n"):
@@ -632,6 +673,16 @@ def restart_services():
         ctid, _rest = key.split(":", 1)
         user_uid, service = _rest.split(":", 1)
         ct_name = CT_NAMES.get(ctid, "unknown")
+
+        # Non-systemd processes (in the container root cgroup) cannot be
+        # restarted via systemctl; report and leave the action to the user.
+        if key in NON_SYSTEMD_KEYS:
+            print(f"Container {ctid} ({ct_name}): non-systemd process {service} "
+                  f"needs restart (restart it manually or reboot the container)", end="")
+            print_security_annotation(key)
+            if SECURITY and VERBOSE:
+                print_security_info(key)
+            continue
 
         # systemd-manager can be re-exec'd, no container reboot needed
         if service == "systemd-manager":
@@ -1291,7 +1342,10 @@ def zabbix_output():
             services += 1
             _rest = key.split(":", 1)[1]
             user_uid, service = _rest.split(":", 1)
-            svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
+            if key in NON_SYSTEMD_KEYS:
+                svc_display = f"{service} (non-systemd)"
+            else:
+                svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
             if key in CONT_CVES:
                 for vl in CONT_CVES[key].split("\n"):
                     if not vl:
