@@ -11,6 +11,12 @@ information, and can restart individual services via `pct exec`.
 It does NOT modify or depend on needrestart being installed inside
 containers. It is a standalone tool that complements the host-side
 needrestart by providing per-service granularity for LXC containers.
+
+By default (no mode flag) it presents an interactive whiptail checkbox
+list of the services needing restart, mirroring needrestart's own UI, and
+restarts only the services the user selects. Use -l/--list for a plain
+non-interactive text report, or -r/--restart to restart every flagged
+service without prompting (for automation).
 """
 
 import gzip
@@ -78,7 +84,7 @@ CACHE_TTL = 86400                     # seconds to keep cached API responses
 CACHE_DIR = "/var/cache/needrestart-lxc"
 
 # Modes / flags
-MODE = "list"
+MODE = "interactive"   # default: whiptail checkbox selection
 VERBOSE = 0
 DEEP = 0
 DRY_RUN = 0
@@ -113,9 +119,11 @@ shared libraries, and optionally restart specific services inside
 those containers.
 
 Options:
-  -l, --list          List containers with services needing restart (default)
-  -r, --restart       Restart services inside containers
-  -n, --dry-run       Show what would be restarted without doing it
+  (default)       Interactive: present a whiptail checkbox list of the
+                  services needing restart and restart the selected ones
+  -l, --list      List containers with services needing restart (no dialog)
+  -r, --restart   Restart all affected services (no prompt; for automation)
+  -n, --dry-run   Show what would be restarted without doing it
   -c, --container ID  Only check a specific container (by CTID or name)
   -e, --exclude PAT   Exclude services matching regex (can be repeated)
   -d, --deep          Also check for inode mismatches (slower but thorough)
@@ -129,12 +137,13 @@ Options:
   -h, --help          Show this help message
 
 Examples:
-  {PROGNAME}                     # List all containers needing service restarts
+  {PROGNAME}                     # Interactive: pick services to restart
+  {PROGNAME} -l                  # List containers needing service restarts
   {PROGNAME} -v                  # Show which libraries are outdated
-  {PROGNAME} -r                  # Restart affected services in containers
+  {PROGNAME} -r                  # Restart all affected services in containers
   {PROGNAME} -n -r               # Show what would be restarted (dry run)
   {PROGNAME} -c 100              # Only check container 100
-  {PROGNAME} -r -c web1          # Restart services in container named 'web1'
+  {PROGNAME} -c web1             # Only check container named 'web1'
   {PROGNAME} -d                   # Deep scan including inode comparison
   {PROGNAME} -s                   # Security scan with CVE analysis
   {PROGNAME} -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
@@ -665,111 +674,183 @@ def print_results():
             print_security_info(key)
 
 
+def restart_one(key):
+    """Restart a single flagged service, identified by its
+    'ctid:user_uid:service' key. Handles non-systemd processes, the
+    container's own systemd, scope units, user-session services and regular
+    system services. Honors DRY_RUN."""
+    ctid, _rest = key.split(":", 1)
+    user_uid, service = _rest.split(":", 1)
+    ct_name = CT_NAMES.get(ctid, "unknown")
+
+    # Non-systemd processes (in the container root cgroup) cannot be
+    # restarted via systemctl; report and leave the action to the user.
+    if key in NON_SYSTEMD_KEYS:
+        print(f"Container {ctid} ({ct_name}): non-systemd process {service} "
+              f"needs restart (restart it manually or reboot the container)", end="")
+        print_security_annotation(key)
+        if SECURITY and VERBOSE:
+            print_security_info(key)
+        return
+
+    # systemd-manager can be re-exec'd, no container reboot needed
+    if service == "systemd-manager":
+        print(f"Container {ctid} ({ct_name}): systemd needs reexec "
+              f"(systemctl daemon-reexec)", end="")
+        print_security_annotation(key)
+        if SECURITY and VERBOSE:
+            print_security_info(key)
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl daemon-reexec")
+            return
+        r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "daemon-reexec"])
+        if r.returncode:
+            log_error(f"Failed to daemon-reexec in container {ctid} "
+                      f"(exit code: {r.returncode})")
+        return
+
+    # Scope units cannot be restarted with systemctl restart
+    if service.endswith(".scope"):
+        if user_uid:
+            print(f"Container {ctid} ({ct_name}): user session scope {service} "
+                  f"has outdated processes (stopping via systemctl --user stop)", end="")
+        else:
+            print(f"Container {ctid} ({ct_name}): scope {service} has outdated "
+                  f"processes (cannot auto-restart, consider restarting user "
+                  f"service or terminating scope)", end="")
+        print_security_annotation(key)
+        if SECURITY and VERBOSE:
+            print_security_info(key)
+        if DRY_RUN:
+            if user_uid:
+                print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
+                      f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
+                      f"systemctl --user stop {service}")
+            else:
+                print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl stop {service}")
+            return
+        if user_uid:
+            username = resolve_user(ctid, user_uid)
+            if not username:
+                log_error(f"Could not resolve username for UID {user_uid} in "
+                          f"container {ctid}; skipping {service}")
+                return
+            cmd = systemctl_cmd(ctid, "stop", service, user_uid, username)
+        else:
+            cmd = ["pct", "exec", ctid, "--", "systemctl", "stop", service]
+        log_verbose("  Stopping scope: " + " ".join(cmd))
+        r = subprocess.run(cmd)
+        if r.returncode:
+            log_error(f"Failed to stop scope {service} in container {ctid} "
+                      f"(exit code: {r.returncode})")
+        return
+
+    # User session service (managed by user's systemd under user@N.service):
+    # restart via `systemctl --user` as the owning user.
+    if user_uid:
+        print(f"Container {ctid} ({ct_name}): restarting user session service "
+              f"{service} (UID {user_uid})", end="")
+        print_security_annotation(key)
+        if SECURITY and VERBOSE:
+            print_security_info(key)
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
+                  f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
+                  f"systemctl --user restart {service}")
+            print(f"  [DRY RUN] Would verify; if stale, escalate to: "
+                  f"systemctl --user kill {service} && systemctl --user start {service}")
+            return
+        username = resolve_user(ctid, user_uid)
+        if not username:
+            log_error(f"Could not resolve username for UID {user_uid} in "
+                      f"container {ctid}; skipping {service}")
+            return
+        restart_with_escalation(ctid, ct_name, service, user_uid, username)
+        return
+
+    # Standard system service
+    print(f"Container {ctid} ({ct_name}): restarting service {service}", end="")
+    print_security_annotation(key)
+    if SECURITY and VERBOSE:
+        print_security_info(key)
+    if DRY_RUN:
+        print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl restart {service}")
+        print(f"  [DRY RUN] Would verify; if stale, escalate to: "
+              f"pct exec {ctid} -- systemctl kill {service} && systemctl start {service}")
+        return
+    restart_with_escalation(ctid, ct_name, service)
+
+
 def restart_services():
     if not CONT_SERVICES:
         print("No containers have services needing restart.")
         return
     for key in sorted(CONT_SERVICES):
+        restart_one(key)
+
+
+def interactive_restart():
+    """Present a whiptail checkbox list of the flagged services (mirroring
+    needrestart's own UI) and restart only the services the user selects.
+    Returns 0 on success, 1 if interactive mode is unavailable."""
+    if not CONT_SERVICES:
+        print("No containers have services needing restart.")
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        log_error("Interactive mode needs a terminal; use -l to list or "
+                  "-r to restart all services")
+        return 1
+    if not shutil.which("whiptail"):
+        log_error("whiptail is not installed; use -l to list or -r to "
+                  "restart all services")
+        return 1
+
+    # Build the checklist: tag = the 'ctid:user_uid:service' key (no spaces,
+    # safe as a whiptail tag), item = human-readable label, status = ON so
+    # every flagged service is pre-selected like needrestart does.
+    items = []
+    for key in sorted(CONT_SERVICES):
         ctid, _rest = key.split(":", 1)
         user_uid, service = _rest.split(":", 1)
         ct_name = CT_NAMES.get(ctid, "unknown")
-
-        # Non-systemd processes (in the container root cgroup) cannot be
-        # restarted via systemctl; report and leave the action to the user.
         if key in NON_SYSTEMD_KEYS:
-            print(f"Container {ctid} ({ct_name}): non-systemd process {service} "
-                  f"needs restart (restart it manually or reboot the container)", end="")
-            print_security_annotation(key)
-            if SECURITY and VERBOSE:
-                print_security_info(key)
-            continue
+            label = f"{ct_name} ({ctid}): {service} (non-systemd)"
+        elif user_uid:
+            label = f"{ct_name} ({ctid}): {service} [user UID {user_uid}]"
+        else:
+            label = f"{ct_name} ({ctid}): {service}"
+        if SECURITY:
+            cve_count = CONT_CVE_COUNTS.get(key, 0)
+            if cve_count > 0:
+                plural = "" if cve_count == 1 else "s"
+                label += f" ({cve_count} CVE{plural})"
+        items.append((key, label, "ON"))
 
-        # systemd-manager can be re-exec'd, no container reboot needed
-        if service == "systemd-manager":
-            print(f"Container {ctid} ({ct_name}): systemd needs reexec "
-                  f"(systemctl daemon-reexec)", end="")
-            print_security_annotation(key)
-            if SECURITY and VERBOSE:
-                print_security_info(key)
-            if DRY_RUN:
-                print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl daemon-reexec")
-                continue
-            r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "daemon-reexec"])
-            if r.returncode:
-                log_error(f"Failed to daemon-reexec in container {ctid} "
-                          f"(exit code: {r.returncode})")
-            continue
+    height = min(len(items) + 8, 20)
+    width = 80
+    list_height = min(len(items), 15)
+    cmd = ["whiptail", "--title", "needrestart-lxc: services to restart",
+           "--separate-output", "--checklist",
+           "Select services to restart:", str(height), str(width), str(list_height)]
+    for tag, label, status in items:
+        cmd += [tag, label, status]
 
-        # Scope units cannot be restarted with systemctl restart
-        if service.endswith(".scope"):
-            if user_uid:
-                print(f"Container {ctid} ({ct_name}): user session scope {service} "
-                      f"has outdated processes (stopping via systemctl --user stop)", end="")
-            else:
-                print(f"Container {ctid} ({ct_name}): scope {service} has outdated "
-                      f"processes (cannot auto-restart, consider restarting user "
-                      f"service or terminating scope)", end="")
-            print_security_annotation(key)
-            if SECURITY and VERBOSE:
-                print_security_info(key)
-            if DRY_RUN:
-                if user_uid:
-                    print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
-                          f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
-                          f"systemctl --user stop {service}")
-                else:
-                    print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl stop {service}")
-                continue
-            if user_uid:
-                username = resolve_user(ctid, user_uid)
-                if not username:
-                    log_error(f"Could not resolve username for UID {user_uid} in "
-                              f"container {ctid}; skipping {service}")
-                    continue
-                cmd = systemctl_cmd(ctid, "stop", service, user_uid, username)
-            else:
-                cmd = ["pct", "exec", ctid, "--", "systemctl", "stop", service]
-            log_verbose("  Stopping scope: " + " ".join(cmd))
-            r = subprocess.run(cmd)
-            if r.returncode:
-                log_error(f"Failed to stop scope {service} in container {ctid} "
-                          f"(exit code: {r.returncode})")
-            continue
+    # whiptail draws the dialog on stdout and writes the result to stderr, so
+    # swap them: send the dialog to our stderr (the terminal) and capture the
+    # selected tags from whiptail's stderr.
+    r = subprocess.run(cmd, stdout=sys.stderr.fileno(), stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        print("No services selected; nothing restarted.")
+        return 0
+    selected = [line for line in r.stderr.decode().splitlines() if line]
+    if not selected:
+        print("No services selected; nothing restarted.")
+        return 0
 
-        # User session service (managed by user's systemd under user@N.service):
-        # restart via `systemctl --user` as the owning user.
-        if user_uid:
-            print(f"Container {ctid} ({ct_name}): restarting user session service "
-                  f"{service} (UID {user_uid})", end="")
-            print_security_annotation(key)
-            if SECURITY and VERBOSE:
-                print_security_info(key)
-            if DRY_RUN:
-                print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
-                      f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
-                      f"systemctl --user restart {service}")
-                print(f"  [DRY RUN] Would verify; if stale, escalate to: "
-                      f"systemctl --user kill {service} && systemctl --user start {service}")
-                continue
-            username = resolve_user(ctid, user_uid)
-            if not username:
-                log_error(f"Could not resolve username for UID {user_uid} in "
-                          f"container {ctid}; skipping {service}")
-                continue
-            restart_with_escalation(ctid, ct_name, service, user_uid, username)
-            continue
-
-        # Standard system service
-        print(f"Container {ctid} ({ct_name}): restarting service {service}", end="")
-        print_security_annotation(key)
-        if SECURITY and VERBOSE:
-            print_security_info(key)
-        if DRY_RUN:
-            print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl restart {service}")
-            print(f"  [DRY RUN] Would verify; if stale, escalate to: "
-                  f"pct exec {ctid} -- systemctl kill {service} && systemctl start {service}")
-            continue
-        restart_with_escalation(ctid, ct_name, service)
+    for key in selected:
+        if key in CONT_SERVICES:
+            restart_one(key)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1454,6 +1535,8 @@ def _run():
         restart_services()
     elif MODE == "zabbix":
         return zabbix_output()
+    elif MODE == "interactive":
+        return interactive_restart()
     else:
         print_results()
     return 0

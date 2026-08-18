@@ -6,14 +6,36 @@ This script was created in order to be able to detect services within lxc contai
 
 ## Running the command
 
-### Default action
+### Default action (interactive)
 
-When running the command without options it will scan all containers for services that need to be restarted.
-This is the same as starting the script with the list (-l, --list) option.
+When running the command without options it scans all containers for services
+that need to be restarted and presents an interactive **whiptail checkbox list**
+of those services, mirroring needrestart's own UI. Every flagged service is
+pre-selected; uncheck the ones you want to leave alone and press **Ok** to
+restart only the selected services. Press **Cancel** (or **Esc**) to abort
+without restarting anything.
 
-### Restart
+```
+needrestart-lxc
+```
 
-The script can restart the services that need to be restarted. This requires the -r or --restart option.
+If no services need a restart, or the command is run without a terminal (e.g.
+piped or from cron), it falls back to a plain message instead of a dialog.
+
+### List (non-interactive)
+
+To get a plain text report without any dialog, use the list (-l, --list)
+option:
+
+```
+needrestart-lxc -l
+```
+
+### Restart all (non-interactive)
+
+The script can restart **all** flagged services without prompting. This
+requires the -r or --restart option and is intended for automation (cron,
+Zabbix actions, etc.).
 
 For regular services the script runs `systemctl restart`. It then verifies that
 the outdated processes are actually gone. Some services use `KillMode=process`
@@ -48,7 +70,7 @@ To only do a check for a specific container, the container to be checked can be 
 ID or by its container name.
 
 ```
-needrestart-lxc -c 100
+needrestart-lxc -l -c 100
 Container 100 (test): service systemd-journald.service needs restart
 Container 100 (test): service systemd-logind.service needs restart
 ```
