@@ -80,7 +80,8 @@ do_status() {
     local hosts=()
     while (($#)); do
         case $1 in
-            --mode) MODE=$2; shift 2 ;;
+            --mode) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    MODE=$2; shift 2 ;;
             --mode=*) MODE=${1#*=}; shift ;;
             -h|--help) usage ;;
             *) hosts+=("$1"); shift ;;
@@ -193,14 +194,28 @@ PYEOF
 # restart
 # ---------------------------------------------------------------------------
 
+# shquote <string>
+# POSIX-safe single-quoted form for embedding into a remote shell command.
+# ssh re-joins argv into one string and runs it through the remote login
+# shell, so unquoted user input from the script-server UI would be
+# interpreted there (as root on the PVE host).
+shquote() {
+    local s=${1//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
 do_restart() {
     local host="" container="" exclude="" action="dry-run"
     while (($#)); do
         case $1 in
-            --host) host=$2; shift 2 ;;
-            --container) container=$2; shift 2 ;;
-            --exclude) exclude=$2; shift 2 ;;
-            --action) action=$2; shift 2 ;;
+            --host) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    host=$2; shift 2 ;;
+            --container) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    container=$2; shift 2 ;;
+            --exclude) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    exclude=$2; shift 2 ;;
+            --action) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    action=$2; shift 2 ;;
             -h|--help) usage ;;
             *) echo "unknown restart option: $1"; exit 1 ;;
         esac
@@ -208,12 +223,13 @@ do_restart() {
     [[ -n $host ]] || { echo "--host is required"; exit 1; }
     [[ $action == dry-run || $action == restart ]] || { echo "bad --action: $action"; exit 1; }
 
-    local cmd=(ssh "${SSH_OPTS[@]}" "$host" --
-               /usr/local/bin/needrestart-lxc)
-    [[ $action == dry-run ]] && cmd+=(-n)
-    cmd+=(-r)
-    [[ -n $container ]] && cmd+=(-c "$container")
-    [[ -n $exclude ]] && cmd+=(-e "$exclude")
+    local remote="/usr/local/bin/needrestart-lxc"
+    [[ $action == dry-run ]] && remote+=" -n"
+    remote+=" -r"
+    [[ -n $container ]] && remote+=" -c $(shquote "$container")"
+    [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
+
+    local cmd=(ssh "${SSH_OPTS[@]}" "$host" -- "$remote")
 
     echo "Running: ${cmd[*]}"
     echo

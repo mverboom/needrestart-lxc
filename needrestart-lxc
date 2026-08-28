@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -48,7 +49,7 @@ CGROUP_RE = re.compile(r"^/lxc/(\d+)/ns/(.+)$")
 BLACKLIST_PATTERNS = [re.compile(p) for p in (
     r"^/memfd:",
     r"^/dev/",
-    r"^/\(SYSV00000000",
+    r"^/SYSV[0-9a-fA-F]{8}",                    # SysV shared memory segments
     r"^/\[aio\]",
     r"^\[",
     r"^(/var)?/tmp/",
@@ -81,6 +82,8 @@ DBUS_DEPENDENT_SERVICES = [
 # Security scan configuration (CVE analysis)
 CACHE_TTL = 86400                     # seconds to keep cached API responses
 CACHE_DIR = "/var/cache/needrestart-lxc"
+SUBPROC_TIMEOUT = 120                 # seconds; pct exec can hang on frozen
+                                      # containers, which would pile up cron runs
 
 # Modes / flags
 MODE = "interactive"   # default: whiptail checkbox selection
@@ -528,16 +531,25 @@ def restart_dbus_dependents(ctid, ct_name):
         if DRY_RUN:
             print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl restart {dep}")
             continue
-        r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "restart", dep])
+        try:
+            r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "restart", dep],
+                               timeout=SUBPROC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log_error(f"Timed out restarting {dep} in container {ctid}")
+            continue
         if r.returncode:
             log_error(f"Failed to restart {dep} in container {ctid} "
                       f"(exit code: {r.returncode})")
 
 
 def resolve_user(ctid, user_uid):
-    r = subprocess.run(
-        ["pct", "exec", ctid, "--", "getent", "passwd", user_uid],
-        capture_output=True, text=True)
+    try:
+        r = subprocess.run(
+            ["pct", "exec", ctid, "--", "getent", "passwd", user_uid],
+            capture_output=True, text=True, timeout=SUBPROC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log_error(f"Timed out looking up UID {user_uid} in container {ctid}")
+        return ""
     if r.returncode == 0 and r.stdout:
         return r.stdout.split(":", 1)[0]
     return ""
@@ -562,17 +574,26 @@ def restart_with_escalation(ctid, ct_name, service, user_uid="", username=""):
     def run(action, extra=()):
         cmd = systemctl_cmd(ctid, action, service, user_uid, username, extra)
         log_verbose("  Running: " + " ".join(cmd))
-        return subprocess.run(cmd).returncode
+        try:
+            return subprocess.run(cmd, timeout=SUBPROC_TIMEOUT).returncode
+        except subprocess.TimeoutExpired:
+            log_error(f"Timed out after {SUBPROC_TIMEOUT}s running {tool} {action} "
+                      f"for {service} in container {ctid}")
+            return 124
 
     # Step 1: normal restart (works for default KillMode=control-group)
     rc = run("restart")
     if rc:
         log_error(f"Failed to restart {service} in container {ctid} (exit code: {rc})")
         if not user_uid:
-            r = subprocess.run(
-                ["pct", "exec", ctid, "--", "systemctl", "status", service],
-                capture_output=True, text=True)
-            log_verbose("\n".join(r.stdout.splitlines()[-5:]))
+            try:
+                r = subprocess.run(
+                    ["pct", "exec", ctid, "--", "systemctl", "status", service],
+                    capture_output=True, text=True, timeout=SUBPROC_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                r = None
+            if r:
+                log_verbose("\n".join(r.stdout.splitlines()[-5:]))
         return
 
     # After restarting dbus.service, re-register its D-Bus dependents.
@@ -686,7 +707,12 @@ def restart_one(key):
         if DRY_RUN:
             print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl daemon-reexec")
             return
-        r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "daemon-reexec"])
+        try:
+            r = subprocess.run(["pct", "exec", ctid, "--", "systemctl", "daemon-reexec"],
+                               timeout=SUBPROC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log_error(f"Timed out daemon-reexec in container {ctid}")
+            return
         if r.returncode:
             log_error(f"Failed to daemon-reexec in container {ctid} "
                       f"(exit code: {r.returncode})")
@@ -722,7 +748,11 @@ def restart_one(key):
         else:
             cmd = ["pct", "exec", ctid, "--", "systemctl", "stop", service]
         log_verbose("  Stopping scope: " + " ".join(cmd))
-        r = subprocess.run(cmd)
+        try:
+            r = subprocess.run(cmd, timeout=SUBPROC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log_error(f"Timed out stopping scope {service} in container {ctid}")
+            return
         if r.returncode:
             log_error(f"Failed to stop scope {service} in container {ctid} "
                       f"(exit code: {r.returncode})")
@@ -831,10 +861,12 @@ def interactive_restart():
     # swap them: send the dialog to our stderr (the terminal) and capture the
     # selected tags from whiptail's stderr.
     r = subprocess.run(cmd, stdout=sys.stderr.fileno(), stderr=subprocess.PIPE)
-    if r.returncode == 255:      # whiptail error (e.g. dialog does not fit)
-        log_error(f"whiptail failed: {r.stderr.decode(errors='replace').strip()}")
+    errmsg = r.stderr.decode(errors="replace").strip()
+    if r.returncode == 255 and errmsg:
+        log_error(f"whiptail failed: {errmsg}")
         return 1
-    if r.returncode != 0:        # 1 = cancelled
+    if r.returncode != 0:
+        # 1 = Cancel button; 255 with no message = Esc key
         print("No services selected; nothing restarted.")
         return 0
     selected = [line for line in r.stderr.decode().splitlines() if line]
@@ -930,11 +962,16 @@ def owning_pkgs(root, paths):
 
 def ver_cmp(a, b):
     """Debian version comparison; returns -1, 0 or 1 (dpkg semantics)."""
-    if subprocess.run(["dpkg", "--compare-versions", a, "eq", b],
-                      capture_output=True).returncode == 0:
+    def dpkg_op(op):
+        try:
+            return subprocess.run(
+                ["dpkg", "--compare-versions", a, op, b],
+                capture_output=True, timeout=10).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    if dpkg_op("eq"):
         return 0
-    if subprocess.run(["dpkg", "--compare-versions", a, "gt", b],
-                      capture_output=True).returncode == 0:
+    if dpkg_op("gt"):
         return 1
     return -1
 
@@ -991,11 +1028,10 @@ def version_at_start(root, binpkg, start_epoch):
         p = parts[3].split(":")[0]
         if p != binpkg:
             continue
-        if parts[2] == "upgrade" and len(parts) >= 6:
-            v = parts[5]
-        else:
-            v = parts[4]
-        if not v:
+        # Both "upgrade pkg old new" and "install pkg <none> new" carry the
+        # version in effect after the operation in the last field.
+        v = parts[5] if len(parts) >= 6 else parts[4]
+        if not v or v == "<none>":
             continue
         ts = epoch_from_date(line[:19], tz)
         if ts is None:
@@ -1061,8 +1097,13 @@ def changelog_verdict(root, binpkg, srcpkg, old, new):
             version, suite = fields
             want_entry = False
             if old:
-                if ver_cmp(version, old) > 0 and ver_cmp(version, new) <= 0:
-                    want_entry = True
+                if ver_cmp(version, old) > 0:
+                    if ver_cmp(version, new) <= 0:
+                        want_entry = True
+                else:
+                    # Reached the old version; changelogs are newest-first,
+                    # so stop instead of scanning (and spawning dpkg) to EOF.
+                    break
             else:
                 want_entry = True
                 top_entry = True
@@ -1175,6 +1216,7 @@ def fetch_all_ubuntu(pkg, cache):
     BASE = "https://ubuntu.com/security/cves.json"
     PAGE = 20          # max accepted by the API
     PAGE_SLEEP = 2.0   # be gentle; the API rate-limits bursts (429)
+    RETRY_SLEEP = 15.0  # backoff between retries on HTTP 429
     MAX_PAGES = 100
     merged = []
     offset = 0
@@ -1191,7 +1233,7 @@ def fetch_all_ubuntu(pkg, cache):
                 break
             except urllib.error.HTTPError as err:
                 if err.code == 429 and attempt < 2:
-                    time.sleep(60)
+                    time.sleep(RETRY_SLEEP)
                     continue
                 raise
         if data is None:
@@ -1219,10 +1261,20 @@ def load_cache(cache):
 
 
 def write_cache(cache, data):
-    tmp = cache + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, cache)
+    # mkstemp gives a unique temp name so concurrent runs (15-min cron plus a
+    # script-server scan) can never interleave into one torn file.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache),
+                               prefix=os.path.basename(cache) + ".")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, cache)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def security_analysis(ctid, srcpkg, binpkg, old, new):
@@ -1373,8 +1425,12 @@ def security_scan():
             CT_NOTES[ctid] = "no dpkg database found in container"
             continue
 
-        lstart = subprocess.run(["ps", "-o", "lstart=", "-p", pid],
-                                capture_output=True, text=True).stdout.strip()
+        try:
+            lstart = subprocess.run(["ps", "-o", "lstart=", "-p", pid],
+                                    capture_output=True, text=True,
+                                    timeout=10).stdout.strip()
+        except subprocess.TimeoutExpired:
+            lstart = ""
         start_epoch = epoch_from_date(lstart, "") if lstart else ""
 
         log_verbose(f"Extended security analysis for CT {ctid}, "
@@ -1478,20 +1534,21 @@ def zabbix_output():
     }
     text = json.dumps(out)
 
-    # Publish to the cache file the Zabbix agent reads, atomically, creating
-    # the dir if needed (so cron needs no redirect). On failure the previous
-    # cache file is left untouched.
+    # Publish to the cache file the Zabbix agent reads, atomically with a
+    # unique temp name (concurrent cron + script-server runs), creating the
+    # dir if needed (so cron needs no redirect). On failure the previous
+    # cache file is left untouched and the JSON is still printed so the run
+    # is not lost.
+    target = os.path.join(CACHE_DIR, "zabbix.json")
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        target = os.path.join(CACHE_DIR, "zabbix.json")
-        tmp = target + ".tmp"
-        with open(tmp, "w") as fh:
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix="zabbix.json.")
+        with os.fdopen(fd, "w") as fh:
             fh.write(text)
         os.replace(tmp, target)
         os.chmod(target, 0o644)
-    except OSError:
-        return 1
-
+    except OSError as err:
+        log_error(f"failed to update {target}: {err}")
     print(text)
     return 0
 
@@ -1546,7 +1603,13 @@ def main(argv):
                 args_valid = False
                 i += 1
             else:
-                EXCLUDE_PATTERNS.append(argv[i + 1])
+                try:
+                    re.compile(argv[i + 1])
+                except re.error as err:
+                    log_error(f"{a}: invalid regex {argv[i + 1]!r}: {err}")
+                    args_valid = False
+                else:
+                    EXCLUDE_PATTERNS.append(argv[i + 1])
                 i += 2
         elif a in ("-d", "--deep"):
             DEEP = 1; i += 1

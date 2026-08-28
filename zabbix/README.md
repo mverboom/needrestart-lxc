@@ -108,6 +108,8 @@ many containers and would exceed the Zabbix server `Timeout` (default 4s) if
 the agent ran it synchronously. The scan therefore runs from cron as root; the
 script writes `/var/cache/needrestart-lxc/zabbix.json` itself (creating the
 directory if needed), and the agent check only reads that file (instant).
+The cron job holds a `flock` so a slow scan and a manual `--zabbix` run can
+never write the cache files concurrently.
 
 ## Installation (per Proxmox host)
 

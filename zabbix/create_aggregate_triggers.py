@@ -75,7 +75,13 @@ def main():
                     help="path to file containing the Zabbix API token")
     args = ap.parse_args()
 
-    token = open(args.api_key).read().strip()
+    try:
+        with open(args.api_key) as fh:
+            token = fh.read().strip()
+    except OSError as e:
+        sys.exit(f"cannot read API key file {args.api_key}: {e}")
+    if not token:
+        sys.exit(f"API key file {args.api_key} is empty")
 
     # Find the template id.
     r = call(token, "template.get",

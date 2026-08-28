@@ -5,4 +5,6 @@
 # The Zabbix master item polls every hour; this cron keeps the file fresh.
 # The script writes /var/cache/needrestart-lxc/zabbix.json itself (creating the
 # directory if needed), so no shell redirect is required here.
-*/15 * * * * root /usr/local/bin/needrestart-lxc --zabbix
+# flock prevents overlapping runs (a slow scan plus a manual script-server
+# scan racing over the cache files).
+*/15 * * * * root flock -n /run/lock/needrestart-lxc.lock /usr/local/bin/needrestart-lxc --zabbix
