@@ -1,0 +1,45 @@
+{
+  "name": "needrestart-lxc restart",
+  "script_path": "sudo -u cdist -i needrestart-lxc-ss restart",
+  "description": "Restart the services inside LXC containers that use outdated libraries, on one Proxmox host.\n\n- **Dry run** (default) shows exactly what would be restarted and does nothing.\n- **Restart** runs `needrestart-lxc -r`: every flagged service is restarted (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind). Non-systemd processes and scope units are reported but never touched automatically.\n\nOptionally limit the run to one container (CTID or name) and/or exclude services matching a regex (e.g. `^dbus|^rsyslog`).",
+  "group": "needrestart-lxc",
+  "requires_terminal": true,
+  "parameters": [
+    {
+      "name": "Host",
+      "required": true,
+      "param": "--host",
+      "type": "list",
+      "description": "Proxmox host to run on.",
+      "values": {
+        "script": "sudo -u cdist -i needrestart-lxc-ss hosts",
+        "shell": false
+      }
+    },
+    {
+      "name": "Container",
+      "param": "--container",
+      "type": "text",
+      "description": "Optional: only this container (CTID or container name)."
+    },
+    {
+      "name": "Exclude",
+      "param": "--exclude",
+      "type": "text",
+      "description": "Optional: regex of services to exclude (can use alternation, e.g. `^dbus|^rsyslog`)."
+    },
+    {
+      "name": "Action",
+      "required": true,
+      "param": "--action",
+      "type": "list",
+      "default": "dry-run",
+      "description": "Dry run only shows what would happen.",
+      "values": ["dry-run", "restart"],
+      "values_ui_mapping": {
+        "dry-run": "Dry run (show what would be restarted)",
+        "restart": "Restart all flagged services"
+      }
+    }
+  ]
+}

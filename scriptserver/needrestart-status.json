@@ -1,0 +1,34 @@
+{
+  "name": "needrestart-lxc status",
+  "script_path": "sudo -u cdist -i needrestart-lxc-ss status",
+  "description": "Which LXC containers on the Proxmox hosts have services running outdated libraries?\n\nFor every selected host a table shows the containers, their state (clean / restart / CVEs) and the affected services with CVE verdicts. Rows with work to do deep-link into the **needrestart-lxc restart** runner with host, container and dry-run pre-filled.\n\n- **Scan now** runs a fresh scan on each host (a few seconds; also warms the hosts' 24h CVE cache). This is the default.\n- **Cached** reads the JSON the hosts' 15-minute cron generates (instant, up to 15 minutes old).",
+  "group": "needrestart-lxc",
+  "requires_terminal": false,
+  "output_format": "html",
+  "parameters": [
+    {
+      "name": "Hosts",
+      "required": true,
+      "type": "multiselect",
+      "description": "Proxmox hosts to report on (distro explorer == proxmox).",
+      "values": {
+        "script": "sudo -u cdist -i needrestart-lxc-ss hosts",
+        "shell": false
+      },
+      "multiselect_argument_type": "argument_per_value"
+    },
+    {
+      "name": "Data",
+      "required": true,
+      "param": "--mode",
+      "type": "list",
+      "default": "scan",
+      "description": "Fresh scan on the hosts, or read their cached Zabbix JSON.",
+      "values": ["scan", "cached"],
+      "values_ui_mapping": {
+        "scan": "Scan now (fresh, includes CVE analysis)",
+        "cached": "Cached (instant, up to 15 min old)"
+      }
+    }
+  ]
+}

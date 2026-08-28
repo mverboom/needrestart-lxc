@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# ============================================================================
+# needrestart-lxc-ss - script-server wrapper for needrestart-lxc.
+#
+# Installed on the cdist control host as ~cdist/bin/needrestart-lxc-ss (a
+# symlink into the needrestart-lxc.git checkout under files.external/) and
+# invoked by the script-server runners in /etc/script-server-dev/runners/ as
+# `sudo -u cdist -i needrestart-lxc-ss ...`. It reaches the PVE hosts over the
+# cdist user's root SSH and runs /usr/local/bin/needrestart-lxc there
+# (deployed by cdist, see config/manifest/autorun/zabbix-agent-config).
+#
+# Subcommands:
+#   hosts
+#       Print the PVE host FQDNs (explorer distro == proxmox), one per line.
+#       Used by the runners as their dynamic value list.
+#   status [--mode scan|cached] HOST [HOST...]
+#       Per-host report of containers needing service restarts.
+#         scan   = run `needrestart-lxc --zabbix` on each host (default;
+#                  fresh data incl. CVE analysis, warms the hosts' 24h cache)
+#         cached = read the JSON the hosts' 15-min cron writes (instant,
+#                  up to 15 minutes old)
+#       Output: HTML tables. Rows with services to restart deep-link into the
+#       "needrestart-lxc restart" runner with Host/Container/Action pre-filled.
+#   restart --host FQDN [--container CTID] [--exclude REGEX]
+#           [--action dry-run|restart]
+#       Run `needrestart-lxc [-n] -r [-c CTID] [-e REGEX]` on one host.
+#       dry-run (default) shows what would be restarted; restart actually
+#       restarts the flagged services (including the escalation ladder).
+# ============================================================================
+set -euo pipefail
+
+SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
+RESTART_RUNNER="needrestart-lxc restart"
+
+usage() {
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+list_hosts() {
+    local f
+    for f in /home/cdist/explore/*/distro; do
+        [[ -r "$f" ]] || continue
+        [[ $(<"$f") == proxmox ]] || continue
+        basename "$(dirname "$f")"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+# run_on <host> <outfile> <errfile>
+# Fresh scan: `needrestart-lxc --zabbix` prints the JSON to stdout and any
+# analysis notes to stderr. Cached: the agent UserParameter's file read.
+run_on() {
+    local host=$1 out=$2 err=$3
+    if [[ $MODE == cached ]]; then
+        timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
+            "cat /var/cache/needrestart-lxc/zabbix.json" \
+            >"$out" 2>"$err"
+    else
+        timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
+            "timeout $SCAN_TIMEOUT /usr/local/bin/needrestart-lxc --zabbix" \
+            >"$out" 2>"$err"
+    fi
+}
+
+do_status() {
+    local hosts=()
+    while (($#)); do
+        case $1 in
+            --mode) MODE=$2; shift 2 ;;
+            --mode=*) MODE=${1#*=}; shift ;;
+            -h|--help) usage ;;
+            *) hosts+=("$1"); shift ;;
+        esac
+    done
+    MODE=${MODE:-scan}
+    [[ $MODE == scan || $MODE == cached ]] || { echo "bad --mode: $MODE"; exit 1; }
+    ((${#hosts[@]})) || { echo "no hosts selected"; exit 1; }
+
+    local tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+
+    local h pids=()
+    for h in "${hosts[@]}"; do
+        : >"$tmp/$h.json"; : >"$tmp/$h.err"; : >"$tmp/$h.rc"
+        ( if run_on "$h" "$tmp/$h.json" "$tmp/$h.err"; then
+              echo 0 >"$tmp/$h.rc"
+          else
+              echo $? >"$tmp/$h.rc"
+          fi ) &
+        pids+=("$!")
+    done
+    local rc=0
+    for p in "${pids[@]}"; do wait "$p" || rc=1; done
+
+    python3 - "$tmp" "$MODE" "$RESTART_RUNNER" <<'PYEOF'
+import glob, html, json, os, sys
+from datetime import datetime
+from urllib.parse import quote
+
+tmpdir, mode, restart_runner = sys.argv[1], sys.argv[2], sys.argv[3]
+runner_enc = quote(restart_runner, safe="")
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def restart_link(host, ctid):
+    query = "&amp;".join(
+        f"{k}={quote(v, safe='')}"
+        for k, v in (("Host", host), ("Container", ctid), ("Action", "dry-run")))
+    return f"#/{runner_enc}?{query}"
+
+
+STATE = {0: ("#1a7f37", "clean"), 1: ("#9a6700", "restart"), 2: ("#cf222e", "CVEs")}
+
+
+def badge(state):
+    color, label = STATE.get(state, ("#6e7781", f"state {state}"))
+    return (f'<span style="background:{color};color:#fff;padding:1px 8px;'
+            f'border-radius:10px;font-size:smaller">{label}</span>')
+
+
+print("<html><body>")
+print(f"<h2>needrestart-lxc report</h2>")
+print(f"<p>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>")
+
+total_svc = total_cve = 0
+files = sorted(glob.glob(os.path.join(tmpdir, "*.json")))
+for path in files:
+    host = os.path.basename(path)[:-len(".json")]
+    err = open(path[:-len("json")] + "err").read().strip()
+    rc = open(path[:-len("json")] + "rc").read().strip()
+    print(f"<h3>{esc(host)}</h3>")
+    try:
+        data = json.load(open(path))
+    except ValueError:
+        print(f'<p style="color:#cf222e"><b>failed</b> (rc {esc(rc)}):'
+              f"<pre>{esc(err[-2000:]) or 'no output'}</pre></p>")
+        continue
+
+    containers = data.get("containers", [])
+    flagged = [c for c in containers if c.get("services", 0) > 0]
+    total_svc += sum(c["services"] for c in flagged)
+    total_cve += sum(c.get("cves", 0) for c in flagged)
+    print(f'<p style="font-size:smaller">{len(flagged)} of {len(containers)} '
+          f"container(s) need a restart</p>")
+    print("<table border=1 cellpadding=4 cellspacing=0 "
+          'style="border-collapse:collapse;font-size:small">')
+    print("<tr><th>CT</th><th>Name</th><th>Services</th><th>CVEs</th>"
+          "<th>State</th><th>Details</th></tr>")
+    for c in containers:
+        svc, cves = c.get("services", 0), c.get("cves", 0)
+        details = esc(c.get("details") or "")
+        ct = esc(c.get("ctid", "?"))
+        if svc > 0:
+            href = restart_link(host, c.get("ctid", ""))
+            ct = f'<a href="{href}" title="open restart runner (dry-run)">{ct}</a>'
+        print(f"<tr><td>{ct}</td><td>{esc(c.get('name', '?'))}</td>"
+              f"<td style='text-align:right'>{svc}</td>"
+              f"<td style='text-align:right'>{cves}</td>"
+              f"<td>{badge(c.get('state', 0))}</td>"
+              f"<td style='white-space:pre-wrap'>{details}</td></tr>")
+    print("</table>")
+    if err:
+        print(f"<p style='font-size:smaller;color:#6e7781'>notes:"
+              f"<pre style='margin:2px'>{esc(err[-2000:])}</pre></p>")
+
+print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
+      f"across {len(files)} host(s).</p>")
+print("</body></html>")
+PYEOF
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# restart
+# ---------------------------------------------------------------------------
+
+do_restart() {
+    local host="" container="" exclude="" action="dry-run"
+    while (($#)); do
+        case $1 in
+            --host) host=$2; shift 2 ;;
+            --container) container=$2; shift 2 ;;
+            --exclude) exclude=$2; shift 2 ;;
+            --action) action=$2; shift 2 ;;
+            -h|--help) usage ;;
+            *) echo "unknown restart option: $1"; exit 1 ;;
+        esac
+    done
+    [[ -n $host ]] || { echo "--host is required"; exit 1; }
+    [[ $action == dry-run || $action == restart ]] || { echo "bad --action: $action"; exit 1; }
+
+    local cmd=(ssh "${SSH_OPTS[@]}" "$host" --
+               /usr/local/bin/needrestart-lxc)
+    [[ $action == dry-run ]] && cmd+=(-n)
+    cmd+=(-r)
+    [[ -n $container ]] && cmd+=(-c "$container")
+    [[ -n $exclude ]] && cmd+=(-e "$exclude")
+
+    echo "Running: ${cmd[*]}"
+    echo
+    exec "${cmd[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    hosts)    shift; list_hosts "$@" ;;
+    status)   shift; do_status "$@" ;;
+    restart)  shift; do_restart "$@" ;;
+    -h|--help|"" ) usage ;;
+    *) echo "unknown subcommand: $1"; usage ;;
+esac
