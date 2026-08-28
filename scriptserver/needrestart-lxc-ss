@@ -11,7 +11,8 @@
 #
 # Subcommands:
 #   hosts
-#       Print the PVE host FQDNs (explorer distro == proxmox), one per line.
+#       Print the PVE host FQDNs that have needrestart-lxc deployed (explorer
+#       distro == proxmox and a zabbix agent config present), one per line.
 #       Used by the runners as their dynamic value list.
 #   status [--mode scan|cached] HOST [HOST...]
 #       Per-host report of containers needing service restarts.
@@ -39,11 +40,19 @@ usage() {
 }
 
 list_hosts() {
+    # Hosts where the needrestart-lxc deployment actually applies: the
+    # zabbix-agent-config manifest is gated on files/zabbix/agents/<fqdn>
+    # (config repo) and the needrestart-lxc block on distro == proxmox
+    # (explorer data). Require both so hosts without the binary don't show up
+    # as permanent failures in the value list.
     local f
     for f in /home/cdist/explore/*/distro; do
         [[ -r "$f" ]] || continue
         [[ $(<"$f") == proxmox ]] || continue
-        basename "$(dirname "$f")"
+        local fqdn
+        fqdn=$(basename "$(dirname "$f")")
+        [[ -f /home/cdist/config/files/zabbix/agents/$fqdn ]] || continue
+        echo "$fqdn"
     done
 }
 

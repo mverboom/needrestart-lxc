@@ -60,7 +60,8 @@ script-server picks up runner changes after a restart of the service
 
 ## Host list
 
-`needrestart-lxc-ss hosts` derives the PVE hosts dynamically from the cdist
-explorer data (`/home/cdist/explore/<fqdn>/distro` == `proxmox`). A host
-without the needrestart-lxc binary (e.g. not yet deployed there) shows up as a
-failed host in the status report rather than being silently skipped.
+`needrestart-lxc-ss hosts` derives the PVE hosts dynamically: cdist explorer
+data (`/home/cdist/explore/<fqdn>/distro` == `proxmox`) intersected with the
+zabbix-agent-config gate (`/home/cdist/config/files/zabbix/agents/<fqdn>`
+existing) — i.e. exactly the hosts where the manifest deploys
+needrestart-lxc.
