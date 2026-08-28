@@ -90,24 +90,25 @@ do_status() {
     [[ $MODE == scan || $MODE == cached ]] || { echo "bad --mode: $MODE"; exit 1; }
     ((${#hosts[@]})) || { echo "no hosts selected"; exit 1; }
 
-    local tmp
-    tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
+    # Global (not local): the EXIT trap below must still see it at script
+    # exit, where function locals are out of scope (set -u would abort).
+    STATUS_TMP=$(mktemp -d)
+    trap 'rm -rf "$STATUS_TMP"' EXIT
 
     local h pids=()
     for h in "${hosts[@]}"; do
-        : >"$tmp/$h.json"; : >"$tmp/$h.err"; : >"$tmp/$h.rc"
-        ( if run_on "$h" "$tmp/$h.json" "$tmp/$h.err"; then
-              echo 0 >"$tmp/$h.rc"
+        : >"$STATUS_TMP/$h.json"; : >"$STATUS_TMP/$h.err"; : >"$STATUS_TMP/$h.rc"
+        ( if run_on "$h" "$STATUS_TMP/$h.json" "$STATUS_TMP/$h.err"; then
+              echo 0 >"$STATUS_TMP/$h.rc"
           else
-              echo $? >"$tmp/$h.rc"
+              echo $? >"$STATUS_TMP/$h.rc"
           fi ) &
         pids+=("$!")
     done
     local rc=0
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
-    python3 - "$tmp" "$MODE" "$RESTART_RUNNER" <<'PYEOF'
+    python3 - "$STATUS_TMP" "$MODE" "$RESTART_RUNNER" <<'PYEOF'
 import glob, html, json, os, sys
 from datetime import datetime
 from urllib.parse import quote
