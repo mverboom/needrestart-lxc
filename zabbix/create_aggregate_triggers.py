@@ -22,8 +22,8 @@ from the file and never printed.
 """
 import argparse
 import json
-import ssl
 import sys
+import urllib.error
 import urllib.request
 
 API_URL = "https://zabbix.lnw.verboom.net/zabbix/api_jsonrpc.php"
@@ -44,14 +44,14 @@ def call(token, method, params):
         headers={"Content-Type": "application/json-rpc",
                  "Authorization": f"Bearer {token}"},
     )
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # TLS verification stays on; the API cert validates against the system CA.
     try:
-        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+        resp = urllib.request.urlopen(req, timeout=30)
         return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return {"error": {"data": e.read().decode()[:300]}}
+    except urllib.error.URLError as e:
+        return {"error": {"data": f"connection failed: {e.reason}"}}
 
 
 def aggregate_expr(cmp_op, state_value):

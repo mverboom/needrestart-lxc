@@ -27,7 +27,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -92,7 +91,6 @@ SECURITY = 0
 ZABBIX = 0
 CONTAINER_FILTER = ""
 EXCLUDE_PATTERNS = []
-WORKDIR = ""
 
 # Collected data structures
 CT_NAMES = {}          # ctid -> container name
@@ -160,17 +158,11 @@ def log_error(msg):
 
 
 def is_blacklisted(path):
-    for pat in BLACKLIST_PATTERNS:
-        if pat.search(path):
-            return True
-    return False
+    return any(p.search(path) for p in BLACKLIST_PATTERNS)
 
 
 def is_excluded(service):
-    for pat in EXCLUDE_PATTERNS:
-        if re.search(pat, service):
-            return True
-    return False
+    return any(re.search(pat, service) for pat in EXCLUDE_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +267,7 @@ def read_maps(pid):
         return []
 
 
-def check_process_fast(pid):
+def check_process_fast(pid, maps=None):
     """Fast check: look for (deleted) in /proc/<pid>/maps and /proc/<pid>/exe.
     Returns (needs_restart, found_libs)."""
     try:
@@ -288,11 +280,12 @@ def check_process_fast(pid):
             return True, clean + " (executable)"
 
     libs = set()
-    for line in read_maps(pid):
+    for line in maps if maps is not None else read_maps(pid):
         perms, _dev, _ino, path = parse_map_line(line)
         if not path:
             continue
-        if "r-xp" in perms and "(deleted)" in path:
+        # Any executable mapping (r-xp, rwxp, ...), not just exact "r-xp".
+        if "x" in perms and "(deleted)" in path:
             clean = path[:-len(" (deleted)")] if path.endswith(" (deleted)") else path
             if not is_blacklisted(clean):
                 libs.add(clean)
@@ -305,11 +298,12 @@ def check_process_deep(pid, init_pid):
     """Deep check: also compare inode numbers for shared libraries.
     Returns (needs_restart, found_libs)."""
     found = []
-    ok, libs = check_process_fast(pid)
+    maps = read_maps(pid)
+    ok, libs = check_process_fast(pid, maps)
     if ok and libs:
         found.append(libs)
 
-    for line in read_maps(pid):
+    for line in maps:
         perms, dev, inode, path = parse_map_line(line)
         if not path:
             continue
@@ -376,10 +370,7 @@ def service_from_path(path_suffix):
     m = re.search(r"/([^/]+\.scope)$", path_suffix)
     if m:
         return m.group(1)
-    m = re.search(r"/([^/]+\.service)$", path_suffix)
-    if m:
-        return m.group(1)
-    m = re.match(r"^([^/]+\.service)$", path_suffix)
+    m = re.search(r"(?:^|/)([^/]+\.service)$", path_suffix)
     if m:
         return m.group(1)
     m = re.search(r"(user@[0-9]+\.service)", path_suffix)
@@ -552,14 +543,14 @@ def resolve_user(ctid, user_uid):
     return ""
 
 
-def systemctl_cmd(ctid, action, service, user_uid="", username=""):
+def systemctl_cmd(ctid, action, service, user_uid="", username="", extra=()):
     cmd = ["pct", "exec", ctid, "--"]
     if user_uid:
         cmd += ["runuser", "-u", username, "--", "env",
                 f"XDG_RUNTIME_DIR=/run/user/{user_uid}",
-                "systemctl", "--user", action, service]
+                "systemctl", "--user", action, *extra, service]
     else:
-        cmd += ["systemctl", action, service]
+        cmd += ["systemctl", action, *extra, service]
     return cmd
 
 
@@ -569,15 +560,7 @@ def restart_with_escalation(ctid, ct_name, service, user_uid="", username=""):
     tool = "systemctl --user" if user_uid else "systemctl"
 
     def run(action, extra=()):
-        cmd = systemctl_cmd(ctid, action, service, user_uid, username)
-        if action == "kill" and extra:
-            cmd = ["pct", "exec", ctid, "--"]
-            if user_uid:
-                cmd += ["runuser", "-u", username, "--", "env",
-                        f"XDG_RUNTIME_DIR=/run/user/{user_uid}",
-                        "systemctl", "--user", action, *extra, service]
-            else:
-                cmd += ["systemctl", action, *extra, service]
+        cmd = systemctl_cmd(ctid, action, service, user_uid, username, extra)
         log_verbose("  Running: " + " ".join(cmd))
         return subprocess.run(cmd).returncode
 
@@ -848,7 +831,10 @@ def interactive_restart():
     # swap them: send the dialog to our stderr (the terminal) and capture the
     # selected tags from whiptail's stderr.
     r = subprocess.run(cmd, stdout=sys.stderr.fileno(), stderr=subprocess.PIPE)
-    if r.returncode != 0:
+    if r.returncode == 255:      # whiptail error (e.g. dialog does not fit)
+        log_error(f"whiptail failed: {r.stderr.decode(errors='replace').strip()}")
+        return 1
+    if r.returncode != 0:        # 1 = cancelled
         print("No services selected; nothing restarted.")
         return 0
     selected = [line for line in r.stderr.decode().splitlines() if line]
@@ -874,76 +860,72 @@ def load_ct_os(ctid, root):
     osr = os.path.join(root, "etc/os-release")
     if not os.path.isfile(osr):
         return False
-    for line in open(osr, errors="ignore"):
-        line = line.strip()
-        if not line or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        v = v.strip('"')
-        if k == "ID":
-            CT_OS_ID[ctid] = v
-        elif k == "VERSION_ID":
-            CT_OS_RELEASE[ctid] = v
-        elif k == "VERSION_CODENAME":
-            CT_OS_CODENAME[ctid] = v
+    with open(osr, errors="ignore") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip('"')
+            if k == "ID":
+                CT_OS_ID[ctid] = v
+            elif k == "VERSION_ID":
+                CT_OS_RELEASE[ctid] = v
+            elif k == "VERSION_CODENAME":
+                CT_OS_CODENAME[ctid] = v
     return ctid in CT_OS_ID
 
 
+DPKG_STATUS = {}      # ctid -> {binpkg: "version\tsrcpkg"}
+
+
 def parse_dpkg_status(ctid, root):
-    out = os.path.join(WORKDIR, f"status-{ctid}.tsv")
-    if os.path.isfile(out):
+    """Parse the container's dpkg status database into memory (per run)."""
+    if ctid in DPKG_STATUS:
         return True
     st = os.path.join(root, "var/lib/dpkg/status")
     if not os.path.isfile(st):
         return False
-    rows = []
+    pkgs = {}
     pkg = ver = src = status = ""
-    for line in open(st, errors="ignore"):
-        if line.startswith("Package: "):
-            pkg = line[len("Package: "):].strip()
-        elif line.startswith("Version: "):
-            ver = line[len("Version: "):].strip()
-        elif line.startswith("Source: "):
-            src = line[len("Source: "):].strip().split()[0] if line[len("Source: "):].strip() else ""
-        elif line.startswith("Status: "):
-            status = line[len("Status: "):].strip()
-        elif line == "\n":
-            if pkg and status.startswith("install"):
-                rows.append(f"{pkg}\t{ver}\t{src}")
-            pkg = ver = src = status = ""
-    with open(out, "w") as fh:
-        fh.write("\n".join(rows) + ("\n" if rows else ""))
+    with open(st, errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("Package: "):
+                pkg = line[len("Package: "):].strip()
+            elif line.startswith("Version: "):
+                ver = line[len("Version: "):].strip()
+            elif line.startswith("Source: "):
+                src = line[len("Source: "):].strip().split()[0] if line[len("Source: "):].strip() else ""
+            elif line.startswith("Status: "):
+                status = line[len("Status: "):].strip()
+            elif line == "\n":
+                if pkg and status.startswith("install"):
+                    pkgs[pkg] = f"{ver}\t{src}"
+                pkg = ver = src = status = ""
+    DPKG_STATUS[ctid] = pkgs
     return True
 
 
 def status_lookup(ctid, binpkg):
-    f = os.path.join(WORKDIR, f"status-{ctid}.tsv")
-    try:
-        for line in open(f):
-            p, v, s = line.rstrip("\n").split("\t")
-            if p == binpkg:
-                return f"{v}\t{s}"
-    except (OSError, ValueError):
-        pass
-    return ""
+    return DPKG_STATUS.get(ctid, {}).get(binpkg, "")
 
 
-def pkgs_for_path(root, path):
-    if not re.match(r"^/[A-Za-z0-9._+~/-]+$", path):
-        return []
-    pkgs = set()
+def owning_pkgs(root, paths):
+    """Single pass over /var/lib/dpkg/info/*.list; maps each wanted path to
+    its owning binary package(s)."""
+    wanted = set(paths)
+    found = {p: set() for p in wanted}
     for list_file in glob.glob(root + "/var/lib/dpkg/info/*.list"):
-        if not os.path.isfile(list_file):
-            continue
+        base = os.path.basename(list_file)[:-len(".list")].split(":")[0]
         try:
             with open(list_file, errors="ignore") as fh:
-                lines = set(fh.read().splitlines())
+                for line in fh:
+                    p = line.rstrip("\n")
+                    if p in wanted:
+                        found[p].add(base)
         except OSError:
             continue
-        if path in lines:
-            base = os.path.basename(list_file)[:-len(".list")]
-            pkgs.add(base.split(":")[0])
-    return sorted(pkgs)
+    return found
 
 
 def ver_cmp(a, b):
@@ -990,9 +972,13 @@ def version_at_start(root, binpkg, start_epoch):
     if not all_data:
         return ""
 
+    # Without /etc/timezone the log timestamps are parsed in the host's
+    # timezone; near DST/offset boundaries the version in effect at process
+    # start may then be wrong by a few hours.
     tz = ""
     try:
-        tz = re.sub(r"[\s]", "", open(root + "/etc/timezone").read())
+        with open(root + "/etc/timezone") as fh:
+            tz = re.sub(r"\s", "", fh.read())
     except OSError:
         pass
 
@@ -1034,6 +1020,14 @@ def parse_changelog(path):
                 continue
             else:
                 yield ("BODY", line)
+
+
+def cve_summary(cves, limit=6):
+    """", "-joined list of the first `limit` CVEs plus an overflow note."""
+    text = ", ".join(cves[:limit])
+    if len(cves) > limit:
+        text += f", and {len(cves) - limit} more"
+    return text
 
 
 def changelog_verdict(root, binpkg, srcpkg, old, new):
@@ -1080,15 +1074,7 @@ def changelog_verdict(root, binpkg, srcpkg, old, new):
 
     cves = sorted(cves)
     n = len(cves)
-    shown = 0
-    shown_list = []
-    for cve in cves:
-        if shown < 6:
-            shown_list.append(cve)
-        shown += 1
-    cvelist = ", ".join(shown_list)
-    if shown > 6:
-        cvelist += f", and {shown - 6} more"
+    cvelist = cve_summary(cves)
     plural = "" if n == 1 else "s"
     secpart = ", security upload" if sec_count > 0 else ""
 
@@ -1297,15 +1283,7 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
                 if cvss3:
                     cvss_list.append(cvss3)
             if count > 0:
-                shown = 0
-                shown_list = []
-                for cve in cves:
-                    if shown < 6:
-                        shown_list.append(cve)
-                    shown += 1
-                cvelist = ", ".join(shown_list)
-                if shown > 6:
-                    cvelist += f", and {shown - 6} more"
+                cvelist = cve_summary(cves)
                 plural = "" if count == 1 else "s"
                 cvss = f", CVSS {','.join(cvss_list)}" if cvss_list else ""
                 verdict = (f"{binpkg} {old} -> {new}: SECURITY update, fixes "
@@ -1326,13 +1304,12 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
 
 
 def analyze_service_libs(ctid, key, root, start_epoch, libs):
+    paths = [clean_lib_path(line) for line in libs.split("\n") if line]
+    owners = owning_pkgs(root, paths)
     binpkgs = []
     seen_pkgs = set()
-    for line in libs.split("\n"):
-        if not line:
-            continue
-        path = clean_lib_path(line)
-        for bp in pkgs_for_path(root, path):
+    for path in paths:
+        for bp in sorted(owners.get(path, ())):
             if bp not in seen_pkgs:
                 seen_pkgs.add(bp)
                 binpkgs.append(bp)
@@ -1368,8 +1345,6 @@ def analyze_service_libs(ctid, key, root, start_epoch, libs):
 
         result = security_analysis(ctid, srcpkg, binpkg, old, curver)
         count, verdict = result.split("\t", 1)
-        if not re.match(r"^\d+$", count):
-            count = "0"
         CONT_UPDATE_COUNTS[vkey] = int(count)
         CONT_CVES[key] = (CONT_CVES.get(key, "") +
                           ("\n" if CONT_CVES.get(key) else "") + verdict)
@@ -1400,12 +1375,7 @@ def security_scan():
 
         lstart = subprocess.run(["ps", "-o", "lstart=", "-p", pid],
                                 capture_output=True, text=True).stdout.strip()
-        start_epoch = ""
-        if lstart:
-            r = subprocess.run(["date", "-d", lstart, "+%s"],
-                               capture_output=True, text=True)
-            if r.returncode == 0 and r.stdout.strip().isdigit():
-                start_epoch = int(r.stdout.strip())
+        start_epoch = epoch_from_date(lstart, "") if lstart else ""
 
         log_verbose(f"Extended security analysis for CT {ctid}, "
                     f"service {key.split(':', 1)[1]} (PID {pid})...")
@@ -1422,7 +1392,8 @@ def security_scan():
 def zabbix_output():
     containers = {}
     sorted_keys = sorted(CONT_SERVICES)
-    for ctid in sorted(CT_PIDS, key=int):
+    all_ctids = set(CT_PIDS) | {k.split(":", 1)[0] for k in CONT_SERVICES}
+    for ctid in sorted(all_ctids, key=int):
         services = 0
         cves = 0
         details = []
@@ -1526,9 +1497,7 @@ def zabbix_output():
 
 
 def _run():
-    global WORKDIR
     if SECURITY:
-        WORKDIR = tempfile.mkdtemp(prefix="needrestart-lxc.")
         os.makedirs(CACHE_DIR, exist_ok=True)
 
     load_container_names()
@@ -1564,11 +1533,21 @@ def main(argv):
         elif a in ("-n", "--dry-run"):
             DRY_RUN = 1; i += 1
         elif a in ("-c", "--container"):
-            CONTAINER_FILTER = argv[i + 1] if i + 1 < len(argv) else ""
-            i += 2
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                log_error(f"{a} requires a CTID or container name argument")
+                args_valid = False
+                i += 1
+            else:
+                CONTAINER_FILTER = argv[i + 1]
+                i += 2
         elif a in ("-e", "--exclude"):
-            EXCLUDE_PATTERNS.append(argv[i + 1] if i + 1 < len(argv) else "")
-            i += 2
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                log_error(f"{a} requires a regex argument")
+                args_valid = False
+                i += 1
+            else:
+                EXCLUDE_PATTERNS.append(argv[i + 1])
+                i += 2
         elif a in ("-d", "--deep"):
             DEEP = 1; i += 1
         elif a in ("-s", "--security"):
@@ -1592,11 +1571,7 @@ def main(argv):
         log_error("This script must be run as root to access /proc/*/maps")
         return 1
 
-    try:
-        return _run()
-    finally:
-        if WORKDIR and os.path.isdir(WORKDIR):
-            shutil.rmtree(WORKDIR, ignore_errors=True)
+    return _run()
 
 
 if __name__ == "__main__":
