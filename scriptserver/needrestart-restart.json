@@ -1,7 +1,7 @@
 {
-  "name": "needrestart-lxc restart",
+  "name": "restart",
   "script_path": "sudo -u cdist -i needrestart-lxc-ss restart",
-  "description": "Restart the services inside LXC containers that use outdated libraries, on one Proxmox host.\n\n- **Dry run** (default) shows exactly what would be restarted and does nothing.\n- **Restart** runs `needrestart-lxc -r`: every flagged service is restarted (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind). Non-systemd processes and scope units are reported but never touched automatically.\n\nOptionally limit the run to one container (CTID or name) and/or exclude services matching a regex (e.g. `^dbus|^rsyslog`).",
+  "description": "Restart services inside LXC containers that use outdated libraries, on one Proxmox host.\n\n- **Restart all flagged services** is preselected: runs `needrestart-lxc -r`, restarting every flagged service (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind).\n- Select **Dry run** instead to preview exactly what would be restarted without touching anything.\n\nNon-systemd processes and scope units are reported but never touched automatically. Optionally limit the run to one container (CTID or name) and/or exclude services matching a regex (e.g. `^dbus|^rsyslog`)",
   "group": "needrestart-lxc",
   "requires_terminal": true,
   "parameters": [
@@ -33,8 +33,8 @@
       "required": true,
       "param": "--action",
       "type": "list",
-      "default": "dry-run",
-      "description": "Dry run only shows what would happen.",
+      "default": "restart",
+      "description": "Restart is preselected; pick dry run to only preview.",
       "values": ["dry-run", "restart"],
       "values_ui_mapping": {
         "dry-run": "Dry run (show what would be restarted)",

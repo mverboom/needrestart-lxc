@@ -21,7 +21,7 @@
 #         cached = read the JSON the hosts' 15-min cron writes (instant,
 #                  up to 15 minutes old)
 #       Output: HTML tables. Rows with services to restart deep-link into the
-#       "needrestart-lxc restart" runner with Host/Container/Action pre-filled.
+#       "restart" runner with Host/Container/Action pre-filled.
 #   restart --host FQDN [--container CTID] [--exclude REGEX]
 #           [--action dry-run|restart]
 #       Run `needrestart-lxc [-n] -r [-c CTID] [-e REGEX]` on one host.
@@ -32,7 +32,7 @@ set -euo pipefail
 
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
-RESTART_RUNNER="needrestart-lxc restart"
+RESTART_RUNNER="restart"
 
 usage() {
     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'

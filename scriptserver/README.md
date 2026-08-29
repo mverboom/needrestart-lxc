@@ -17,7 +17,7 @@ needrestart-lxc across all Proxmox hosts managed by cdist.
 
 ## Runners
 
-### needrestart-lxc status (read-only)
+### list (read-only)
 
 HTML report per host: containers, state badge (clean / restart / CVEs),
 services and CVE verdicts. Two data sources:
@@ -32,13 +32,14 @@ Rows needing work deep-link into the restart runner (host, container and
 dry-run pre-filled). Deep links require `output_format: html` (hash-mode router
 pre-fill, see script-server skill notes).
 
-### needrestart-lxc restart
+### restart
 
 Runs `needrestart-lxc [-n] -r [-c CTID] [-e REGEX]` on one host with live
-terminal output. `dry-run` is the default action; `restart` restarts every
-flagged service, including the escalation ladder (restart → kill + start →
-SIGKILL). Non-systemd processes and scope units are reported but never
-restarted automatically, mirroring the script's own safety rules.
+terminal output. `restart` (all flagged services) is the preselected action;
+select `dry-run` to preview first. Restarting includes the escalation ladder
+(restart → kill + start → SIGKILL). Non-systemd processes and scope units are
+reported but never restarted automatically, mirroring the script's own safety
+rules.
 
 ## Installation / update
 
