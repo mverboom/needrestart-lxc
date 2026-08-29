@@ -138,7 +138,14 @@ def badge(state):
             f'border-radius:10px;font-size:smaller">{label}</span>')
 
 
-print("<html><body>")
+# All columns except Details must stay on one line; the (possibly very long)
+# container name is capped and gets an ellipsis, the full name is in the
+# cell's title attribute (hover tooltip).
+print("<html><head><style>"
+      "td,th{white-space:nowrap}"
+      "td.details{white-space:pre-wrap}"
+      "td.name{max-width:24ch;overflow:hidden;text-overflow:ellipsis}"
+      "</style></head><body>")
 print(f"<h2>needrestart-lxc report</h2>")
 print(f"<p>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>")
 
@@ -173,11 +180,13 @@ for path in files:
         if svc > 0:
             href = restart_link(host, c.get("ctid", ""))
             ct = f'<a href="{href}" title="open restart runner (dry-run)">{ct}</a>'
-        print(f"<tr><td>{ct}</td><td>{esc(c.get('name', '?'))}</td>"
+        name = esc(c.get("name", "?"))
+        print(f"<tr><td>{ct}</td>"
+              f'<td class="name" title="{name}">{name}</td>'
               f"<td style='text-align:right'>{svc}</td>"
               f"<td style='text-align:right'>{cves}</td>"
               f"<td>{badge(c.get('state', 0))}</td>"
-              f"<td style='white-space:pre-wrap'>{details}</td></tr>")
+              f'<td class="details">{details}</td></tr>')
     print("</table>")
     if err:
         print(f"<p style='font-size:smaller;color:#6e7781'>notes:"
