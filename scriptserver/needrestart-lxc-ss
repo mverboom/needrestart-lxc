@@ -160,6 +160,16 @@ def fmt_details(raw):
 NOWRAP = "white-space:nowrap"
 NAME = NOWRAP + ";max-width:24ch;overflow:hidden;text-overflow:ellipsis"
 DETAILS = "white-space:pre-wrap"
+# Script-server's own autoscroll is off for html runs, but the report grows the
+# log panel beyond the viewport as it streams, and the browser's scroll
+# anchoring keeps pinning the window to the bottom. Give the report its own
+# bounded scroll container: the document height no longer changes while chunks
+# stream in, so the window simply stays where it is (i.e. at the top - the
+# report starts right below the always-visible header). overflow-anchor:none
+# additionally tells the scroller not to pick an anchor inside the report.
+FRAME = ("max-height:calc(100vh - 320px);overflow-y:auto;overflow-anchor:none"
+         ";padding-right:4px")
+print(f'<div style="{FRAME}">')
 print(f"<p>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>")
 
 total_svc = total_cve = 0
@@ -214,6 +224,7 @@ for path in files:
 
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
       f"across {len(files)} host(s).</p>")
+print("</div>")
 PYEOF
     return $rc
 }
