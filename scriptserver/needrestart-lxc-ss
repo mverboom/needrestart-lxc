@@ -138,6 +138,18 @@ def badge(state):
             f'border-radius:10px;font-size:smaller">{label}</span>')
 
 
+# details lines are "svc_display: verdict" (svc_display may carry a
+# " (non-systemd)" or " [user session UID n]" suffix); bold the service so
+# the lines scan quickly, verdict stays normal.
+def fmt_details(raw):
+    out = []
+    for line in str(raw or "").split("\n"):
+        e = esc(line)
+        svc, sep, rest = e.partition(": ")
+        out.append(f"<b>{svc}</b>: {rest}" if sep else e)
+    return "\n".join(out)
+
+
 # All columns except Details must stay on one line; the (possibly very long)
 # container name is capped and gets an ellipsis, the full name is in the
 # cell's title attribute (hover tooltip).
@@ -177,7 +189,7 @@ for path in files:
           f"{th}State</th>{th}Details</th></tr>")
     for c in containers:
         svc, cves = c.get("services", 0), c.get("cves", 0)
-        details = esc(c.get("details") or "")
+        details = fmt_details(c.get("details"))
         ct = esc(c.get("ctid", "?"))
         if svc > 0:
             href = restart_link(host, c.get("ctid", ""))
