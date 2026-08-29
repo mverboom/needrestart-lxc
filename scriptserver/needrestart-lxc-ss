@@ -177,6 +177,12 @@ for path in files:
         continue
 
     containers = data.get("containers", [])
+    # CVE-affected first, then plain restarts, clean last; CTID order within
+    # each group (stable sort on ctid).
+    containers = sorted(
+        containers,
+        key=lambda c: (-c.get("state", 0),
+                       int(c["ctid"]) if str(c.get("ctid", "")).isdigit() else 0))
     flagged = [c for c in containers if c.get("services", 0) > 0]
     total_svc += sum(c["services"] for c in flagged)
     total_cve += sum(c.get("cves", 0) for c in flagged)
