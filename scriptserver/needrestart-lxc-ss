@@ -239,6 +239,8 @@ for path in files:
     all_names = [c.get("name") for c in containers]
     for c in containers:
         svc, cves = c.get("services", 0), c.get("cves", 0)
+        if svc == 0:
+            continue  # clean containers: no findings, not shown
         details = fmt_details(c.get("details"))
         ct = esc(c.get("ctid", "?"))
         if svc > 0:
