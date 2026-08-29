@@ -22,11 +22,15 @@
 #                  up to 15 minutes old)
 #       Output: HTML tables. Rows with services to restart deep-link into the
 #       "restart" runner with Host/Container/Action pre-filled.
-#   restart --host FQDN [--container CTID] [--exclude REGEX]
+#   restart --host FQDN [--container CTID|NAME]... [--exclude REGEX]
 #           [--action dry-run|restart]
-#       Run `needrestart-lxc [-n] -r [-c CTID] [-e REGEX]` on one host.
+#       Run `needrestart-lxc [-n] -r [-c ID[,ID...]] [-e REGEX]` on one host.
 #       dry-run (default) shows what would be restarted; restart actually
 #       restarts the flagged services (including the escalation ladder).
+#   containers --host FQDN
+#       List the containers of one host that currently have services to
+#       restart (from the host's cached report), one per line - the value
+#       list for the restart runner's dynamic Container multiselect.
 # ============================================================================
 set -euo pipefail
 
@@ -64,8 +68,8 @@ list_hosts() {
 # Fresh scan: `needrestart-lxc --zabbix` prints the JSON to stdout and any
 # analysis notes to stderr. Cached: the agent UserParameter's file read.
 run_on() {
-    local host=$1 out=$2 err=$3
-    if [[ $MODE == cached ]]; then
+    local host=$1 out=$2 err=$3 cached=${4:-}
+    if [[ $cached == cached ]]; then
         timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
             "cat /var/cache/needrestart-lxc/zabbix.json" \
             >"$out" 2>"$err"
@@ -99,7 +103,7 @@ do_status() {
     local h pids=()
     for h in "${hosts[@]}"; do
         : >"$STATUS_TMP/$h.json"; : >"$STATUS_TMP/$h.err"; : >"$STATUS_TMP/$h.rc"
-        ( if run_on "$h" "$STATUS_TMP/$h.json" "$STATUS_TMP/$h.err"; then
+        ( if run_on "$h" "$STATUS_TMP/$h.json" "$STATUS_TMP/$h.err" "$MODE"; then
               echo 0 >"$STATUS_TMP/$h.rc"
           else
               echo $? >"$STATUS_TMP/$h.rc"
@@ -203,12 +207,19 @@ for path in files:
     th = f'<th style="{NOWRAP};text-align:left">'
     print(f"<tr>{th}CT</th>{th}Name</th>{th}Services</th>{th}CVEs</th>"
           f"{th}State</th>{th}Details</th></tr>")
+    # Deep links must prefill the restart runner's Container multiselect, whose
+    # values are the container name (unique) or the CTID (ambigous/unknown 
+    # names) - same rule as the `containers` subcommand.
+    all_names = [c.get("name") for c in containers]
     for c in containers:
         svc, cves = c.get("services", 0), c.get("cves", 0)
         details = fmt_details(c.get("details"))
         ct = esc(c.get("ctid", "?"))
         if svc > 0:
-            href = restart_link(host, c.get("ctid", ""))
+            cname = c.get("name")
+            cval = (cname if cname and cname != "unknown"
+                    and all_names.count(cname) == 1 else c.get("ctid", ""))
+            href = restart_link(host, cval)
             ct = f'<a href="{href}" title="open restart runner (dry-run)">{ct}</a>'
         name = esc(c.get("name", "?"))
         print(f'<tr><td style="{NOWRAP}">{ct}</td>'
@@ -243,14 +254,57 @@ shquote() {
     printf "'%s'" "$s"
 }
 
+do_containers() {
+    local host=""
+    while (($#)); do
+        case $1 in
+            --host) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    host=$2; shift 2 ;;
+            -h|--help) usage ;;
+            *) echo "unknown containers option: $1"; exit 1 ;;
+        esac
+    done
+    [[ -n $host ]] || { echo "--host is required"; exit 1; }
+
+    # Read the host's cached report (instant; the restart run itself rescans
+    # fresh, so staleness only affects what the checkbox list offers).
+    local out err rc
+    out=$(mktemp); err=$(mktemp)
+    run_on "$host" "$out" "$err" cached
+    rc=$?
+    if ((rc != 0)); then
+        echo "failed to read cached report from $host (rc $rc)" >&2
+        rm -f "$out" "$err"
+        exit 1
+    fi
+    python3 - "$out" <<'PYEOF'
+import json, sys
+
+# One line per container that has services to restart. The line IS the value
+# passed to needrestart-lxc -c, so it must resolve to exactly one container:
+# use the container name when unique, else the CTID.
+data = json.load(open(sys.argv[1]))
+containers = [c for c in data.get("containers", []) if c.get("services", 0) > 0]
+names = [c.get("name") for c in containers]
+containers.sort(key=lambda c: (-c.get("state", 0),
+                               int(c["ctid"]) if str(c.get("ctid", "")).isdigit() else 0))
+for c in containers:
+    name = c.get("name")
+    print(name if name and name != "unknown" and names.count(name) == 1
+          else str(c.get("ctid", "?")))
+PYEOF
+    rm -f "$out" "$err"
+}
+
 do_restart() {
-    local host="" container="" exclude="" action="dry-run"
+    local host="" exclude="" action="dry-run"
+    local -a containers=()
     while (($#)); do
         case $1 in
             --host) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     host=$2; shift 2 ;;
             --container) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
-                    container=$2; shift 2 ;;
+                    containers+=("$2"); shift 2 ;;
             --exclude) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     exclude=$2; shift 2 ;;
             --action) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
@@ -265,7 +319,7 @@ do_restart() {
     local remote="/usr/local/bin/needrestart-lxc"
     [[ $action == dry-run ]] && remote+=" -n"
     remote+=" -r"
-    [[ -n $container ]] && remote+=" -c $(shquote "$container")"
+    ((${#containers[@]})) && remote+=" -c $(shquote "$(IFS=,; echo "${containers[*]}")")"
     [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
 
     local cmd=(ssh "${SSH_OPTS[@]}" "$host" -- "$remote")
@@ -280,9 +334,10 @@ do_restart() {
 # ---------------------------------------------------------------------------
 
 case "${1:-}" in
-    hosts)    shift; list_hosts "$@" ;;
-    status)   shift; do_status "$@" ;;
-    restart)  shift; do_restart "$@" ;;
+    hosts)      shift; list_hosts "$@" ;;
+    status)     shift; do_status "$@" ;;
+    containers) shift; do_containers "$@" ;;
+    restart)    shift; do_restart "$@" ;;
     -h|--help|"" ) usage ;;
     *) echo "unknown subcommand: $1"; usage ;;
 esac

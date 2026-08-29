@@ -19,8 +19,12 @@
     {
       "name": "Container",
       "param": "--container",
-      "type": "text",
-      "description": "Optional: only this container (CTID or container name)."
+      "type": "multiselect",
+      "description": "Optional: which containers to restart (from the host's cached report). Empty = all flagged containers on the host. Re-pick the Host to refresh the list; the restart run always scans fresh.",
+      "values": {
+        "script": "sudo -u cdist -i needrestart-lxc-ss containers --host ${Host}",
+        "shell": false
+      }
     },
     {
       "name": "Exclude",

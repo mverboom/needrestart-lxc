@@ -92,7 +92,7 @@ DEEP = 0
 DRY_RUN = 0
 SECURITY = 0
 ZABBIX = 0
-CONTAINER_FILTER = ""
+CONTAINER_FILTERS = set()
 EXCLUDE_PATTERNS = []
 
 # Collected data structures
@@ -125,7 +125,9 @@ Options:
   -l, --list      List containers with services needing restart (no dialog)
   -r, --restart   Restart all affected services (no prompt; for automation)
   -n, --dry-run   Show what would be restarted without doing it
-  -c, --container ID  Only check a specific container (by CTID or name)
+  -c, --container ID[,ID...]
+                      Only check specific container(s) (by CTID or name;
+                      comma-separated or the option may be repeated)
   -e, --exclude PAT   Exclude services matching regex (can be repeated)
   -d, --deep          Also check for inode mismatches (slower but thorough)
   -s, --security      Security analysis: report whether pending updates are
@@ -145,6 +147,8 @@ Examples:
   {PROGNAME} -n -r               # Show what would be restarted (dry run)
   {PROGNAME} -c 100              # Only check container 100
   {PROGNAME} -c web1             # Only check container named 'web1'
+  {PROGNAME} -r -c 100,102,105   # Restart services in several containers
+  {PROGNAME} -n -r -c 100 -c 103 # Dry-run for two containers (repeated -c)
   {PROGNAME} -d                   # Deep scan including inode comparison
   {PROGNAME} -s                   # Security scan with CVE analysis
   {PROGNAME} -e '^dbus' -e '^rsyslog'  # Exclude dbus and rsyslog services
@@ -220,25 +224,31 @@ def load_container_names():
 
 
 def resolve_container_filter():
-    """Resolve a -c/--container filter given as a name to its CTID.
+    """Resolve -c/--container filters given as names to their CTIDs.
 
-    Numeric filters (CTIDs) are passed through unchanged. Names are resolved
-    against the container list loaded by load_container_names(); this must run
-    before scan_containers(). Returns 0 on success, non-zero on failure."""
-    global CONTAINER_FILTER
-    if not CONTAINER_FILTER or CONTAINER_FILTER.isdigit():
+    The value may contain several comma-separated containers. Numeric filters
+    (CTIDs) are passed through unchanged. Names are resolved against the
+    container list loaded by load_container_names(); this must run before
+    scan_containers(). Returns 0 on success, non-zero on failure."""
+    global CONTAINER_FILTERS
+    if not CONTAINER_FILTERS:
         return 0
-    name = CONTAINER_FILTER
-    matches = [ctid for ctid, cname in CT_NAMES.items() if cname == name]
-    if not matches:
-        log_error(f"Unknown container name: {name} (no such LXC container)")
-        return 1
-    if len(matches) > 1:
-        log_error(f"Container name is ambiguous ({len(matches)} containers share "
-                  f"the name '{name}'): {', '.join(matches)}; use a CTID instead")
-        return 1
-    CONTAINER_FILTER = matches[0]
-    log_verbose(f"Resolved container name '{name}' to CTID {CONTAINER_FILTER}")
+    resolved = set()
+    for name in sorted(CONTAINER_FILTERS):
+        if name.isdigit():
+            resolved.add(name)
+            continue
+        matches = [ctid for ctid, cname in CT_NAMES.items() if cname == name]
+        if not matches:
+            log_error(f"Unknown container name: {name} (no such LXC container)")
+            return 1
+        if len(matches) > 1:
+            log_error(f"Container name is ambiguous ({len(matches)} containers share "
+                      f"the name '{name}'): {', '.join(matches)}; use a CTID instead")
+            return 1
+        log_verbose(f"Resolved container name '{name}' to CTID {matches[0]}")
+        resolved.add(matches[0])
+    CONTAINER_FILTERS = resolved
     return 0
 
 
@@ -421,7 +431,7 @@ def scan_containers():
         ctid = m.group(1)
         path_suffix = m.group(2)
 
-        if CONTAINER_FILTER and ctid != CONTAINER_FILTER:
+        if CONTAINER_FILTERS and ctid not in CONTAINER_FILTERS:
             continue
 
         # Detect processes inside a user session manager subtree
@@ -1578,7 +1588,7 @@ def _run():
 
 
 def main(argv):
-    global MODE, VERBOSE, DEEP, DRY_RUN, SECURITY, ZABBIX, CONTAINER_FILTER
+    global MODE, VERBOSE, DEEP, DRY_RUN, SECURITY, ZABBIX, CONTAINER_FILTERS
     args_valid = True
     i = 0
     while i < len(argv):
@@ -1595,7 +1605,9 @@ def main(argv):
                 args_valid = False
                 i += 1
             else:
-                CONTAINER_FILTER = argv[i + 1]
+                CONTAINER_FILTERS.update(f for f in
+                                         (x.strip() for x in argv[i + 1].split(","))
+                                         if f)
                 i += 2
         elif a in ("-e", "--exclude"):
             if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
