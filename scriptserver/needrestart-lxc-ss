@@ -167,8 +167,8 @@ DETAILS = "white-space:pre-wrap"
 # stream in, so the window simply stays where it is (i.e. at the top - the
 # report starts right below the always-visible header). overflow-anchor:none
 # additionally tells the scroller not to pick an anchor inside the report.
-FRAME = ("max-height:calc(100vh - 320px);overflow-y:auto;overflow-anchor:none"
-         ";padding-right:4px")
+FRAME = ("max-height:calc(100vh - 460px);overflow-y:auto;overflow-anchor:none"
+         ";padding-right:4px;min-height:300px")
 print(f'<div style="{FRAME}">')
 print(f"<p>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>")
 
