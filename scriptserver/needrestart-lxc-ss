@@ -141,12 +141,13 @@ def badge(state):
 # All columns except Details must stay on one line; the (possibly very long)
 # container name is capped and gets an ellipsis, the full name is in the
 # cell's title attribute (hover tooltip).
-print("<html><head><style>"
-      "td,th{white-space:nowrap}"
-      "td.details{white-space:pre-wrap}"
-      "td.name{max-width:24ch;overflow:hidden;text-overflow:ellipsis}"
-      "</style></head><body>")
-print(f"<h2>needrestart-lxc report</h2>")
+#
+# NOTE: script-server renders output_format=html through DOMPurify, which
+# strips <style>/<head> — so the CSS has to be inline style attributes on the
+# cells, it cannot live in a <style> block.
+NOWRAP = "white-space:nowrap"
+NAME = NOWRAP + ";max-width:24ch;overflow:hidden;text-overflow:ellipsis"
+DETAILS = "white-space:pre-wrap"
 print(f"<p>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>")
 
 total_svc = total_cve = 0
@@ -171,8 +172,9 @@ for path in files:
           f"container(s) need a restart</p>")
     print("<table border=1 cellpadding=4 cellspacing=0 "
           'style="border-collapse:collapse;font-size:small">')
-    print("<tr><th>CT</th><th>Name</th><th>Services</th><th>CVEs</th>"
-          "<th>State</th><th>Details</th></tr>")
+    th = f'<th style="{NOWRAP};text-align:left">'
+    print(f"<tr>{th}CT</th>{th}Name</th>{th}Services</th>{th}CVEs</th>"
+          f"{th}State</th>{th}Details</th></tr>")
     for c in containers:
         svc, cves = c.get("services", 0), c.get("cves", 0)
         details = esc(c.get("details") or "")
@@ -181,12 +183,12 @@ for path in files:
             href = restart_link(host, c.get("ctid", ""))
             ct = f'<a href="{href}" title="open restart runner (dry-run)">{ct}</a>'
         name = esc(c.get("name", "?"))
-        print(f"<tr><td>{ct}</td>"
-              f'<td class="name" title="{name}">{name}</td>'
-              f"<td style='text-align:right'>{svc}</td>"
-              f"<td style='text-align:right'>{cves}</td>"
-              f"<td>{badge(c.get('state', 0))}</td>"
-              f'<td class="details">{details}</td></tr>')
+        print(f'<tr><td style="{NOWRAP}">{ct}</td>'
+              f'<td style="{NAME}" title="{name}">{name}</td>'
+              f'<td style="{NOWRAP};text-align:right">{svc}</td>'
+              f'<td style="{NOWRAP};text-align:right">{cves}</td>'
+              f'<td style="{NOWRAP}">{badge(c.get("state", 0))}</td>'
+              f'<td style="{DETAILS}">{details}</td></tr>')
     print("</table>")
     if err:
         print(f"<p style='font-size:smaller;color:#6e7781'>notes:"
@@ -194,7 +196,6 @@ for path in files:
 
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
       f"across {len(files)} host(s).</p>")
-print("</body></html>")
 PYEOF
     return $rc
 }
