@@ -183,6 +183,10 @@ print("p.meta{font-size:smaller}")
 print("</style><script>")
 print(f"var RUNNER = {restart_runner!r};")
 print("""
+function toggleAll(master) {
+    var boxes = document.querySelectorAll('input.rsel');
+    for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
+}
 function go(host, action) {
     var boxes = document.querySelectorAll('input.rsel:checked');
     if (!boxes.length) { alert('No containers selected on ' + host + '.'); return; }
@@ -231,7 +235,8 @@ for path in files:
           f"container(s) need a restart</p>")
     print("<table border=1 cellpadding=4 cellspacing=0>")
     th = "<th>"
-    print(f"<tr><th title='tick the containers to restart'>✓</th>{th}CT</th>{th}Name</th>"
+    print(f"<tr><th title='tick to select/deselect all containers'>"
+          f"<input type=checkbox onchange=\"toggleAll(this)\"></th>{th}CT</th>{th}Name</th>"
           f"{th}Services</th>{th}CVEs</th>{th}State</th>{th}Details</th></tr>")
     # Deep links must prefill the restart runner's Container multiselect, whose
     # values are the container name (unique) or the CTID (ambigous/unknown 
