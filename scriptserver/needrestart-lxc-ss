@@ -226,7 +226,7 @@ for path in files:
     print(f"<h3>{esc(host)} "
           f'<button onclick="go(\'{esc(host)}\',\'dry-run\')" '
           f"title='open the restart runner with the ticked containers, dry-run preselected'>"
-          f"restart selected (dry-run)</button></h3>")
+          f"go to restart</button></h3>")
     print(f'<p class=meta>{len(flagged)} of {len(containers)} '
           f"container(s) need a restart</p>")
     print("<table border=1 cellpadding=4 cellspacing=0>")
