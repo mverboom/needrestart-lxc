@@ -187,19 +187,31 @@ function toggleAll(master) {
     var boxes = document.querySelectorAll('input.rsel');
     for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
 }
-function go(host, action) {
-    var boxes = document.querySelectorAll('input.rsel:checked');
-    if (!boxes.length) { alert('No containers selected on ' + host + '.'); return; }
-    var vals = [];
-    for (var i = 0; i < boxes.length; i++) vals.push(boxes[i].value);
-    var q = 'Host=' + encodeURIComponent(host) +
+function goSelected(action) {
+    // group the ticked containers per host; the multi-host restart runner
+    // takes a Targets string "host1:c1,c2;host2:c3"
+    var groups = {};
+    var tables = document.querySelectorAll('table[data-host]');
+    for (var t = 0; t < tables.length; t++) {
+        var host = tables[t].getAttribute('data-host');
+        var boxes = tables[t].querySelectorAll('input.rsel:checked');
+        if (!boxes.length) continue;
+        var vals = [];
+        for (var i = 0; i < boxes.length; i++) vals.push(boxes[i].value);
+        groups[host] = vals.join(',');
+    }
+    var targets = [];
+    for (var h in groups) targets.push(h + ':' + groups[h]);
+    if (!targets.length) { alert('No containers selected.'); return; }
+    var q = 'Targets=' + encodeURIComponent(targets.join(';')) +
             '&Action=' + encodeURIComponent(action);
-    for (var i = 0; i < vals.length; i++)
-        q += '&Container=' + encodeURIComponent(vals[i]);
     window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
 }
 </script></head><body>""")
-print(f"<p class=meta>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>")
+print(f"<p class=meta>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} "
+      f"&nbsp; <button onclick='goSelected(\"dry-run\")' "
+      f"title='open the restart runner with all ticked containers (across hosts), dry-run preselected'>"
+      f"go to restart</button></p>")
 
 total_svc = total_cve = 0
 files = sorted(glob.glob(os.path.join(tmpdir, "*.json")))
@@ -227,13 +239,10 @@ for path in files:
     flagged = [c for c in containers if c.get("services", 0) > 0]
     total_svc += sum(c["services"] for c in flagged)
     total_cve += sum(c.get("cves", 0) for c in flagged)
-    print(f"<h3>{esc(host)} "
-          f'<button onclick="go(\'{esc(host)}\',\'dry-run\')" '
-          f"title='open the restart runner with the ticked containers, dry-run preselected'>"
-          f"go to restart</button></h3>")
+    print(f"<h3>{esc(host)}</h3>")
     print(f'<p class=meta>{len(flagged)} of {len(containers)} '
           f"container(s) need a restart</p>")
-    print("<table border=1 cellpadding=4 cellspacing=0>")
+    print(f'<table border=1 cellpadding=4 cellspacing=0 data-host="{esc(host)}">')
     th = "<th>"
     print(f"<tr><th title='tick to select/deselect all containers'>"
           f"<input type=checkbox onchange=\"toggleAll(this)\"></th>{th}CT</th>{th}Name</th>"
@@ -272,6 +281,9 @@ for path in files:
 
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
       f"across {len(files)} host(s).</p>")
+print("<p><button onclick='goSelected(\"dry-run\")' "
+      f"title='open the restart runner with all ticked containers (across hosts), dry-run preselected'>"
+      f"go to restart</button></p>")
 print("</body></html>")
 PYEOF
     return $rc
@@ -334,7 +346,11 @@ PYEOF
 }
 
 do_restart() {
-    local host="" exclude="" action="dry-run"
+    # Single host:  --host F [--container C]... [--exclude RE] [--action A]
+    # Multi host (from the list report): --targets 'h1:c1,c2;h2:c3' ...
+    # With targets, the runs execute sequentially in one terminal, one scan
+    # per host, and the script exits non-zero if any host failed.
+    local host="" exclude="" action="dry-run" targets=""
     local -a containers=()
     while (($#)); do
         case $1 in
@@ -342,6 +358,8 @@ do_restart() {
                     host=$2; shift 2 ;;
             --container) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     containers+=("$2"); shift 2 ;;
+            --targets) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    targets=$2; shift 2 ;;
             --exclude) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     exclude=$2; shift 2 ;;
             --action) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
@@ -350,8 +368,33 @@ do_restart() {
             *) echo "unknown restart option: $1"; exit 1 ;;
         esac
     done
-    [[ -n $host ]] || { echo "--host is required"; exit 1; }
+    [[ -n $host || -n $targets ]] || { echo "--host or --targets is required"; exit 1; }
     [[ $action == dry-run || $action == restart ]] || { echo "bad --action: $action"; exit 1; }
+
+    if [[ -n $targets ]]; then
+        # hosts and container lists are restricted to hostname-ish characters
+        # (they end up as ssh destination / shquoted remote arg); anything else
+        # is rejected instead of shipped to the remote root shell
+        [[ $targets =~ ^[A-Za-z0-9.-]+:[A-Za-z0-9._,-]+(;[A-Za-z0-9.-]+:[A-Za-z0-9._,-]+)*$ ]] \
+            || { echo "bad --targets format (expected host:c1,c2;host2:...)"; exit 1; }
+        local rc=0 t h csv
+        local -a tgt
+        IFS=';' read -ra tgt <<< "$targets"
+        for t in "${tgt[@]}"; do
+            h=${t%%:*}
+            csv=${t#*:}
+            local remote="/usr/local/bin/needrestart-lxc"
+            [[ $action == dry-run ]] && remote+=" -n"
+            remote+=" -r -c $(shquote "$csv")"
+            [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
+            echo "=== $h ==="
+            if ! ssh "${SSH_OPTS[@]}" "$h" -- "$remote"; then
+                rc=1
+            fi
+        done
+        [[ $rc == 0 ]] && echo "all hosts ok" || echo "SOME HOSTS FAILED"
+        return $rc
+    fi
 
     local remote="/usr/local/bin/needrestart-lxc"
     [[ $action == dry-run ]] && remote+=" -n"

@@ -1,0 +1,37 @@
+{
+  "name": "restart multi",
+  "script_path": "sudo -u cdist -i needrestart-lxc-ss restart",
+  "description": "Restart flagged services in LXC containers on SEVERAL Proxmox hosts in one run.\n\nYou normally get here from the **list** report: tick containers there (across hosts) and click **go to restart** — this form is then prefilled with a Targets line like `host1:names...;host2:names...` (host: comma-separated containers). You can review or hand-edit it.\n\n- **Dry run** (default) shows exactly what would be restarted and does nothing.\n- **Restart** runs `needrestart-lxc -r` per host: every flagged service is restarted (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind). Non-systemd processes and scope units are never touched automatically.\n\nEach host is scanned fresh and processed sequentially; the run fails if any host failed.",
+  "group": "needrestart-lxc",
+  "requires_terminal": true,
+  "parameters": [
+    {
+      "name": "Targets",
+      "required": true,
+      "param": "--targets",
+      "type": "text",
+      "description": "host: comma-separated containers, one entry per host, separated by ';'. Usually prefilled from the list report.",
+      "regex": "[A-Za-z0-9.-]+:[A-Za-z0-9._,-]+(;[A-Za-z0-9.-]+:[A-Za-z0-9._,-]+)*",
+      "regex_description": "host1:containers;host2:containers"
+    },
+    {
+      "name": "Exclude",
+      "param": "--exclude",
+      "type": "text",
+      "description": "Optional: regex of services to exclude on every host (can use alternation, e.g. `^dbus|^rsyslog`)."
+    },
+    {
+      "name": "Action",
+      "required": true,
+      "param": "--action",
+      "type": "list",
+      "default": "dry-run",
+      "description": "Dry run only shows what would happen.",
+      "values": ["dry-run", "restart"],
+      "values_ui_mapping": {
+        "dry-run": "Dry run (show what would be restarted)",
+        "restart": "Restart all flagged services"
+      }
+    }
+  ]
+}
