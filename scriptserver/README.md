@@ -34,12 +34,17 @@ pre-fill, see script-server skill notes).
 
 ### restart
 
-Runs `needrestart-lxc [-n] -r [-c CTID] [-e REGEX]` on one host with live
-terminal output. `restart` (all flagged services) is the preselected action;
-select `dry-run` to preview first. Restarting includes the escalation ladder
-(restart → kill + start → SIGKILL). Non-systemd processes and scope units are
-reported but never restarted automatically, mirroring the script's own safety
-rules.
+Restart flagged services inside containers, on one or several Proxmox hosts in
+one run. **Hosts** is a multiselect; **Containers** is a multiselect of
+`host:container` pairs refreshed from the selected hosts' cached reports —
+leave it empty to restart ALL flagged containers on every selected host. The
+list report's **go to restart** button prefills both from the ticked rows.
+
+Each host is scanned fresh and processed sequentially with live terminal
+output. `restart` is the default action; select `dry-run` to preview first.
+Restarting includes the escalation ladder (restart → kill + start → SIGKILL).
+Non-systemd processes and scope units are reported but never restarted
+automatically, mirroring the script's own safety rules.
 
 ## Installation / update
 
@@ -53,8 +58,7 @@ ln -sfn ../files.external/needrestart-lxc.git/scriptserver/needrestart-lxc-ss \
 # runner definitions: copy into script-server (owned by script-dev)
 install -o script-dev -g script-dev -m 664 \
     scriptserver/needrestart-status.json scriptserver/needrestart-restart.json \
-    /etc/script-server-dev/runners/
-```
+    /etc/script-server-dev/runners/```
 
 script-server picks up runner changes after a restart of the service
 (`systemctl restart script-server-dev` or equivalent for the launcher process).

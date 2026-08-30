@@ -127,11 +127,10 @@ def esc(s):
 
 
 def restart_query(host, cvals, action="dry-run"):
-    # one parameter per value: the runner's Container param is a multiselect,
-    # and its prefill does not split comma strings; vue-router turns repeated
-    # query keys into the array the multiselect expects.
-    parts = [f"Host={quote(host, safe='')}"]
-    parts += [f"Container={quote(v, safe='')}" for v in cvals]
+    # repeated query keys: the runner's Hosts and Containers params are
+    # multiselects whose prefill expects arrays (comma strings are NOT split)
+    parts = [f"Hosts={quote(host, safe='')}"]
+    parts += [f"Containers={quote(host + ':' + v, safe='')}" for v in cvals]
     parts.append(f"Action={quote(action, safe='')}")
     return "&amp;".join(parts)
 
@@ -188,23 +187,25 @@ function toggleAll(master) {
     for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
 }
 function goSelected(action) {
-    // group the ticked containers per host; the multi-host restart runner
-    // takes a Targets string "host1:c1,c2;host2:c3"
-    var groups = {};
+    // collect ticked containers as host-qualified values (host:cval); the
+    // restart runner takes repeated Hosts= and Containers= query params
+    var hosts = [], containers = [], seen = {};
     var tables = document.querySelectorAll('table[data-host]');
     for (var t = 0; t < tables.length; t++) {
         var host = tables[t].getAttribute('data-host');
         var boxes = tables[t].querySelectorAll('input.rsel:checked');
-        if (!boxes.length) continue;
-        var vals = [];
-        for (var i = 0; i < boxes.length; i++) vals.push(boxes[i].value);
-        groups[host] = vals.join(',');
+        for (var i = 0; i < boxes.length; i++) {
+            if (!seen[host]) { seen[host] = 1; hosts.push(host); }
+            containers.push(host + ':' + boxes[i].value);
+        }
     }
-    var targets = [];
-    for (var h in groups) targets.push(h + ':' + groups[h]);
-    if (!targets.length) { alert('No containers selected.'); return; }
-    var q = 'Targets=' + encodeURIComponent(targets.join(';')) +
-            '&Action=' + encodeURIComponent(action);
+    if (!containers.length) { alert('No containers selected.'); return; }
+    var q = '';
+    for (var i = 0; i < hosts.length; i++)
+        q += '&Hosts=' + encodeURIComponent(hosts[i]);
+    for (var i = 0; i < containers.length; i++)
+        q += '&Containers=' + encodeURIComponent(containers[i]);
+    q += '&Action=' + encodeURIComponent(action);
     window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
 }
 </script></head><body>""")
@@ -304,34 +305,42 @@ shquote() {
 }
 
 do_containers() {
-    local host=""
+    local hostspec=""
     while (($#)); do
         case $1 in
-            --host) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
-                    host=$2; shift 2 ;;
+            --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    hostspec=$2; shift 2 ;;
             -h|--help) usage ;;
             *) echo "unknown containers option: $1"; exit 1 ;;
         esac
     done
-    [[ -n $host ]] || { echo "--host is required"; exit 1; }
+    [[ -n $hostspec ]] || { echo "--hosts is required"; exit 1; }
+    [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+        || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
 
-    # Read the host's cached report (instant; the restart run itself rescans
+    # Read the hosts' cached reports (instant; the restart run itself rescans
     # fresh, so staleness only affects what the checkbox list offers).
-    local out err rc
+    local out err rc h
     out=$(mktemp); err=$(mktemp)
-    run_on "$host" "$out" "$err" cached
-    rc=$?
-    if ((rc != 0)); then
-        echo "failed to read cached report from $host (rc $rc)" >&2
+    local -a hostlist
+    IFS=',' read -ra hostlist <<< "$hostspec"
+    for h in "${hostlist[@]}"; do
+        run_on "$h" "$out" "$err" cached && continue
+        rc=$?
+        echo "failed to read cached report from $h (rc $rc)" >&2
         rm -f "$out" "$err"
         exit 1
-    fi
-    python3 - "$out" <<'PYEOF'
+    done
+    for h in "${hostlist[@]}"; do
+        run_on "$h" "$out" "$err" cached
+        # One line per container that has services to restart, as
+        # "host:container" (host-qualified so containers on different hosts
+        # cannot collide). The line IS a --targets token, so the container
+        # must resolve to exactly one target: use the container name when
+        # unique, else the CTID.
+        python3 - "$out" "$h" <<'PYEOF'
 import json, sys
 
-# One line per container that has services to restart. The line IS the value
-# passed to needrestart-lxc -c, so it must resolve to exactly one container:
-# use the container name when unique, else the CTID.
 data = json.load(open(sys.argv[1]))
 containers = [c for c in data.get("containers", []) if c.get("services", 0) > 0]
 names = [c.get("name") for c in containers]
@@ -339,23 +348,31 @@ containers.sort(key=lambda c: (-c.get("state", 0),
                                int(c["ctid"]) if str(c.get("ctid", "")).isdigit() else 0))
 for c in containers:
     name = c.get("name")
-    print(name if name and name != "unknown" and names.count(name) == 1
-          else str(c.get("ctid", "?")))
+    val = name if name and name != "unknown" and names.count(name) == 1 \
+        else str(c.get("ctid", "?"))
+    print(f"{sys.argv[2]}:{val}")
 PYEOF
+    done
     rm -f "$out" "$err"
 }
 
 do_restart() {
-    # Single host:  --host F [--container C]... [--exclude RE] [--action A]
-    # Multi host (from the list report): --targets 'h1:c1,c2;h2:c3' ...
-    # With targets, the runs execute sequentially in one terminal, one scan
-    # per host, and the script exits non-zero if any host failed.
-    local host="" exclude="" action="dry-run" targets=""
+    # One entry point for all restarts; hosts and container lists are
+    # restricted to hostname-ish characters (they end up as ssh destination /
+    # shquoted remote args); anything else is rejected, never passed on.
+    #   --hosts h1,h2            run on these host(s)
+    #   --targets h1:c1,c2;h2:c3  (from the list report; ':' grouping also
+    #                             accepted as ','-separated host:c pairs)
+    #   --container C (+ single --host)      legacy single-host form
+    #   --exclude RE, --action dry-run|restart
+    # Runs execute sequentially in one terminal, one scan per host; exit code
+    # is non-zero if any host failed.
+    local hostspec="" exclude="" action="dry-run"
     local -a containers=()
     while (($#)); do
         case $1 in
-            --host) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
-                    host=$2; shift 2 ;;
+            --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    hostspec=$2; shift 2 ;;
             --container) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     containers+=("$2"); shift 2 ;;
             --targets) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
@@ -368,45 +385,55 @@ do_restart() {
             *) echo "unknown restart option: $1"; exit 1 ;;
         esac
     done
-    [[ -n $host || -n $targets ]] || { echo "--host or --targets is required"; exit 1; }
+    [[ -n $hostspec || -n $targets ]] || { echo "--hosts or --targets is required"; exit 1; }
     [[ $action == dry-run || $action == restart ]] || { echo "bad --action: $action"; exit 1; }
 
-    if [[ -n $targets ]]; then
-        # hosts and container lists are restricted to hostname-ish characters
-        # (they end up as ssh destination / shquoted remote arg); anything else
-        # is rejected instead of shipped to the remote root shell
-        [[ $targets =~ ^[A-Za-z0-9.-]+:[A-Za-z0-9._,-]+(;[A-Za-z0-9.-]+:[A-Za-z0-9._,-]+)*$ ]] \
-            || { echo "bad --targets format (expected host:c1,c2;host2:...)"; exit 1; }
-        local rc=0 t h csv
-        local -a tgt
-        IFS=';' read -ra tgt <<< "$targets"
-        for t in "${tgt[@]}"; do
-            h=${t%%:*}
-            csv=${t#*:}
-            local remote="/usr/local/bin/needrestart-lxc"
-            [[ $action == dry-run ]] && remote+=" -n"
-            remote+=" -r -c $(shquote "$csv")"
-            [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
-            echo "=== $h ==="
-            if ! ssh "${SSH_OPTS[@]}" "$h" -- "$remote"; then
-                rc=1
+    # Build the ordered per-host grouping: hosts_list + groups[host]=csv
+    local -A groups=()
+    local -a hostlist=()
+    if [[ -n ${targets:-} ]]; then
+        [[ $targets =~ ^[A-Za-z0-9.-]+:[A-Za-z0-9._-]+(,[A-Za-z0-9.-]+:[A-Za-z0-9._-]+)*$ ]] \
+            || { echo "bad --targets format (expected comma-separated host:container pairs)"; exit 1; }
+        local -a toks
+        local tok h cv
+        IFS=',' read -ra toks <<< "$targets"
+        for tok in "${toks[@]}"; do
+            h=${tok%%:*}
+            cv=${tok#*:}
+            if [[ -z ${groups[$h]+x} ]]; then
+                hostlist+=("$h")
+                groups[$h]=$cv
+            else
+                [[ ,${groups[$h]}, == *,$cv,* ]] || groups[$h]+=",$cv"
             fi
         done
-        [[ $rc == 0 ]] && echo "all hosts ok" || echo "SOME HOSTS FAILED"
-        return $rc
+    elif ((${#containers[@]})); then
+        ((${#containers[@]} == 1)) || hostspec=${hostspec%%,*}  # containers are one host's
+        [[ $hostspec != *,* ]] || { echo "--container only works with a single --host"; exit 1; }
+        hostlist=("$hostspec")
+        groups[$hostspec]=$(IFS=,; echo "${containers[*]}")
+    else
+        [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+            || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
+        IFS=',' read -ra hostlist <<< "$hostspec"
+        for h in "${hostlist[@]}"; do groups[$h]=""; done
     fi
 
-    local remote="/usr/local/bin/needrestart-lxc"
-    [[ $action == dry-run ]] && remote+=" -n"
-    remote+=" -r"
-    ((${#containers[@]})) && remote+=" -c $(shquote "$(IFS=,; echo "${containers[*]}")")"
-    [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
-
-    local cmd=(ssh "${SSH_OPTS[@]}" "$host" -- "$remote")
-
-    echo "Running: ${cmd[*]}"
-    echo
-    exec "${cmd[@]}"
+    local rc=0 h csv remote
+    for h in "${hostlist[@]}"; do
+        csv=${groups[$h]}
+        remote="/usr/local/bin/needrestart-lxc"
+        [[ $action == dry-run ]] && remote+=" -n"
+        remote+=" -r"
+        [[ -n $csv ]] && remote+=" -c $(shquote "$csv")"
+        [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
+        echo "=== $h ==="
+        if ! ssh "${SSH_OPTS[@]}" "$h" -- "$remote"; then
+            rc=1
+        fi
+    done
+    [[ $rc == 0 ]] && echo "all hosts ok" || echo "SOME HOSTS FAILED"
+    return $rc
 }
 
 # ---------------------------------------------------------------------------

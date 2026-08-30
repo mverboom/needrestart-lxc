@@ -1,28 +1,28 @@
 {
   "name": "restart",
   "script_path": "sudo -u cdist -i needrestart-lxc-ss restart",
-  "description": "Restart services inside LXC containers that use outdated libraries, on one Proxmox host.\n\n- **Restart all flagged services** is preselected: runs `needrestart-lxc -r`, restarting every flagged service (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind).\n- Select **Dry run** instead to preview exactly what would be restarted without touching anything.\n\nNon-systemd processes and scope units are reported but never touched automatically. Optionally limit the run to one container (CTID or name) and/or exclude services matching a regex (e.g. `^dbus|^rsyslog`)",
+  "description": "Restart flagged services in LXC containers, on one or several Proxmox hosts in one run.\n\nYou normally get here from the **list** report: tick containers there (any host) and click **go to restart** — Hosts and Containers are then prefilled. Or pick host(s) below:\n\n- **Containers** prefills from each selected host's cached report as `host:container` entries; leave it empty to restart ALL flagged containers on every selected host.\n- The run scans each host fresh and processes them sequentially.\n- **Dry run** shows exactly what would be restarted and does nothing; **Restart all flagged services** runs `needrestart-lxc -r` per host (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind). Non-systemd processes and scope units are reported but never touched automatically.",
   "group": "needrestart-lxc",
   "requires_terminal": true,
   "parameters": [
     {
-      "name": "Host",
+      "name": "Hosts",
       "required": true,
-      "param": "--host",
-      "type": "list",
-      "description": "Proxmox host to run on.",
+      "param": "--hosts",
+      "type": "multiselect",
+      "description": "Proxmox host(s) to run on. The Containers list refreshes from the cached report of the selection.",
       "values": {
         "script": "sudo -u cdist -i needrestart-lxc-ss hosts",
         "shell": false
       }
     },
     {
-      "name": "Container",
-      "param": "--container",
+      "name": "Containers",
+      "param": "--targets",
       "type": "multiselect",
-      "description": "Optional: which containers to restart (from the host's cached report). Empty = all flagged containers on the host. Re-pick the Host to refresh the list; the restart run always scans fresh.",
+      "description": "host:container entries to restart. Empty selection = ALL flagged containers on the selected host(s). Usually prefilled from the list report.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-lxc-ss containers --host ${Host}",
+        "script": "sudo -u cdist -i needrestart-lxc-ss containers --hosts ${Hosts}",
         "shell": false
       }
     },
@@ -30,7 +30,7 @@
       "name": "Exclude",
       "param": "--exclude",
       "type": "text",
-      "description": "Optional: regex of services to exclude (can use alternation, e.g. `^dbus|^rsyslog`)."
+      "description": "Optional: regex of services to exclude on every host (can use alternation, e.g. `^dbus|^rsyslog`)."
     },
     {
       "name": "Action",
