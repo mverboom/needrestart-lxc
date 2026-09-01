@@ -1,7 +1,7 @@
 {
   "name": "list",
   "script_path": "sudo -u cdist -i needrestart-lxc-ss status",
-  "description": "Which LXC containers on the Proxmox hosts have services running outdated libraries?\n\nFor every selected host a table shows the containers, their state (clean / restart / CVEs) and the affected services with CVE verdicts. Rows with work to do deep-link into the **restart** runner with host, container and dry-run pre-filled.\n\n- **Scan now** runs a fresh scan on each host (a few seconds; also warms the hosts' 24h CVE cache). This is the default.\n- **Cached** reads the JSON the hosts' 15-minute cron generates (instant, up to 15 minutes old).",
+  "description": "Which LXC containers on the Proxmox hosts have services running outdated libraries?\n\nFor every selected host a table shows the containers, their state (clean / restart / CVEs) and the affected services with CVE verdicts. Rows with work to do deep-link into the **restart** runner with host and container pre-filled (the Action there keeps its default, restart).\n\n- **Scan now** runs a fresh scan on each host (a few seconds; also warms the hosts' 24h CVE cache). This is the default.\n- **Cached** reads the JSON the hosts' 15-minute cron generates (instant, up to 15 minutes old).",
   "group": "needrestart-lxc",
   "requires_terminal": false,
   "output_format": "html_iframe",

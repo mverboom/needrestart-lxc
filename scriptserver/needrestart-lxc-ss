@@ -21,7 +21,8 @@
 #         cached = read the JSON the hosts' 15-min cron writes (instant,
 #                  up to 15 minutes old)
 #       Output: HTML tables. Rows with services to restart deep-link into the
-#       "restart" runner with Host/Container/Action pre-filled.
+#       "restart" runner with Host/Container pre-filled (Action keeps the
+#       runner's default, restart).
 #   restart --host FQDN [--container CTID|NAME]... [--exclude REGEX]
 #           [--action dry-run|restart]
 #       Run `needrestart-lxc [-n] -r [-c ID[,ID...]] [-e REGEX]` on one host.
@@ -126,12 +127,15 @@ def esc(s):
     return html.escape(str(s), quote=True)
 
 
-def restart_query(host, cvals, action="dry-run"):
+def restart_query(host, cvals):
     # repeated query keys: the runner's Hosts and Containers params are
     # multiselects whose prefill expects arrays (comma strings are NOT split)
+    # No Action= here: the runner's default (restart) then applies. Passing
+    # the raw "dry-run" would NOT preselect anything - script-server maps
+    # list values through values_ui_mapping before the UI sees them, so the
+    # raw value matches no option and the select renders empty.
     parts = [f"Hosts={quote(host, safe='')}"]
     parts += [f"Containers={quote(host + ':' + v, safe='')}" for v in cvals]
-    parts.append(f"Action={quote(action, safe='')}")
     return "&amp;".join(parts)
 
 
@@ -187,8 +191,9 @@ function toggleAll(master) {
     for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
 }
 function goSelected(action) {
-    // collect ticked containers as host-qualified values (host:cval); the
-    // restart runner takes repeated Hosts= and Containers= query params
+    // action is unused (kept for the onclick calls); collect ticked
+    // containers as host-qualified values (host:cval); the restart runner
+    // takes repeated Hosts= and Containers= query params
     var hosts = [], containers = [], seen = {};
     var tables = document.querySelectorAll('table[data-host]');
     for (var t = 0; t < tables.length; t++) {
@@ -200,18 +205,18 @@ function goSelected(action) {
         }
     }
     if (!containers.length) { alert('No containers selected.'); return; }
+    // no Action param: the restart runner's default (restart) stays selected
     var q = '';
     for (var i = 0; i < hosts.length; i++)
         q += '&Hosts=' + encodeURIComponent(hosts[i]);
     for (var i = 0; i < containers.length; i++)
         q += '&Containers=' + encodeURIComponent(containers[i]);
-    q += '&Action=' + encodeURIComponent(action);
     window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
 }
 </script></head><body>""")
 print(f"<p class=meta>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} "
       f"&nbsp; <button onclick='goSelected(\"dry-run\")' "
-      f"title='open the restart runner with all ticked containers (across hosts), dry-run preselected'>"
+      f"title='open the restart runner with all ticked containers (across hosts); Action defaults to restart'>"
       f"go to restart</button></p>")
 
 total_svc = total_cve = 0
@@ -264,7 +269,7 @@ for path in files:
                     and all_names.count(cname) == 1 else c.get("ctid", ""))
             href = restart_link(host, cval)
             ct = (f'<a target="_top" href="{href}" '
-                  f'title="open restart runner (dry-run)">{ct}</a>')
+                  f'title="open restart runner">{ct}</a>')
             sel = f'<input type=checkbox class=rsel value="{esc(cval)}">'
         else:
             sel = ""
@@ -283,7 +288,7 @@ for path in files:
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
       f"across {len(files)} host(s).</p>")
 print("<p><button onclick='goSelected(\"dry-run\")' "
-      f"title='open the restart runner with all ticked containers (across hosts), dry-run preselected'>"
+      f"title='open the restart runner with all ticked containers (across hosts); Action defaults to restart'>"
       f"go to restart</button></p>")
 print("</body></html>")
 PYEOF
