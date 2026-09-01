@@ -313,15 +313,20 @@ do_containers() {
     local hostspec=""
     while (($#)); do
         case $1 in
-            --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+            --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1" >&2; exit 1; }
                     hostspec=$2; shift 2 ;;
             -h|--help) usage ;;
-            *) echo "unknown containers option: $1"; exit 1 ;;
+            *) echo "unknown containers option: $1" >&2; exit 1 ;;
         esac
     done
-    [[ -n $hostspec ]] || { echo "--hosts is required"; exit 1; }
+    [[ -n $hostspec ]] || { echo "--hosts is required" >&2; exit 1; }
+    # script-server substitutes multiselect params into values-script
+    # templates as str(list), e.g. "['a.b.c', 'd.e.f']" (fill_parameter_values
+    # stringifies mapped_script_value). Strip the list-repr artifacts before
+    # validating, otherwise the Containers dropdown is silently empty.
+    hostspec=$(printf %s "$hostspec" | tr -d "[]'\" ")
     [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
-        || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
+        || { echo "bad --hosts format (expected host[,host...]): got '$hostspec'" >&2; exit 1; }
 
     # Read the hosts' cached reports (instant; the restart run itself rescans
     # fresh, so staleness only affects what the checkbox list offers).
@@ -370,9 +375,12 @@ do_restart() {
     #                             accepted as ','-separated host:c pairs)
     #   --container C (+ single --host)      legacy single-host form
     #   --exclude RE, --action dry-run|restart
+    #   --allow-all     permit restarting ALL flagged containers when no
+    #                   targets are given (safety: without it, a real restart
+    #                   with an empty container selection is refused)
     # Runs execute sequentially in one terminal, one scan per host; exit code
     # is non-zero if any host failed.
-    local hostspec="" exclude="" action="dry-run"
+    local hostspec="" exclude="" action="dry-run" allow_all=0
     local -a containers=()
     while (($#)); do
         case $1 in
@@ -386,6 +394,7 @@ do_restart() {
                     exclude=$2; shift 2 ;;
             --action) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     action=$2; shift 2 ;;
+            --allow-all) allow_all=1; shift ;;
             -h|--help) usage ;;
             *) echo "unknown restart option: $1"; exit 1 ;;
         esac
@@ -422,6 +431,23 @@ do_restart() {
             || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
         IFS=',' read -ra hostlist <<< "$hostspec"
         for h in "${hostlist[@]}"; do groups[$h]=""; done
+    fi
+
+    # Safety: an empty Containers selection means "ALL flagged containers on
+    # every selected host". That is far too easy to hit by accident (a dropped
+    # prefill once restarted everything on a host, killing user sessions), so
+    # a real restart without explicit targets requires --allow-all; dry-run
+    # still previews everything.
+    if [[ $action == restart && $allow_all != 1 ]]; then
+        local hh has_targets=0
+        for hh in "${hostlist[@]}"; do
+            if [[ -n ${groups[$hh]} ]]; then has_targets=1; fi
+        done
+        if [[ $has_targets == 0 ]]; then
+            echo "refusing to restart ALL flagged containers: no containers selected" >&2
+            echo "(tick containers, or tick 'Allow all' in the UI / pass --allow-all)" >&2
+            exit 1
+        fi
     fi
 
     local rc=0 h csv remote
