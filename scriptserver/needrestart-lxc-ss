@@ -195,12 +195,14 @@ print("button{padding:2px 10px;font-size:smaller;cursor:pointer}")
 print("p.failed{color:#cf222e}")
 print("p.notes{font-size:smaller;color:#6e7781}")
 print("p.meta{font-size:smaller}")
+print("label.all{font-size:smaller;cursor:pointer}")
 print("</style><script>")
 print(f"var RUNNER = {restart_runner!r};")
 print(f"var ACTION_RESTART_UI = {ACTION_RESTART_UI!r};")
 print("""
-function toggleAll(master) {
-    var boxes = document.querySelectorAll('input.rsel');
+function toggleAll(master, hostOnly) {
+    var scope = hostOnly ? master.closest('table') : document;
+    var boxes = scope.querySelectorAll('input.rsel');
     for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
 }
 function goSelected(action) {
@@ -230,6 +232,8 @@ function goSelected(action) {
 }
 </script></head><body>""")
 print(f"<p class=meta>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} "
+      f"&nbsp; <label class=all title='tick to select/deselect every container on every host'>"
+      f"<input type=checkbox onchange=\"toggleAll(this)\"> all</label> "
       f"&nbsp; <button onclick='goSelected(\"dry-run\")' "
       f"title='open the restart runner with all ticked containers (across hosts); Action preselected to restart'>"
       f"go to restart</button></p>")
@@ -265,8 +269,8 @@ for path in files:
           f"container(s) need a restart</p>")
     print(f'<table border=1 cellpadding=4 cellspacing=0 data-host="{esc(host)}">')
     th = "<th>"
-    print(f"<tr><th title='tick to select/deselect all containers'>"
-          f"<input type=checkbox onchange=\"toggleAll(this)\"></th>{th}CT</th>{th}Name</th>"
+    print(f"<tr><th title='tick to select/deselect all containers of this host'>"
+          f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th>{th}CT</th>{th}Name</th>"
           f"{th}Services</th>{th}CVEs</th>{th}State</th>{th}Details</th></tr>")
     # Deep links must prefill the restart runner's Container multiselect, whose
     # values are the container name (unique) or the CTID (ambigous/unknown 
@@ -302,7 +306,9 @@ for path in files:
 
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
       f"across {len(files)} host(s).</p>")
-print("<p><button onclick='goSelected(\"dry-run\")' "
+print(f"<p><label class=all title='tick to select/deselect every container on every host'>"
+      f"<input type=checkbox onchange=\"toggleAll(this)\"> all</label> &nbsp; "
+      f"<button onclick='goSelected(\"dry-run\")' "
       f"title='open the restart runner with all ticked containers (across hosts); Action preselected to restart'>"
       f"go to restart</button></p>")
 print("</body></html>")
