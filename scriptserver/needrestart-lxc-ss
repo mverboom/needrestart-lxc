@@ -14,8 +14,14 @@
 #       Print the PVE host FQDNs that have needrestart-lxc deployed (explorer
 #       distro == proxmox and a zabbix agent config present), one per line.
 #       Used by the runners as their dynamic value list.
-#   status [--mode scan|cached] HOST [HOST...]
-#       Per-host report of containers needing service restarts.
+#   status [--mode scan|cached] [--all-hosts] HOST [HOST...]
+#       Per-host report of containers needing service restarts. With --all-hosts
+#       every host that has needrestart-lxc deployed is reported on (the
+#       runner's 'All hosts' checkbox); otherwise only the given HOST(s).
+#         scan   = run `needrestart-lxc --zabbix` on each host (default;
+#                  fresh data incl. CVE analysis, warms the hosts' 24h cache)
+#         cached = read the JSON the hosts' 15-min cron writes (instant,
+#                  up to 15 minutes old)
 #         scan   = run `needrestart-lxc --zabbix` on each host (default;
 #                  fresh data incl. CVE analysis, warms the hosts' 24h cache)
 #         cached = read the JSON the hosts' 15-min cron writes (instant,
@@ -83,18 +89,27 @@ run_on() {
 
 do_status() {
     local hosts=()
+    local all_hosts=0
     while (($#)); do
         case $1 in
             --mode) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
                     MODE=$2; shift 2 ;;
             --mode=*) MODE=${1#*=}; shift ;;
+            --all-hosts) all_hosts=1; shift ;;
             -h|--help) usage ;;
             *) hosts+=("$1"); shift ;;
         esac
     done
     MODE=${MODE:-scan}
     [[ $MODE == scan || $MODE == cached ]] || { echo "bad --mode: $MODE"; exit 1; }
-    ((${#hosts[@]})) || { echo "no hosts selected"; exit 1; }
+    if [[ $all_hosts == 1 ]]; then
+        # 'All hosts' wins over an explicit selection: report on every host
+        # with needrestart-lxc deployed (same list the Hosts pulldown uses).
+        hosts=()
+        local hh
+        while IFS= read -r hh; do hosts+=("$hh"); done < <(list_hosts)
+    fi
+    ((${#hosts[@]})) || { echo "no hosts selected (pick hosts in the pulldown, or tick 'All hosts')" >&2; exit 1; }
 
     # Global (not local): the EXIT trap below must still see it at script
     # exit, where function locals are out of scope (set -u would abort).
