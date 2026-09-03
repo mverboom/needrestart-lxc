@@ -127,15 +127,27 @@ def esc(s):
     return html.escape(str(s), quote=True)
 
 
+# UI label of the restart runner's Action=restart option. The deep link must
+# pass this mapped label, not the raw script value: the UI sees list values
+# through values_ui_mapping (see scriptserver/needrestart-restart.json), so a
+# raw "restart" would match no option and render the select empty. The server
+# maps the label back to "restart" when the run executes. KEEP IN SYNC with
+# values_ui_mapping in the runner JSON.
+ACTION_RESTART_UI = "Restart all flagged services"
+
+
 def restart_query(host, cvals):
     # repeated query keys: the runner's Hosts and Containers params are
-    # multiselects whose prefill expects arrays (comma strings are NOT split)
-    # No Action= here: the runner's default (restart) then applies. Passing
-    # the raw "dry-run" would NOT preselect anything - script-server maps
-    # list values through values_ui_mapping before the UI sees them, so the
-    # raw value matches no option and the select renders empty.
+    # multiselects whose prefill expects arrays (comma strings are NOT split).
+    # Action= is pinned to restart here: with any predefinedParameters present,
+    # the UI's reloaded-model handler replaces the value state with exactly the
+    # deep-link params, so parameters NOT in the link get no value at all (the
+    # runner default does NOT apply). With the forceAllowedValues frontend
+    # patch (script-server-dev recipe) the forced values are also not wiped
+    # while the dependent Containers list is still loading.
     parts = [f"Hosts={quote(host, safe='')}"]
     parts += [f"Containers={quote(host + ':' + v, safe='')}" for v in cvals]
+    parts.append(f"Action={quote(ACTION_RESTART_UI, safe='')}")
     return "&amp;".join(parts)
 
 
@@ -185,6 +197,7 @@ print("p.notes{font-size:smaller;color:#6e7781}")
 print("p.meta{font-size:smaller}")
 print("</style><script>")
 print(f"var RUNNER = {restart_runner!r};")
+print(f"var ACTION_RESTART_UI = {ACTION_RESTART_UI!r};")
 print("""
 function toggleAll(master) {
     var boxes = document.querySelectorAll('input.rsel');
@@ -205,18 +218,20 @@ function goSelected(action) {
         }
     }
     if (!containers.length) { alert('No containers selected.'); return; }
-    // no Action param: the restart runner's default (restart) stays selected
+    // Action is pinned to restart (UI-mapped label): parameters missing from
+    // the deep link get no value at all, the runner default does NOT apply
     var q = '';
     for (var i = 0; i < hosts.length; i++)
         q += '&Hosts=' + encodeURIComponent(hosts[i]);
     for (var i = 0; i < containers.length; i++)
         q += '&Containers=' + encodeURIComponent(containers[i]);
+    q += '&Action=' + encodeURIComponent(ACTION_RESTART_UI);
     window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
 }
 </script></head><body>""")
 print(f"<p class=meta>mode: {esc(mode)} &mdash; generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} "
       f"&nbsp; <button onclick='goSelected(\"dry-run\")' "
-      f"title='open the restart runner with all ticked containers (across hosts); Action defaults to restart'>"
+      f"title='open the restart runner with all ticked containers (across hosts); Action preselected to restart'>"
       f"go to restart</button></p>")
 
 total_svc = total_cve = 0
@@ -288,7 +303,7 @@ for path in files:
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
       f"across {len(files)} host(s).</p>")
 print("<p><button onclick='goSelected(\"dry-run\")' "
-      f"title='open the restart runner with all ticked containers (across hosts); Action defaults to restart'>"
+      f"title='open the restart runner with all ticked containers (across hosts); Action preselected to restart'>"
       f"go to restart</button></p>")
 print("</body></html>")
 PYEOF
