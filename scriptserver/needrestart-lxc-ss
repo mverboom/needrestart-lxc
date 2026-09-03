@@ -346,21 +346,27 @@ shquote() {
 }
 
 do_containers() {
-    local hostspec=""
+    # script-server renders values-script templates by substituting multiselect
+    # params as a python str(list) and then splits the rendered command with
+    # shlex (shell=false, split_command in process_utils.py) - the quotes are
+    # consumed by shlex, so ${Hosts} arrives as SEPARATE word fragments:
+    #   2 hosts:  --hosts [h1, h2]        (two tokens: "[h1,", "h2]")
+    #   1 host:   --hosts [h1]            (one token)
+    # Collect every non-flag token as a host fragment, strip all list-repr
+    # artifacts, and re-validate. (The old single-argument --hosts handling
+    # silently died on the second host: "unknown containers option: h2]".)
+    local -a raw=()
     while (($#)); do
         case $1 in
-            --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1" >&2; exit 1; }
-                    hostspec=$2; shift 2 ;;
+            --host|--hosts) shift ;;
             -h|--help) usage ;;
-            *) echo "unknown containers option: $1" >&2; exit 1 ;;
+            *) raw+=("$1"); shift ;;
         esac
     done
-    [[ -n $hostspec ]] || { echo "--hosts is required" >&2; exit 1; }
-    # script-server substitutes multiselect params into values-script
-    # templates as str(list), e.g. "['a.b.c', 'd.e.f']" (fill_parameter_values
-    # stringifies mapped_script_value). Strip the list-repr artifacts before
-    # validating, otherwise the Containers dropdown is silently empty.
-    hostspec=$(printf %s "$hostspec" | tr -d "[]'\" ")
+    ((${#raw[@]})) || { echo "--hosts is required" >&2; exit 1; }
+    local hostspec
+    hostspec=$(printf '%s' "${raw[*]}" | tr -d "[]'\" " | tr -s ,)
+    hostspec=${hostspec#,} hostspec=${hostspec%,}
     [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
         || { echo "bad --hosts format (expected host[,host...]): got '$hostspec'" >&2; exit 1; }
 
