@@ -55,13 +55,18 @@ cd /home/cdist/files.external/needrestart-lxc.git && git pull --ff-only origin m
 # wrapper: symlinked into ~cdist/bin (survives git pulls)
 ln -sfn ../files.external/needrestart-lxc.git/scriptserver/needrestart-lxc-ss \
         /home/cdist/bin/needrestart-lxc-ss
-# runner definitions: copy into script-server (owned by script-dev)
-install -o script-dev -g script-dev -m 664 \
-    scriptserver/needrestart-status.json scriptserver/needrestart-restart.json \
-    /etc/script-server-dev/runners/```
+# runner definitions: symlinked into script-server (survive git pulls)
+ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart-status.json \
+        /etc/script-server-dev/runners/needrestart-status.json
+ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart-restart.json \
+        /etc/script-server-dev/runners/needrestart-restart.json
+```
 
-script-server picks up runner changes after a restart of the service
-(`systemctl restart script-server-dev` or equivalent for the launcher process).
+A `git pull` is enough: the wrapper and both runner definitions are symlinks
+into the checkout, and script-server re-reads runner files from disk on every
+page load - no service restart needed. (Caveat: editing a runner through
+script-server's admin UI would write through the symlink into the git
+checkout; treat the checkout as the single source of truth.)
 
 ## Host list
 
