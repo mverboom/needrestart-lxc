@@ -20,7 +20,6 @@ Usage:
 The API key file contains the raw Zabbix API token (one line). The key is read
 from the file and never printed.
 """
-import argparse
 import json
 import sys
 import urllib.error
@@ -70,18 +69,21 @@ def aggregate_expr(cmp_op, state_value):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--api-key", default=DEFAULT_KEY_FILE,
-                    help="path to file containing the Zabbix API token")
-    args = ap.parse_args()
+    key_file = DEFAULT_KEY_FILE
+    argv = sys.argv[1:]
+    if argv:
+        if len(argv) == 2 and argv[0] == "--api-key":
+            key_file = argv[1]
+        else:
+            sys.exit(f"usage: {sys.argv[0]} [--api-key /path/to/key]")
 
     try:
-        with open(args.api_key) as fh:
+        with open(key_file) as fh:
             token = fh.read().strip()
     except OSError as e:
-        sys.exit(f"cannot read API key file {args.api_key}: {e}")
+        sys.exit(f"cannot read API key file {key_file}: {e}")
     if not token:
-        sys.exit(f"API key file {args.api_key} is empty")
+        sys.exit(f"API key file {key_file} is empty")
 
     # Find the template id.
     r = call(token, "template.get",

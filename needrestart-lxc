@@ -19,6 +19,7 @@ non-interactive text report, or -r/--restart to restart every flagged
 service without prompting (for automation).
 """
 
+import argparse
 import gzip
 import glob
 import json
@@ -31,6 +32,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Ensure pct (in /usr/sbin) is found even when run from a minimal
 # environment such as cron (PATH=/usr/bin:/bin), where /usr/sbin is missing
@@ -91,7 +94,6 @@ VERBOSE = 0
 DEEP = 0
 DRY_RUN = 0
 SECURITY = 0
-ZABBIX = 0
 CONTAINER_FILTERS = set()
 EXCLUDE_PATTERNS = []
 
@@ -664,6 +666,14 @@ def print_security_annotation(key):
         print()
 
 
+def report(key, msg):
+    """Print a restart message with the security annotation suffix."""
+    print(msg, end="")
+    print_security_annotation(key)
+    if SECURITY and VERBOSE:
+        print_security_info(key)
+
+
 def print_results():
     if not CONT_SERVICES:
         print("No containers have services needing restart.")
@@ -700,20 +710,14 @@ def restart_one(key):
     # Non-systemd processes (in the container root cgroup) cannot be
     # restarted via systemctl; report and leave the action to the user.
     if key in NON_SYSTEMD_KEYS:
-        print(f"Container {ctid} ({ct_name}): non-systemd process {service} "
-              f"needs restart (restart it manually or reboot the container)", end="")
-        print_security_annotation(key)
-        if SECURITY and VERBOSE:
-            print_security_info(key)
+        report(key, f"Container {ctid} ({ct_name}): non-systemd process {service} "
+                    f"needs restart (restart it manually or reboot the container)")
         return
 
     # systemd-manager can be re-exec'd, no container reboot needed
     if service == "systemd-manager":
-        print(f"Container {ctid} ({ct_name}): systemd needs reexec "
-              f"(systemctl daemon-reexec)", end="")
-        print_security_annotation(key)
-        if SECURITY and VERBOSE:
-            print_security_info(key)
+        report(key, f"Container {ctid} ({ct_name}): systemd needs reexec "
+                    f"(systemctl daemon-reexec)")
         if DRY_RUN:
             print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl daemon-reexec")
             return
@@ -731,15 +735,12 @@ def restart_one(key):
     # Scope units cannot be restarted with systemctl restart
     if service.endswith(".scope"):
         if user_uid:
-            print(f"Container {ctid} ({ct_name}): user session scope {service} "
-                  f"has outdated processes (stopping via systemctl --user stop)", end="")
+            report(key, f"Container {ctid} ({ct_name}): user session scope {service} "
+                        f"has outdated processes (stopping via systemctl --user stop)")
         else:
-            print(f"Container {ctid} ({ct_name}): scope {service} has outdated "
-                  f"processes (cannot auto-restart, consider restarting user "
-                  f"service or terminating scope)", end="")
-        print_security_annotation(key)
-        if SECURITY and VERBOSE:
-            print_security_info(key)
+            report(key, f"Container {ctid} ({ct_name}): scope {service} has outdated "
+                        f"processes (cannot auto-restart, consider restarting user "
+                        f"service or terminating scope)")
         if DRY_RUN:
             if user_uid:
                 print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
@@ -771,11 +772,8 @@ def restart_one(key):
     # User session service (managed by user's systemd under user@N.service):
     # restart via `systemctl --user` as the owning user.
     if user_uid:
-        print(f"Container {ctid} ({ct_name}): restarting user session service "
-              f"{service} (UID {user_uid})", end="")
-        print_security_annotation(key)
-        if SECURITY and VERBOSE:
-            print_security_info(key)
+        report(key, f"Container {ctid} ({ct_name}): restarting user session service "
+                    f"{service} (UID {user_uid})")
         if DRY_RUN:
             print(f"  [DRY RUN] Would run: pct exec {ctid} -- runuser -u <user> "
                   f"-- env XDG_RUNTIME_DIR=/run/user/{user_uid} "
@@ -792,10 +790,7 @@ def restart_one(key):
         return
 
     # Standard system service
-    print(f"Container {ctid} ({ct_name}): restarting service {service}", end="")
-    print_security_annotation(key)
-    if SECURITY and VERBOSE:
-        print_security_info(key)
+    report(key, f"Container {ctid} ({ct_name}): restarting service {service}")
     if DRY_RUN:
         print(f"  [DRY RUN] Would run: pct exec {ctid} -- systemctl restart {service}")
         print(f"  [DRY RUN] Would verify; if stale, escalate to: "
@@ -948,10 +943,6 @@ def parse_dpkg_status(ctid, root):
     return True
 
 
-def status_lookup(ctid, binpkg):
-    return DPKG_STATUS.get(ctid, {}).get(binpkg, "")
-
-
 def owning_pkgs(root, paths):
     """Single pass over /var/lib/dpkg/info/*.list; maps each wanted path to
     its owning binary package(s)."""
@@ -987,17 +978,23 @@ def ver_cmp(a, b):
 
 
 def epoch_from_date(datestr, tz):
-    cmd = ["date", "-d", datestr, "+%s"]
-    env = dict(os.environ)
-    if tz:
-        env["TZ"] = tz
+    """Parse a timestamp into a Unix epoch. Accepts dpkg.log's
+    'YYYY-MM-DD HH:MM:SS' and ps lstart ('Tue Sep  3 09:46:00 2026') formats.
+    tz is a zoneinfo name from /etc/timezone; empty means the host timezone."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10)
-        if r.returncode == 0 and r.stdout.strip().isdigit():
-            return int(r.stdout.strip())
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%a %b %d %H:%M:%S %Y"):
+            try:
+                dt = datetime.strptime(datestr.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+        if tz:
+            dt = dt.replace(tzinfo=ZoneInfo(tz))
+        return int(dt.timestamp())   # naive dt: interpreted in the host timezone
     except Exception:
-        pass
-    return None
+        return None
 
 
 def version_at_start(root, binpkg, start_epoch):
@@ -1058,10 +1055,9 @@ def parse_changelog(path):
     with fh:
         for line in fh:
             line = line.rstrip("\n")
-            if re.match(r"^[A-Za-z0-9.+~_-]+ \([^)]+\) [^;]+; urgency=", line):
-                version = re.sub(r"\)[^)]*", "", re.sub(r"^[^ ]+ \(", "", line))
-                suite = re.sub(r";.*", "", re.sub(r"^[^ ]+ \([^)]+\) ", "", line))
-                yield ("ENTRY", version, suite)
+            m = re.match(r"^[^ ]+ \(([^)]+)\) ([^;]+); urgency=", line)
+            if m:
+                yield ("ENTRY", m.group(1), m.group(2))
             elif line.startswith("-- "):
                 continue
             else:
@@ -1383,7 +1379,7 @@ def analyze_service_libs(ctid, key, root, start_epoch, libs):
 
     seen_verdicts = set()
     for binpkg in binpkgs:
-        status_out = status_lookup(ctid, binpkg)
+        status_out = DPKG_STATUS.get(ctid, {}).get(binpkg, "")
         if not status_out:
             CONT_CVES[key] = (CONT_CVES.get(key, "") +
                               ("\n" if CONT_CVES.get(key) else "") +
@@ -1449,7 +1445,7 @@ def security_scan():
 
     for ctid in sorted(CT_NOTES):
         msg = f"Container {ctid} ({CT_NAMES.get(ctid, 'unknown')}): {CT_NOTES[ctid]}"
-        if ZABBIX:
+        if MODE == "zabbix":
             print(msg, file=sys.stderr)
         else:
             print(msg)
@@ -1509,7 +1505,7 @@ def zabbix_output():
             "details": "\n".join(details),
         }
 
-    out_containers = [containers[k] for k in sorted(containers, key=int)]
+    out_containers = list(containers.values())
     needing = [c for c in out_containers if c["services"] > 0]
     total_services = sum(c["services"] for c in needing)
     total_cves = sum(c["cves"] for c in needing)
@@ -1588,60 +1584,36 @@ def _run():
 
 
 def main(argv):
-    global MODE, VERBOSE, DEEP, DRY_RUN, SECURITY, ZABBIX, CONTAINER_FILTERS
-    args_valid = True
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a in ("-l", "--list"):
-            MODE = "list"; i += 1
-        elif a in ("-r", "--restart"):
-            MODE = "restart"; i += 1
-        elif a in ("-n", "--dry-run"):
-            DRY_RUN = 1; i += 1
-        elif a in ("-c", "--container"):
-            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-                log_error(f"{a} requires a CTID or container name argument")
-                args_valid = False
-                i += 1
-            else:
-                CONTAINER_FILTERS.update(f for f in
-                                         (x.strip() for x in argv[i + 1].split(","))
-                                         if f)
-                i += 2
-        elif a in ("-e", "--exclude"):
-            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-                log_error(f"{a} requires a regex argument")
-                args_valid = False
-                i += 1
-            else:
-                try:
-                    re.compile(argv[i + 1])
-                except re.error as err:
-                    log_error(f"{a}: invalid regex {argv[i + 1]!r}: {err}")
-                    args_valid = False
-                else:
-                    EXCLUDE_PATTERNS.append(argv[i + 1])
-                i += 2
-        elif a in ("-d", "--deep"):
-            DEEP = 1; i += 1
-        elif a in ("-s", "--security"):
-            SECURITY = 1; i += 1
-        elif a == "--zabbix":
-            ZABBIX = 1; MODE = "zabbix"; SECURITY = 1; i += 1
-        elif a in ("-v", "--verbose"):
-            VERBOSE = 1; i += 1
-        elif a in ("-h", "--help"):
-            print_usage()
-            return 0
-        else:
-            log_error(f"Unknown option: {a}")
-            args_valid = False
-            i += 1
+    global MODE, VERBOSE, DEEP, DRY_RUN, SECURITY, CONTAINER_FILTERS, EXCLUDE_PATTERNS
+    if "-h" in argv or "--help" in argv:
+        print_usage()
+        return 0
 
-    if not args_valid:
-        print_usage(sys.stderr)
-        return 1
+    def regex_arg(value):
+        try:
+            re.compile(value)
+        except re.error as err:
+            raise argparse.ArgumentTypeError(f"invalid regex {value!r}: {err}")
+        return value
+
+    ap = argparse.ArgumentParser(prog=PROGNAME, add_help=False)
+    ap.add_argument("-l", "--list", dest="mode", action="store_const", const="list")
+    ap.add_argument("-r", "--restart", dest="mode", action="store_const", const="restart")
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("-c", "--container", action="append")
+    ap.add_argument("-e", "--exclude", action="append", type=regex_arg)
+    ap.add_argument("-d", "--deep", action="store_true")
+    ap.add_argument("-s", "--security", action="store_true")
+    ap.add_argument("--zabbix", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    MODE = args.mode or ("zabbix" if args.zabbix else "interactive")
+    SECURITY = 1 if (args.security or args.zabbix) else 0
+    VERBOSE, DEEP, DRY_RUN = args.verbose, args.deep, args.dry_run
+    for val in args.container or []:
+        CONTAINER_FILTERS.update(f for f in (x.strip() for x in val.split(",")) if f)
+    EXCLUDE_PATTERNS = args.exclude or []
     if os.geteuid() != 0:
         log_error("This script must be run as root to access /proc/*/maps")
         return 1
