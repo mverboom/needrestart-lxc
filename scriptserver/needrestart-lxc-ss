@@ -346,15 +346,10 @@ shquote() {
 }
 
 do_containers() {
-    # script-server renders values-script templates by substituting multiselect
-    # params as a python str(list) and then splits the rendered command with
-    # shlex (shell=false, split_command in process_utils.py) - the quotes are
-    # consumed by shlex, so ${Hosts} arrives as SEPARATE word fragments:
-    #   2 hosts:  --hosts [h1, h2]        (two tokens: "[h1,", "h2]")
-    #   1 host:   --hosts [h1]            (one token)
-    # Collect every non-flag token as a host fragment, strip all list-repr
-    # artifacts, and re-validate. (The old single-argument --hosts handling
-    # silently died on the second host: "unknown containers option: h2]".)
+    # script-server splits the rendered values-script command with shlex
+    # (shell=false), which eats the quotes, so ${Hosts} arrives as word
+    # fragments: --hosts [h1, h2] -> tokens "[h1," "h2]". Collect all
+    # non-flag tokens, strip the list-repr artifacts, re-validate.
     local -a raw=()
     while (($#)); do
         case $1 in
@@ -365,8 +360,7 @@ do_containers() {
     done
     ((${#raw[@]})) || { echo "--hosts is required" >&2; exit 1; }
     local hostspec
-    hostspec=$(printf '%s' "${raw[*]}" | tr -d "[]'\" " | tr -s ,)
-    hostspec=${hostspec#,} hostspec=${hostspec%,}
+    hostspec=$(printf '%s' "${raw[*]}" | tr -d "[]'\" ")
     [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
         || { echo "bad --hosts format (expected host[,host...]): got '$hostspec'" >&2; exit 1; }
 
