@@ -202,34 +202,6 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                             <description>Number of CVEs fixed by the pending updates that require a service restart in the container.</description>
                         </item_prototype>
                         <item_prototype>
-                            <uuid>7f97196e3db34dc3832223d2338b4ffc</uuid>
-                            <name>Needrestart LXC {#CTNAME}: CVE data complete</name>
-                            <type>DEPENDENT</type>
-                            <key>needrestart.lxc.cvesok[{#CTID}]</key>
-                            <delay>0</delay>
-                            <history>31d</history>
-                            <trends>0</trends>
-                            <value_type>UNSIGNED</value_type>
-                            <master_item>
-                                <key>needrestart.lxc.master</key>
-                            </master_item>
-                            <preprocessing>
-                                <step>
-                                    <type>JSONPATH</type>
-                                    <parameters>
-                                <parameter>$.containers[?(@.ctid == "{#CTID}")].first()</parameter>
-                            </parameters>
-                                </step>
-                                <step>
-                                    <type>JSONPATH</type>
-                                    <parameters>
-                                <parameter>$.cves_ok</parameter>
-                            </parameters>
-                                </step>
-                            </preprocessing>
-                            <description>Whether CVE analysis for this container is complete (1) or indeterminate (0). When 0, restart alerts are suppressed to avoid false positives (an unknown CVE count could be 0 or many).</description>
-                        </item_prototype>
-                        <item_prototype>
                             <uuid>c8a1b6e2493f4c6d8a7e1234567890ab</uuid>
                             <name>Needrestart LXC {#CTNAME}: alert state</name>
                             <type>DEPENDENT</type>

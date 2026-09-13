@@ -42,7 +42,7 @@ SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
 RESTART_RUNNER="restart"
 
 usage() {
-    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"
     exit 1
 }
 
@@ -147,7 +147,7 @@ def esc(s):
 ACTION_RESTART_UI = "Restart all flagged services"
 
 
-def restart_query(host, cvals):
+def restart_query(host, cval):
     # repeated query keys: the runner's Hosts and Containers params are
     # multiselects whose prefill expects arrays (comma strings are NOT split).
     # Action= is pinned to restart here: with any predefinedParameters present,
@@ -157,13 +157,13 @@ def restart_query(host, cvals):
     # patch (script-server-dev recipe) the forced values are also not wiped
     # while the dependent Containers list is still loading.
     parts = [f"Hosts={quote(host, safe='')}"]
-    parts += [f"Containers={quote(host + ':' + v, safe='')}" for v in cvals]
+    parts.append(f"Containers={quote(host + ':' + cval, safe='')}")
     parts.append(f"Action={quote(ACTION_RESTART_UI, safe='')}")
     return "&amp;".join(parts)
 
 
 def restart_link(host, cval):
-    return f"#/{runner_enc}?{restart_query(host, [cval])}"
+    return f"#/{runner_enc}?{restart_query(host, cval)}"
 
 
 STATE = {0: ("#1a7f37", "clean"), 1: ("#9a6700", "restart"), 2: ("#cf222e", "CVEs")}
@@ -216,8 +216,8 @@ function toggleAll(master, hostOnly) {
     var boxes = scope.querySelectorAll('input.rsel');
     for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
 }
-function goSelected(action) {
-    // action is unused (kept for the onclick calls); collect ticked
+function goSelected() {
+    // collect ticked
     // containers as host-qualified values (host:cval); the restart runner
     // takes repeated Hosts= and Containers= query params
     var hosts = [], containers = [], seen = {};
@@ -244,7 +244,7 @@ function goSelected(action) {
 </script></head><body>""")
 CONTROLS = ("<label class=all title='tick to select/deselect every container on every host'>"
             "<input type=checkbox onchange=\"toggleAll(this)\"> all</label> &nbsp; "
-            "<button onclick='goSelected(\"dry-run\")' "
+            "<button onclick='goSelected()' "
             "title='open the restart runner with all ticked containers (across hosts); "
             "Action preselected to restart'>"
             "go to restart</button>")

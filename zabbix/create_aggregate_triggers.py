@@ -94,33 +94,24 @@ def main():
         sys.exit(f"template '{TEMPLATE}' not found")
     templateid = r["result"][0]["templateid"]
 
+    def trigger(cmp_op, state_value, priority, cause):
+        return {
+            "expression": aggregate_expr(cmp_op, state_value),
+            "description": "{HOST.NAME}: {ITEM.VALUE1} containers need restart",
+            "opdata": "{ITEM.VALUE2} CVEs",
+            "priority": priority,
+            "comments": (
+                "Aggregate alert: one or more containers have services needing a "
+                f"restart and {cause}. The notification message can include the "
+                "full per-container list via {ITEM.VALUE3}. The consolidated "
+                f"summary.state (value {state_value}) is the trigger source so the "
+                "aggregate trigger cannot race across the separate summary items."),
+            "tags": [{"tag": "needrestart", "value": "aggregate"}],
+        }
+
     triggers = [
-        {
-            "expression": aggregate_expr("=0", 1),
-            "description": "{HOST.NAME}: {ITEM.VALUE1} containers need restart",
-            "opdata": "{ITEM.VALUE2} CVEs",
-            "priority": WARNING,
-            "comments": ("Aggregate alert: one or more containers have services "
-                         "needing a restart and no known CVEs are pending. The "
-                         "notification message can include the full per-container "
-                         "list via {ITEM.VALUE3}. The consolidated summary.state "
-                         "(value 1) is the trigger source so the aggregate trigger "
-                         "cannot race across the separate summary items."),
-            "tags": [{"tag": "needrestart", "value": "aggregate"}],
-        },
-        {
-            "expression": aggregate_expr(">0", 2),
-            "priority": HIGH,
-            "description": "{HOST.NAME}: {ITEM.VALUE1} containers need restart",
-            "opdata": "{ITEM.VALUE2} CVEs",
-            "comments": ("Aggregate alert: one or more containers have services "
-                         "needing a restart and the pending updates fix known CVEs. "
-                         "The notification message can include the full per-container "
-                         "list via {ITEM.VALUE3}. The summary.state (value 2) is the "
-                         "trigger source so the aggregate trigger cannot race across "
-                         "the separate summary items."),
-            "tags": [{"tag": "needrestart", "value": "aggregate"}],
-        },
+        trigger("=0", 1, WARNING, "no known CVEs are pending"),
+        trigger(">0", 2, HIGH, "the pending updates fix known CVEs"),
     ]
 
     created = 0

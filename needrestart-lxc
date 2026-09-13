@@ -468,13 +468,6 @@ def scan_containers():
             continue
 
         init_pid = CT_PIDS.get(ctid, "")
-        if not init_pid:
-            for p2, pth2 in read_procs():
-                m2 = CGROUP_RE.match(pth2)
-                if m2 and m2.group(1) == ctid and pth2.endswith("/ns/init.scope"):
-                    init_pid = p2
-                    CT_PIDS[ctid] = p2
-                    break
 
         if not os.access(f"/proc/{pid}/maps", os.R_OK):
             continue
@@ -648,22 +641,21 @@ def print_security_info(key):
             print(f"  [security] {line}")
 
 
-def print_cve_count_suffix(key):
-    if not SECURITY or VERBOSE:
-        return
-    cve_count = CONT_CVE_COUNTS.get(key, 0)
-    if cve_count <= 0:
-        return
-    plural = "" if cve_count == 1 else "s"
-    print(f" ({cve_count} CVE{plural})", end="")
+def svc_display(user_uid, service, non_systemd=False):
+    """Human-readable service label used by the reports."""
+    if non_systemd:
+        return f"{service} (non-systemd)"
+    if user_uid:
+        return f"{service} [user session UID {user_uid}]"
+    return service
 
 
 def print_security_annotation(key):
-    if SECURITY and VERBOSE:
-        print()
-    else:
-        print_cve_count_suffix(key)
-        print()
+    if SECURITY and not VERBOSE:
+        n = CONT_CVE_COUNTS.get(key, 0)
+        if n > 0:
+            print(f" ({n} CVE{'' if n == 1 else 's'})", end="")
+    print()
 
 
 def report(key, msg):
@@ -687,8 +679,8 @@ def print_results():
             print(f"Container {ctid} ({ct_name}): non-systemd process {service} "
                   f"needs restart (restart it manually or reboot the container)", end="")
         else:
-            svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
-            print(f"Container {ctid} ({ct_name}): service {svc_display} needs restart", end="")
+            print(f"Container {ctid} ({ct_name}): service "
+                  f"{svc_display(user_uid, service)} needs restart", end="")
         print_security_annotation(key)
         if VERBOSE:
             for lib in libs.split("\n"):
@@ -799,14 +791,6 @@ def restart_one(key):
     restart_with_escalation(ctid, ct_name, service)
 
 
-def restart_services():
-    if not CONT_SERVICES:
-        print("No containers have services needing restart.")
-        return
-    for key in sorted(CONT_SERVICES):
-        restart_one(key)
-
-
 def interactive_restart():
     """Present a whiptail checkbox list of the flagged services (mirroring
     needrestart's own UI) and restart only the services the user selects.
@@ -841,12 +825,8 @@ def interactive_restart():
         ctid, _rest = key.split(":", 1)
         user_uid, service = _rest.split(":", 1)
         ct_name = CT_NAMES.get(ctid, "unknown")
-        if key in NON_SYSTEMD_KEYS:
-            label = f"{ct_name} ({ctid}): {service} (non-systemd)"
-        elif user_uid:
-            label = f"{ct_name} ({ctid}): {service} [user UID {user_uid}]"
-        else:
-            label = f"{ct_name} ({ctid}): {service}"
+        label = (f"{ct_name} ({ctid}): "
+                 f"{svc_display(user_uid, service, key in NON_SYSTEMD_KEYS)}")
         if SECURITY:
             cve_count = CONT_CVE_COUNTS.get(key, 0)
             if cve_count > 0:
@@ -1137,8 +1117,7 @@ def changelog_verdict(root, binpkg, srcpkg, old, new):
 
 def clean_lib_path(p):
     for suf in (" (executable)", " (inode mismatch)", " (deleted)"):
-        if p.endswith(suf):
-            p = p[:-len(suf)]
+        p = p.removesuffix(suf)
     return p
 
 
@@ -1452,7 +1431,7 @@ def security_scan():
 
 
 def zabbix_output():
-    containers = {}
+    out_containers = []
     sorted_keys = sorted(CONT_SERVICES)
     all_ctids = set(CT_PIDS) | {k.split(":", 1)[0] for k in CONT_SERVICES}
     for ctid in sorted(all_ctids, key=int):
@@ -1465,17 +1444,14 @@ def zabbix_output():
             services += 1
             _rest = key.split(":", 1)[1]
             user_uid, service = _rest.split(":", 1)
-            if key in NON_SYSTEMD_KEYS:
-                svc_display = f"{service} (non-systemd)"
-            else:
-                svc_display = f"{service} [user session UID {user_uid}]" if user_uid else service
+            svc = svc_display(user_uid, service, key in NON_SYSTEMD_KEYS)
             if key in CONT_CVES:
                 for vl in CONT_CVES[key].split("\n"):
                     if not vl:
                         continue
-                    details.append(f"{svc_display}: {vl}")
+                    details.append(f"{svc}: {vl}")
             else:
-                details.append(f"{svc_display}: needs restart")
+                details.append(f"{svc}: needs restart")
         # CVEs are counted once per update, not once per affected service
         for ukey, uc in CONT_UPDATE_COUNTS.items():
             if ukey.startswith(ctid + "|"):
@@ -1495,7 +1471,7 @@ def zabbix_output():
             state = 1
         else:
             state = 0
-        containers[ctid] = {
+        out_containers.append({
             "ctid": ctid,
             "name": CT_NAMES.get(ctid, "unknown"),
             "services": services,
@@ -1503,9 +1479,8 @@ def zabbix_output():
             "cves_ok": cves_ok,
             "state": state,
             "details": "\n".join(details),
-        }
+        })
 
-    out_containers = list(containers.values())
     needing = [c for c in out_containers if c["services"] > 0]
     total_services = sum(c["services"] for c in needing)
     total_cves = sum(c["cves"] for c in needing)
@@ -1559,30 +1534,6 @@ def zabbix_output():
     return 0
 
 
-def _run():
-    if SECURITY:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-
-    load_container_names()
-    if resolve_container_filter():
-        return 1
-    get_container_pids()
-    scan_containers()
-
-    if SECURITY:
-        security_scan()
-
-    if MODE == "restart":
-        restart_services()
-    elif MODE == "zabbix":
-        return zabbix_output()
-    elif MODE == "interactive":
-        return interactive_restart()
-    else:
-        print_results()
-    return 0
-
-
 def main(argv):
     global MODE, VERBOSE, DEEP, DRY_RUN, SECURITY, CONTAINER_FILTERS, EXCLUDE_PATTERNS
     if "-h" in argv or "--help" in argv:
@@ -1618,7 +1569,31 @@ def main(argv):
         log_error("This script must be run as root to access /proc/*/maps")
         return 1
 
-    return _run()
+    if SECURITY:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+    load_container_names()
+    if resolve_container_filter():
+        return 1
+    get_container_pids()
+    scan_containers()
+
+    if SECURITY:
+        security_scan()
+
+    if MODE == "restart":
+        if not CONT_SERVICES:
+            print("No containers have services needing restart.")
+        else:
+            for key in sorted(CONT_SERVICES):
+                restart_one(key)
+    elif MODE == "zabbix":
+        return zabbix_output()
+    elif MODE == "interactive":
+        return interactive_restart()
+    else:
+        print_results()
+    return 0
 
 
 if __name__ == "__main__":
