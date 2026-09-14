@@ -1,0 +1,696 @@
+#!/usr/bin/env bash
+# ============================================================================
+# needrestart-ss - script-server wrapper for plain needrestart (host level).
+#
+# Installed on the cdist control host as ~cdist/bin/needrestart-ss and invoked
+# by the script-server runners in /etc/script-server-dev/runners/ as
+# `sudo -u cdist -i needrestart-ss ...`. It reaches the managed hosts over the
+# cdist user's root SSH and runs needrestart there in batch mode.
+#
+# Host list: cdist explorer data - hosts whose explorer `packages` file lists
+# the needrestart package (fresh on every cdist run of that host).
+#
+# Containers are filtered out on the wrapper side (NEEDRESTART-CONT lines are
+# ignored): LXC containers are handled by the separate needrestart-lxc
+# tooling (script-server runner group needrestart-lxc).
+#
+# Subcommands:
+#   hosts
+#       Print the host FQDNs whose explorer package list contains
+#       needrestart, one per line - the runners' dynamic Hosts value list.
+#   status [--all-hosts] HOST [HOST...]
+#       Per-host HTML report (batch scan: `needrestart -b -w`) of services
+#       running outdated libraries, kernel and microcode status, and user
+#       sessions. Service rows deep-link into the "needrestart restart"
+#       runner with Host and Services pre-filled (Action pinned to restart).
+#   services --hosts FQDN[,FQDN...]
+#       List the flagged systemd service units on the given host(s), one per
+#       line as "host:unit" - the value list for the restart runner's
+#       dynamic Services multiselect.
+#   restart --hosts FQDN[,FQDN...] [--targets h1:svc1,h2:svc2]
+#           [--exclude REGEX] [--action dry-run|restart] [--allow-all]
+#       Restart selected services with `systemctl restart` over SSH (dry run
+#       previews without changing anything). Each host is scanned fresh and
+#       only still-flagged selections are processed; guards mirror
+#       needrestart's own logic: RefuseManualStop units and findings that are
+#       not plain systemd service units are skipped and reported.
+# ============================================================================
+set -u
+
+SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
+GUARD_TIMEOUT=30          # systemctl show timeout, seconds
+RESTART_TIMEOUT=300       # systemctl restart timeout, seconds
+RESTART_RUNNER="nr-restart"
+ACTION_RESTART_UI="Restart selected services"
+
+# KEEP IN SYNC: RESTART_RUNNER must be the runner JSON's `name` and
+# ACTION_RESTART_UI the UI label of its Action=restart option (deep links must
+# pass the values_ui_mapping label, not the raw script value).
+
+usage() {
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+list_hosts() {
+    # Hosts where needrestart is installed, per cdist explorer data
+    # (/home/cdist/explore/<fqdn>/packages, one "name version" per line).
+    local packages_file fqdn
+    for packages_file in /home/cdist/explore/*/packages; do
+        [[ -r "$packages_file" ]] || continue
+        grep -q '^needrestart ' "$packages_file" || continue
+        fqdn=$(basename "$(dirname "$packages_file")")
+        printf '%s\n' "$fqdn"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# scanning
+# ---------------------------------------------------------------------------
+
+# run_scan <host> <outfile> <errfile>
+# Fresh batch scan on one host; report to outfile, notes to errfile.
+# -l -k -w select the checks (batch services + kernel + microcode):
+# needrestart only defaults to all checks when NONE of them is passed, so
+# all three must be given explicitly. needrestart skips kernel checks itself
+# inside containers (KSTA lines absent) and microcode checks on VMs and
+# containers (UCSTA line absent).
+run_scan() {
+    local host=$1 out=$2 err=$3
+    timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
+        "timeout $SCAN_TIMEOUT needrestart -b -l -k -w" >"$out" 2>"$err"
+}
+
+# extract_flagged <outfile>
+# Fill FLAGGED_UNITS (plain systemd service units) and FLAGGED_OTHER
+# (interpreter/process findings etc.) from a scan output file.
+extract_flagged() {
+    local out=$1
+    mapfile -t FLAGGED_UNITS < <(
+        sed -n 's/^NEEDRESTART-SVC: //p' "$out" \
+            | grep -E '^[A-Za-z0-9@.:_-]+\.service$' | sort -u)
+    mapfile -t FLAGGED_OTHER < <(
+        sed -n 's/^NEEDRESTART-SVC: //p' "$out" \
+            | grep -vE '^[A-Za-z0-9@.:_-]+\.service$' | sort -u)
+}
+
+# is_flagged <unit>
+# Whether the unit is in FLAGGED_UNITS (exact match).
+is_flagged() {
+    local unit=$1 u
+    for u in "${FLAGGED_UNITS[@]}"; do
+        [[ $u == "$unit" ]] && return 0
+    done
+    return 1
+}
+
+# shquote <string>
+# POSIX-safe single-quoted form for embedding into a remote shell command.
+# ssh re-joins argv into one string and runs it through the remote login
+# shell, so unquoted user input from the script-server UI would be
+# interpreted there (as root on the target host).
+shquote() {
+    local s=${1//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+do_status() {
+    local hosts=()
+    local all_hosts=0
+    while (($#)); do
+        case $1 in
+            --all-hosts) all_hosts=1; shift ;;
+            -h|--help) usage ;;
+            *) hosts+=("$1"); shift ;;
+        esac
+    done
+    if [[ $all_hosts == 1 ]]; then
+        # 'All hosts' wins over an explicit selection: report on every host
+        # with needrestart installed (same list the Hosts pulldown uses).
+        hosts=()
+        local hh
+        while IFS= read -r hh; do hosts+=("$hh"); done < <(list_hosts)
+    fi
+    ((${#hosts[@]})) || {
+        echo "no hosts selected (pick hosts in the pulldown, or tick 'All hosts')" >&2
+        exit 1
+    }
+
+    # Global (not local): the EXIT trap below must still see it at script
+    # exit, where function locals are out of scope (set -u would abort).
+    STATUS_TMP=$(mktemp -d)
+    trap 'rm -rf "$STATUS_TMP"' EXIT
+
+    local h pids=()
+    for h in "${hosts[@]}"; do
+        : >"$STATUS_TMP/$h.json"; : >"$STATUS_TMP/$h.err"; : >"$STATUS_TMP/$h.rc"
+        ( if run_scan "$h" "$STATUS_TMP/$h.json" "$STATUS_TMP/$h.err"; then
+              echo 0 >"$STATUS_TMP/$h.rc"
+          else
+              echo $? >"$STATUS_TMP/$h.rc"
+          fi ) &
+        pids+=("$!")
+    done
+    local rc=0
+    for p in "${pids[@]}"; do wait "$p" || rc=1; done
+
+    python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$ACTION_RESTART_UI" <<'PYEOF'
+import glob, html, os, re, sys
+from datetime import datetime
+from urllib.parse import quote
+
+tmpdir, restart_runner, action_restart_ui = sys.argv[1], sys.argv[2], sys.argv[3]
+runner_enc = quote(restart_runner, safe="")
+UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+# UI label of the restart runner's Action=restart option. The deep link must
+# pass this mapped label, not the raw script value: the UI sees list values
+# through values_ui_mapping (see runners/needrestart-restart.json), so a raw
+# "restart" would match no option and render the select empty. KEEP IN SYNC
+# with values_ui_mapping in the runner JSON.
+def restart_query(host, svals):
+    # repeated query keys: the runner's Hosts and Services params are
+    # multiselects whose prefill expects arrays (comma strings are NOT split).
+    # Action= is pinned to restart: with any predefinedParameters present, the
+    # UI's reloaded-model handler replaces the value state with exactly the
+    # deep-link params, so parameters NOT in the link get no value at all (the
+    # runner default does NOT apply). With the forceAllowedValues frontend
+    # patch (script-server-dev recipe) the forced values are also not wiped
+    # while the dependent Services list is still loading.
+    parts = [f"Hosts={quote(host, safe='')}"]
+    parts += [f"Services={quote(host + ':' + v, safe='')}" for v in svals]
+    parts.append(f"Action={quote(action_restart_ui, safe='')}")
+    return "&amp;".join(parts)
+
+
+def restart_link(host, sval):
+    return f"#/{runner_enc}?{restart_query(host, [sval])}"
+
+
+# NEEDRESTART-KSTA: 0 unknown, 1 up-to-date, 2 ABI update pending,
+# 3 version upgrade pending (2/3 = reboot required). The lines are absent
+# when needrestart skips kernel checks (inside a container).
+KERNEL_TEXT = {
+    None: "not reported (skipped: container)",
+    0: "unknown",
+    1: "up to date",
+    2: "reboot required (ABI update)",
+    3: "reboot required (version update)",
+}
+
+# NEEDRESTART-UCSTA: 0 unknown, 1 current, 2 obsolete microcode
+# (2 = update loaded at the next reboot). The line is absent on VMs and
+# containers (needrestart skips microcode checks there).
+UCODE_TEXT = {
+    None: "not reported (VM/container)",
+    0: "unknown",
+    1: "current",
+    2: "update pending (reboot required)",
+}
+
+
+def parse(text):
+    services, sessions = [], []
+    ksta = ucsta = None
+    kcur = kexp = uccur = ucexp = None
+    for line in text.splitlines():
+        key, sep, val = line.partition(": ")
+        if not sep:
+            continue
+        # NEEDRESTART-CONT lines are deliberately ignored: containers are
+        # handled by the separate needrestart-lxc tooling (wrapper-side
+        # filter, no host config change).
+        if key == "NEEDRESTART-SVC":
+            services.append(val.strip())
+        elif key == "NEEDRESTART-SESS":
+            sessions.append(val.strip())
+        elif key == "NEEDRESTART-KSTA":
+            try:
+                ksta = int(val)
+            except ValueError:
+                pass
+        elif key == "NEEDRESTART-KCUR":
+            kcur = val
+        elif key == "NEEDRESTART-KEXP":
+            kexp = val
+        elif key == "NEEDRESTART-UCSTA":
+            try:
+                ucsta = int(val)
+            except ValueError:
+                pass
+        elif key == "NEEDRESTART-UCCUR":
+            uccur = val
+        elif key == "NEEDRESTART-UCEXP":
+            ucexp = val
+    return services, sessions, ksta, ucsta, kcur, kexp, uccur, ucexp
+
+
+def kernel_note(ksta, kcur, kexp):
+    note = KERNEL_TEXT.get(ksta, "unknown")
+    if ksta in (2, 3) and kcur and kexp:
+        note += f": running {kcur}, available {kexp}"
+    return note
+
+
+def ucode_note(ucsta, uccur, ucexp):
+    note = UCODE_TEXT.get(ucsta, "unknown")
+    if ucsta == 2 and uccur and ucexp:
+        note += f": running {uccur}, available {ucexp}"
+    return note
+
+
+# Host state badge: reboot pending (red) outranks services to restart (amber),
+# clean (green) last.
+STATE = {0: ("#1a7f37", "clean"), 1: ("#9a6700", "restart"),
+         2: ("#cf222e", "reboot")}
+
+
+def badge(state):
+    color, label = STATE.get(state, ("#6e7781", f"state {state}"))
+    return (f'<span style="background:{color};color:#fff;padding:1px 8px;'
+            f'border-radius:10px;font-size:smaller">{label}</span>')
+
+
+def host_state(services, ksta, ucsta):
+    if ksta in (2, 3) or ucsta == 2:
+        return 2
+    if services:
+        return 1
+    return 0
+
+
+# Interactive report (checkboxes + buttons) requires script-server's
+# output_format=html_iframe: the plain html format is DOMPurify-sanitized,
+# which strips <script>. The runner JSON sets html_iframe; the output is a
+# complete HTML document written into the iframe's srcdoc, so a full document
+# with <style> and <script> is fine here. The iframe element itself gets the
+# .log-content class in the run page (fixed height, own scrollbar). JS jumps
+# to the parent app's runner via window.top (same-origin srcdoc).
+print("<!DOCTYPE html><html><head><meta charset='utf-8'><style>")
+print("body{font-family:'Segoe UI',Helvetica,Arial,sans-serif;margin:8px}")
+print("table{border-collapse:collapse;font-size:small}")
+print("td,th{white-space:nowrap;text-align:left}")
+print("td.service{max-width:48ch;overflow:hidden;text-overflow:ellipsis}")
+print("td.sel{text-align:center;width:1%}")
+print("button{padding:2px 10px;font-size:smaller;cursor:pointer}")
+print("p.failed{color:#cf222e}")
+print("p.notes{font-size:smaller;color:#6e7781}")
+print("p.meta{font-size:smaller}")
+print("p.reboot{color:#cf222e;font-size:smaller}")
+print("label.all{font-size:smaller;cursor:pointer}")
+print("</style><script>")
+print(f"var RUNNER = {restart_runner!r};")
+print(f"var ACTION_RESTART_UI = {action_restart_ui!r};")
+print("""
+function toggleAll(master, hostOnly) {
+    var scope = hostOnly ? master.closest('table') : document;
+    var boxes = scope.querySelectorAll('input.ssel');
+    for (var i = 0; i < boxes.length; i++) boxes[i].checked = master.checked;
+}
+function goSelected() {
+    // collect ticked services as host-qualified values (host:unit); the
+    // restart runner takes repeated Hosts= and Services= query params
+    var hosts = [], services = [], seen = {};
+    var tables = document.querySelectorAll('table[data-host]');
+    for (var t = 0; t < tables.length; t++) {
+        var host = tables[t].getAttribute('data-host');
+        var boxes = tables[t].querySelectorAll('input.ssel:checked');
+        for (var i = 0; i < boxes.length; i++) {
+            if (!seen[host]) { seen[host] = 1; hosts.push(host); }
+            services.push(host + ':' + boxes[i].value);
+        }
+    }
+    if (!services.length) { alert('No services selected.'); return; }
+    // Action is pinned to restart (UI-mapped label): parameters missing from
+    // the deep link get no value at all, the runner default does NOT apply
+    var q = '';
+    for (var i = 0; i < hosts.length; i++)
+        q += '&Hosts=' + encodeURIComponent(hosts[i]);
+    for (var i = 0; i < services.length; i++)
+        q += '&Services=' + encodeURIComponent(services[i]);
+    q += '&Action=' + encodeURIComponent(ACTION_RESTART_UI);
+    window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
+}
+</script></head><body>""")
+CONTROLS = ("<label class=all title='tick to select/deselect every service on every host'>"
+            "<input type=checkbox onchange=\"toggleAll(this)\"> all</label> &nbsp; "
+            "<button onclick='goSelected()' "
+            "title='open the restart runner with all ticked services (across hosts); "
+            "Action preselected to restart'>"
+            "go to restart</button>")
+print(f"<p class=meta>generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} "
+      f"&nbsp; {CONTROLS}</p>")
+
+total_svc = total_sess = total_reboot = 0
+excluded = []
+files = sorted(glob.glob(os.path.join(tmpdir, "*.json")))
+shown = []
+for path in files:
+    host = os.path.basename(path)[:-len(".json")]
+    err = open(path[:-len("json")] + "err").read().strip()
+    rc = open(path[:-len("json")] + "rc").read().strip()
+    try:
+        text = open(path).read()
+        # needrestart is silent only when it failed: treat a non-zero rc
+        # without a batch header as a failed scan, never as "clean".
+        if rc != "0" and "NEEDRESTART-VER" not in text:
+            raise ValueError
+        (services, sessions, ksta, ucsta,
+         kcur, kexp, uccur, ucexp) = parse(text)
+    except ValueError:
+        services = None
+
+    if services is None:
+        excluded.append(f"{host} (unreachable)")
+        continue
+
+    state = host_state(services, ksta, ucsta)
+    if not services and state != 2:
+        # nothing actionable: no flagged services and no pending reboot
+        # (session-only findings are not actionable either)
+        excluded.append(f"{host} (clean)")
+        continue
+
+    shown.append((state, host, services, sessions, ksta, ucsta,
+                  kcur, kexp, uccur, ucexp, err, rc))
+
+# reboot-pending hosts first, then hosts with services; name within each
+shown.sort(key=lambda t: (-t[0], t[1]))
+
+for (state, host, services, sessions, ksta, ucsta,
+     kcur, kexp, uccur, ucexp, err, rc) in shown:
+    total_svc += len(services)
+    total_sess += len(sessions)
+    if state == 2:
+        total_reboot += 1
+    print(f"<h3>{esc(host)} {badge(state)}</h3>")
+    print(f'<p class=meta>'
+          f"{len(services)} service(s) with outdated libraries &bull; "
+          f"kernel: {esc(kernel_note(ksta, kcur, kexp))} &bull; "
+          f"microcode: {esc(ucode_note(ucsta, uccur, ucexp))} &bull; "
+          f'<a target="_top" title="open the needrestart-lxc list runner '
+          f'for this host" '
+          f'href="#/list?Hosts={quote(host, safe="")}">LXC containers</a>'
+          f"</p>")
+    if state == 2:
+        print("<p class=reboot>reboot required: kernel or microcode update "
+              "is pending - services restarted here may need the reboot "
+              "too before all updates are active.</p>")
+    if services:
+        print(f'<table border=1 cellpadding=4 cellspacing=0 data-host="{esc(host)}">')
+        print(f"<tr><th title='tick to select/deselect all services of this host'>"
+              f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th>"
+              f"<th>Service</th><th>Type</th></tr>")
+        # restartable .service units first, other findings (interpreter /
+        # non-systemd, never restarted by the wrapper) after; alphabetical.
+        units = sorted(s for s in services if UNIT_RE.match(s))
+        others = [s for s in services if not UNIT_RE.match(s)]
+        for svc in units:
+            href = restart_link(host, svc)
+            sel = f'<input type=checkbox class=ssel value="{esc(svc)}">'
+            print(f'<tr><td class=sel>{sel}</td>'
+                  f'<td class=service><a target="_top" href="{href}" '
+                  f'title="open restart runner with this service">'
+                  f'{esc(svc)}</a></td>'
+                  f"<td>systemd unit</td></tr>")
+        for svc in others:
+            print(f'<tr><td class=sel></td><td class=service>{esc(svc)}</td>'
+                  f"<td>manual (not a systemd unit)</td></tr>")
+        print("</table>")
+    else:
+        print("<p class=notes>no services to restart; host shown for the "
+              "pending reboot.</p>")
+    if sessions:
+        print(f"<p class=notes>user sessions with outdated libraries "
+              f"(not restartable):<br>"
+              f"{esc(chr(10).join(sessions)).replace(chr(10), '<br>')}</p>")
+
+if excluded:
+    print(f"<p class=notes>{len(excluded)} host(s) not shown: "
+          f"{esc(', '.join(excluded))}</p>")
+print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_sess} session(s), "
+      f"{total_reboot} host(s) with a pending reboot - shown for "
+      f"{len(shown)} of {len(files)} host(s).</p>")
+print(f"<p>{CONTROLS}</p>")
+print("</body></html>")
+PYEOF
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# services (value list for the restart runner's Services multiselect)
+# ---------------------------------------------------------------------------
+
+do_services() {
+    # script-server splits the rendered values-script command with shlex
+    # (shell=false), which eats the quotes, so ${Hosts} arrives as word
+    # fragments: --hosts [h1, h2] -> tokens "[h1," "h2]". Collect all
+    # non-flag tokens, strip the list-repr artifacts, re-validate.
+    local -a raw=()
+    while (($#)); do
+        case $1 in
+            --host|--hosts) shift ;;
+            -h|--help) usage ;;
+            *) raw+=("$1"); shift ;;
+        esac
+    done
+    ((${#raw[@]})) || { echo "--hosts is required" >&2; exit 1; }
+    local hostspec
+    hostspec=$(printf '%s' "${raw[*]}" | tr -d "[]'\" ")
+    [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+        || { echo "bad --hosts format (expected host[,host...]): got '$hostspec'" >&2; exit 1; }
+
+    # Fresh scan per host (there is no needrestart cache like needrestart-lxc
+    # has), all hosts in parallel, and emit one line per flagged systemd
+    # service unit as "host:unit" (host-qualified so services on different
+    # hosts cannot collide). Non-unit findings are not offered: the restart
+    # action never touches them.
+    # script-server raises an ExecutionException for a non-zero values
+    # script, which empties the WHOLE multiselect - so a single unreachable
+    # host must not fail the run: values for the reachable hosts are still
+    # emitted (stderr notes report the failures) and only an all-failed run
+    # exits non-zero.
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    local -a hostlist
+    IFS=',' read -ra hostlist <<< "$hostspec"
+    local h pids=() failed=0 ok=0
+    for h in "${hostlist[@]}"; do
+        : >"$tmpdir/$h.out"; : >"$tmpdir/$h.err"; : >"$tmpdir/$h.rc"
+        ( if run_scan "$h" "$tmpdir/$h.out" "$tmpdir/$h.err"; then
+              echo 0 >"$tmpdir/$h.rc"
+          else
+              echo $? >"$tmpdir/$h.rc"
+          fi ) &
+        pids+=("$!")
+    done
+    local p
+    for p in "${pids[@]}"; do wait "$p" || true; done
+    for h in "${hostlist[@]}"; do
+        if [[ $(<"$tmpdir/$h.rc") != 0 ]]; then
+            echo "scan failed on $h: $(tail -n1 "$tmpdir/$h.err")" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+        ok=$((ok + 1))
+        extract_flagged "$tmpdir/$h.out"
+        local unit
+        for unit in "${FLAGGED_UNITS[@]}"; do
+            printf '%s:%s\n' "$h" "$unit"
+        done
+    done
+    if [[ $ok == 0 ]]; then
+        echo "scan failed on every selected host" >&2
+        exit 1
+    fi
+    trap - EXIT
+}
+
+# ---------------------------------------------------------------------------
+# restart
+# ---------------------------------------------------------------------------
+
+# unit_guard <host> <unit>
+# Replicate needrestart's own restart guards remotely; print a skip reason on
+# stdout when the unit must not be restarted, print nothing when it may be.
+unit_guard() {
+    local host=$1 unit=$2 show load ref
+    show=$(timeout $GUARD_TIMEOUT ssh "${SSH_OPTS[@]}" "$host" -- \
+        "systemctl show -p LoadState -p RefuseManualStop --value $(shquote "$unit")") \
+        || { printf 'systemctl show failed on %s' "$host"; return; }
+    load=$(sed -n 1p <<<"$show")
+    ref=$(sed -n 2p <<<"$show")
+    if [[ $load == not-found ]]; then
+        printf 'not a systemd unit on this host'
+    elif [[ $load == masked ]]; then
+        printf 'unit is masked'
+    elif [[ $ref == yes ]]; then
+        printf 'RefuseManualStop=yes (needrestart skips it too)'
+    fi
+}
+
+do_restart() {
+    # One entry point for all restarts; hosts and service lists are
+    # restricted to hostname/unit-ish characters (they end up as ssh
+    # destination / shquoted remote args); anything else is rejected, never
+    # passed on.
+    #   --hosts h1,h2             run on these host(s)
+    #   --targets h1:svc1,h2:svc2 (from the status report; host-qualified)
+    #   --exclude RE, --action dry-run|restart
+    #   --allow-all     permit restarting ALL flagged services when no
+    #                   targets are given (safety: without it, a real restart
+    #                   with an empty service selection is refused)
+    # Each host is scanned fresh and only still-flagged selections are
+    # processed; execution is sequential in one terminal, exit code is
+    # non-zero if any host failed.
+    local hostspec="" exclude="" action="restart" allow_all=0
+    while (($#)); do
+        case $1 in
+            --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    hostspec=$2; shift 2 ;;
+            --targets) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    targets=$2; shift 2 ;;
+            --exclude) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    exclude=$2; shift 2 ;;
+            --action) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
+                    action=$2; shift 2 ;;
+            --allow-all) allow_all=1; shift ;;
+            -h|--help) usage ;;
+            *) echo "unknown restart option: $1"; exit 1 ;;
+        esac
+    done
+    [[ $action == dry-run || $action == restart ]] \
+        || { echo "bad --action: $action"; exit 1; }
+    if [[ -n $exclude ]]; then
+        # reject invalid regexes early (bash reports rc 2 for those)
+        [[ x =~ $exclude ]] 2>/dev/null
+        local re_rc=$?
+        [[ $re_rc == 2 ]] \
+            && { echo "invalid --exclude regex: $exclude" >&2; exit 1; }
+    fi
+    [[ -n $hostspec || -n ${targets:-} ]] \
+        || { echo "--hosts or --targets is required"; exit 1; }
+
+    # Build the ordered per-host grouping: hosts_list + groups[host]=csv
+    local -A groups=()
+    local -a hostlist=()
+    if [[ -n ${targets:-} ]]; then
+        [[ $targets =~ ^[A-Za-z0-9.-]+:[A-Za-z0-9._@-]+(,[A-Za-z0-9.-]+:[A-Za-z0-9._@-]+)*$ ]] \
+            || { echo "bad --targets format (expected comma-separated host:service pairs)"; exit 1; }
+        local -a toks
+        local tok h sv
+        IFS=',' read -ra toks <<< "$targets"
+        for tok in "${toks[@]}"; do
+            h=${tok%%:*}
+            sv=${tok#*:}
+            if [[ -z ${groups[$h]+x} ]]; then
+                hostlist+=("$h")
+                groups[$h]=$sv
+            else
+                [[ ,${groups[$h]}, == *,$sv,* ]] || groups[$h]+=",$sv"
+            fi
+        done
+    else
+        [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+            || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
+        IFS=',' read -ra hostlist <<< "$hostspec"
+        for h in "${hostlist[@]}"; do groups[$h]=""; done
+    fi
+
+    # Safety: an empty Services selection means "ALL flagged services on
+    # every selected host". A real restart without explicit targets therefore
+    # requires --allow-all; dry-run always previews everything.
+    if [[ $action == restart && $allow_all != 1 ]]; then
+        local hh has_targets=0
+        for hh in "${hostlist[@]}"; do
+            if [[ -n ${groups[$hh]} ]]; then has_targets=1; fi
+        done
+        if [[ $has_targets == 0 ]]; then
+            echo "refusing to restart ALL flagged services: no services selected" >&2
+            echo "(tick services, or tick 'Allow all' in the UI / pass --allow-all)" >&2
+            exit 1
+        fi
+    fi
+
+    local rc=0 h csv unit reason out err
+    out=$(mktemp); err=$(mktemp)
+    trap 'rm -f "$out" "$err"' EXIT
+    for h in "${hostlist[@]}"; do
+        echo "=== $h ==="
+        if ! run_scan "$h" "$out" "$err"; then
+            echo "scan failed on $h (rc $?); skipping host"
+            tail -n 3 "$err" | sed 's/^/    /'
+            rc=1
+            continue
+        fi
+        extract_flagged "$out"
+
+        csv=${groups[$h]}
+        local -a selected=()
+        if [[ -n $csv ]]; then
+            IFS=',' read -ra selected <<< "$csv"
+        else
+            # explicit --allow-all: every flagged unit on the host
+            selected=("${FLAGGED_UNITS[@]}")
+            ((${#selected[@]})) \
+                || { echo "nothing flagged (clean)"; continue; }
+        fi
+
+        for unit in "${selected[@]}"; do
+            is_flagged "$unit" \
+                || { echo "  $unit: no longer flagged, skipped"; continue; }
+            if [[ -n $exclude ]] && [[ $unit =~ $exclude ]]; then
+                echo "  $unit: matches exclude regex, skipped"
+                continue
+            fi
+            reason=$(unit_guard "$h" "$unit")
+            if [[ -n $reason ]]; then
+                echo "  $unit: skipped ($reason)"
+                continue
+            fi
+            if [[ $action == dry-run ]]; then
+                echo "  (dry run) systemctl restart $unit"
+            else
+                echo "  restarting $unit"
+                if ! timeout $RESTART_TIMEOUT ssh "${SSH_OPTS[@]}" "$h" -- \
+                    "systemctl restart $(shquote "$unit")"; then
+                    echo "  $unit: systemctl restart FAILED"
+                    rc=1
+                fi
+            fi
+        done
+        ((${#FLAGGED_OTHER[@]})) && {
+            echo "  manual (not systemd units, not restarted):"
+            local other
+            for other in "${FLAGGED_OTHER[@]}"; do echo "    $other"; done
+        }
+    done
+    rm -f "$out" "$err"
+    trap - EXIT
+    [[ $rc == 0 ]] && echo "all hosts ok" || echo "SOME HOSTS FAILED"
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    hosts)     shift; list_hosts "$@" ;;
+    status)    shift; do_status "$@" ;;
+    services)  shift; do_services "$@" ;;
+    restart)   shift; do_restart "$@" ;;
+    -h|--help|"") usage ;;
+    *) echo "unknown subcommand: $1"; usage ;;
+esac
