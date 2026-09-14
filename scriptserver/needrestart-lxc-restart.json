@@ -1,7 +1,7 @@
 {
-  "name": "restart",
+  "name": "nrlxc-restart",
   "script_path": "sudo -u cdist -i needrestart-lxc-ss restart",
-  "description": "Restart flagged services in LXC containers, on one or several Proxmox hosts in one run.\n\nYou normally get here from the **list** report: tick containers there (any host) and click **go to restart** — Hosts and Containers are then prefilled. Or pick host(s) below:\n\n- **Containers** prefills from each selected host's cached report as `host:container` entries. With an **empty** Containers selection a real restart is **refused** unless **Allow all** is ticked (dry run always previews everything flagged).\n- The run scans each host fresh and processes them sequentially.\n- **Dry run** shows exactly what would be restarted and does nothing; **Restart all flagged services** runs `needrestart-lxc -r` per host (`systemctl restart`, with escalation to kill + start and SIGKILL when KillMode leaves children behind). Non-systemd processes and scope units are reported but never touched automatically.",
+  "description": "Restart flagged services in LXC containers.",
   "group": "needrestart-lxc",
   "requires_terminal": true,
   "parameters": [

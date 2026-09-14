@@ -39,7 +39,7 @@ set -euo pipefail
 
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
-RESTART_RUNNER="restart"
+RESTART_RUNNER="nrlxc-restart"
 
 usage() {
     awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"

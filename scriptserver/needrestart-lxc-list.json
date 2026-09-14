@@ -1,7 +1,7 @@
 {
-  "name": "list",
+  "name": "nrlxc-list",
   "script_path": "sudo -u cdist -i needrestart-lxc-ss status",
-  "description": "Which LXC containers on the Proxmox hosts have services running outdated libraries?\n\nFor every selected host a table shows the containers, their state (clean / restart / CVEs) and the affected services with CVE verdicts. Rows with work to do deep-link into the **restart** runner with host and container pre-filled (the Action there keeps its default, restart).\n\n- **All hosts** (checkbox) runs the report on every host that has needrestart-lxc deployed - no need to pick hosts in the pulldown. When it is ticked the Hosts selection is ignored.\n- Without the checkbox, pick one or more hosts in the **Hosts** pulldown.\n- **Scan now** runs a fresh scan on each host (a few seconds; also warms the hosts' 24h CVE cache). This is the default.\n- **Cached** reads the JSON the hosts' 15-minute cron generates (instant, up to 15 minutes old).",
+  "description": "Which LXC containers on the Proxmox hosts have services running outdated libraries.",
   "group": "needrestart-lxc",
   "requires_terminal": false,
   "output_format": "html_iframe",
