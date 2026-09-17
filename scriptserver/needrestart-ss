@@ -21,8 +21,10 @@
 #   status [--all-hosts] HOST [HOST...]
 #       Per-host HTML report (batch scan: `needrestart -b -w`) of services
 #       running outdated libraries, kernel and microcode status, and user
-#       sessions. Service rows deep-link into the "needrestart restart"
-#       runner with Host and Services pre-filled (Action pinned to restart).
+#       sessions. Rows flag services needrestart would defer as potentially
+#       invasive (Invasive column). Service rows deep-link into the
+#       "needrestart restart" runner with Host and Services pre-filled
+#       (Action pinned to restart).
 #   services --hosts FQDN[,FQDN...]
 #       List the flagged systemd service units on the given host(s), one per
 #       line as "host:unit" - the value list for the restart runner's
@@ -49,7 +51,7 @@ ACTION_RESTART_UI="Restart selected services"
 # pass the values_ui_mapping label, not the raw script value).
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"
     exit 1
 }
 
@@ -171,6 +173,34 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
 
 def esc(s):
     return html.escape(str(s), quote=True)
+
+
+# Services needrestart defers by default (override_rc => 0 / blacklist_rc):
+# restarting them is potentially invasive. Copy of needrestart's shipped
+# defaults; local conf.d customisations on the host are not reflected (same
+# built-in list as the LXC path).
+INVASIVE_PATTERNS = [re.compile(p) for p in (
+    r"^dbus",
+    r"^gdm", r"^greetd", r"^kdm", r"^nodm", r"^sddm", r"^wdm", r"^xdm",
+    r"^lightdm", r"^slim", r"^lxdm", r"^xrdp",
+    r"^bird", r"^network", r"^NetworkManager", r"^ModemManager",
+    r"^wpa_supplicant", r"^ifup", r"^openvpn", r"^quagga", r"^frr",
+    r"^tinc", r"^(open|free|libre|strong)swan", r"^bluetooth",
+    r"^getty@.+\.service", r"^serial-getty@.+\.service",
+    r"^user@\d+\.service",
+    r"^usbguard\.service$", r"^zfs-fuse", r"^mythtv-backend", r"^xendomains",
+    r"^lxc", r"^lxcfs", r"^libvirt", r"^virtlogd", r"^virtlockd", r"^docker",
+    r"^bacula-", r"^qrtr-ns", r"^rmtfs",
+    r"^emergency\.service$", r"^rescue\.service$", r"^elogind",
+    r"^apt-daily\.service$", r"^apt-daily-upgrade\.service$",
+    r"^unattended-upgrades\.service$", r"^cron-.*\.service$",
+    r"^rc-local\.service$",
+    r"^systemd-logind", r"^systemd-nspawn",
+)]
+
+
+def is_invasive(service):
+    return any(p.search(service) for p in INVASIVE_PATTERNS)
 
 
 # UI label of the restart runner's Action=restart option. The deep link must
@@ -302,6 +332,8 @@ print("table{border-collapse:collapse;font-size:small}")
 print("td,th{white-space:nowrap;text-align:left}")
 print("td.service{max-width:48ch;overflow:hidden;text-overflow:ellipsis}")
 print("td.sel{text-align:center;width:1%}")
+print("span.inv{background:#9a6700;color:#fff;padding:1px 8px;border-radius:10px;")
+print("font-size:smaller;white-space:nowrap}")
 print("button{padding:2px 10px;font-size:smaller;cursor:pointer}")
 print("p.failed{color:#cf222e}")
 print("p.notes{font-size:smaller;color:#6e7781}")
@@ -410,7 +442,9 @@ for (state, host, services, sessions, ksta, ucsta,
         print(f'<table border=1 cellpadding=4 cellspacing=0 data-host="{esc(host)}">')
         print(f"<tr><th title='tick to select/deselect all services of this host'>"
               f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th>"
-              f"<th>Service</th><th>Type</th></tr>")
+              f"<th>Service</th><th>Type</th>"
+              f"<th title='services needrestart would defer restarting as potentially invasive'>"
+              f"Invasive</th></tr>")
         # restartable .service units first, other findings (interpreter /
         # non-systemd, never restarted by the wrapper) after; alphabetical.
         units = sorted(s for s in services if UNIT_RE.match(s))
@@ -418,14 +452,20 @@ for (state, host, services, sessions, ksta, ucsta,
         for svc in units:
             href = restart_link(host, svc)
             sel = f'<input type=checkbox class=ssel value="{esc(svc)}">'
+            inv = ('<span class=inv title="needrestart would defer restarting '
+                   'this service by default">&#9888; deferred</span>'
+                   if is_invasive(svc) else "")
             print(f'<tr><td class=sel>{sel}</td>'
                   f'<td class=service><a target="_top" href="{href}" '
                   f'title="open restart runner with this service">'
                   f'{esc(svc)}</a></td>'
-                  f"<td>systemd unit</td></tr>")
+                  f"<td>systemd unit</td><td>{inv}</td></tr>")
         for svc in others:
+            inv = ('<span class=inv title="needrestart would defer restarting '
+                   'this service by default">&#9888; deferred</span>'
+                   if is_invasive(svc) else "")
             print(f'<tr><td class=sel></td><td class=service>{esc(svc)}</td>'
-                  f"<td>manual (not a systemd unit)</td></tr>")
+                  f"<td>manual (not a systemd unit)</td><td>{inv}</td></tr>")
         print("</table>")
     else:
         print("<p class=notes>no services to restart; host shown for the "

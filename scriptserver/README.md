@@ -20,7 +20,9 @@ needrestart-lxc across all Proxmox hosts managed by cdist.
 ### list (read-only)
 
 HTML report per host: containers, state badge (clean / restart / CVEs),
-services and CVE verdicts. Two data sources:
+services and CVE verdicts. Containers whose flagged services include ones
+needrestart would defer as potentially invasive show an **Invasive** badge
+(count, with the service names on hover). Two data sources:
 
 - **Scan now** (default): `ssh <host> /usr/local/bin/needrestart-lxc --zabbix` —
   fresh scan including CVE analysis; also warms the host's 24h CVE API cache
@@ -44,7 +46,10 @@ Each host is scanned fresh and processed sequentially with live terminal
 output. `restart` is the default action; select `dry-run` to preview first.
 Restarting includes the escalation ladder (restart → kill + start → SIGKILL).
 Non-systemd processes and scope units are reported but never restarted
-automatically, mirroring the script's own safety rules.
+automatically, mirroring the script's own safety rules. Potentially invasive
+services (needrestart's deferred list, shown in the report's Invasive column)
+are restarted like any other flagged service; that marking is informational and
+does not skip them.
 
 ## Installation / update
 

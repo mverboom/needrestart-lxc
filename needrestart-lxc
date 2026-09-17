@@ -82,6 +82,39 @@ DBUS_DEPENDENT_SERVICES = [
     "ModemManager.service",
 ]
 
+# Services needrestart does NOT restart by default because restarting them is
+# potentially invasive/disruptive: its shipped $nrconf{override_rc} entries
+# mapped to 0 (deferred) plus the default $nrconf{blacklist_rc} (empty
+# upstream). Mirrors upstream needrestart's defaults; local
+# /etc/needrestart/conf.d overrides are NOT consulted, so a locally customised
+# service may be marked differently here.
+INVASIVE_PATTERNS = [re.compile(p) for p in (
+    r"^dbus",                                  # D-Bus
+    # display managers
+    r"^gdm", r"^greetd", r"^kdm", r"^nodm", r"^sddm", r"^wdm", r"^xdm",
+    r"^lightdm", r"^slim", r"^lxdm", r"^xrdp",
+    # networking
+    r"^bird", r"^network", r"^NetworkManager", r"^ModemManager",
+    r"^wpa_supplicant", r"^ifup", r"^openvpn", r"^quagga", r"^frr",
+    r"^tinc", r"^(open|free|libre|strong)swan", r"^bluetooth",
+    # gettys
+    r"^getty@.+\.service", r"^serial-getty@.+\.service",
+    # systemd --user
+    r"^user@\d+\.service",
+    # misc
+    r"^usbguard\.service$", r"^zfs-fuse", r"^mythtv-backend", r"^xendomains",
+    r"^lxc", r"^lxcfs", r"^libvirt", r"^virtlogd", r"^virtlockd", r"^docker",
+    r"^bacula-", r"^qrtr-ns", r"^rmtfs",
+    # systemd
+    r"^emergency\.service$", r"^rescue\.service$", r"^elogind",
+    # oneshot / systemd-cron / rc-local
+    r"^apt-daily\.service$", r"^apt-daily-upgrade\.service$",
+    r"^unattended-upgrades\.service$", r"^cron-.*\.service$",
+    r"^rc-local\.service$",
+    # see Debian #798097 and #1101553
+    r"^systemd-logind", r"^systemd-nspawn",
+)]
+
 # Security scan configuration (CVE analysis)
 CACHE_TTL = 86400                     # seconds to keep cached API responses
 CACHE_DIR = "/var/cache/needrestart-lxc"
@@ -172,6 +205,13 @@ def is_blacklisted(path):
 
 def is_excluded(service):
     return any(re.search(pat, service) for pat in EXCLUDE_PATTERNS)
+
+
+def is_invasive(service):
+    """True if needrestart would defer restarting this service by default
+    (its override_rc => 0 / blacklist list), i.e. restarting it is
+    potentially invasive."""
+    return any(p.search(service) for p in INVASIVE_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -817,24 +857,31 @@ def interactive_restart():
     list_height = min(len(CONT_SERVICES), max(5, height - 8))
 
     # Build the checklist: tag = the 'ctid:user_uid:service' key (no spaces,
-    # safe as a whiptail tag), item = human-readable label, status = ON so
-    # every flagged service is pre-selected like needrestart does. The tag is
-    # hidden with --notags so only the readable label is shown.
+    # safe as a whiptail tag), item = human-readable label, status = ON. Like
+    # needrestart, services it would defer (potentially invasive: dbus,
+    # systemd-logind, networking, ...) are labelled and pre-selected OFF. The
+    # tag is hidden with --notags so only the readable label is shown.
     items = []
     for key in sorted(CONT_SERVICES):
         ctid, _rest = key.split(":", 1)
         user_uid, service = _rest.split(":", 1)
         ct_name = CT_NAMES.get(ctid, "unknown")
-        label = (f"{ct_name} ({ctid}): "
-                 f"{svc_display(user_uid, service, key in NON_SYSTEMD_KEYS)}")
+        invasive = is_invasive(service)
+        base = (f"{ct_name} ({ctid}): "
+                f"{svc_display(user_uid, service, key in NON_SYSTEMD_KEYS)}")
+        suffix = ""
         if SECURITY:
             cve_count = CONT_CVE_COUNTS.get(key, 0)
             if cve_count > 0:
                 plural = "" if cve_count == 1 else "s"
-                label += f" ({cve_count} CVE{plural})"
-        if len(label) > max_label:
-            label = label[:max_label - 3] + "..."
-        items.append((key, label, "ON"))
+                suffix += f" ({cve_count} CVE{plural})"
+        if invasive:
+            suffix += " [invasive]"
+        # Truncate the base only, so the markers always survive.
+        room = max_label - len(suffix)
+        if len(base) > room:
+            base = base[:max(1, room - 3)] + "..."
+        items.append((key, base + suffix, "OFF" if invasive else "ON"))
 
     cmd = ["whiptail", "--title", "needrestart-lxc: services to restart",
            "--notags", "--separate-output", "--checklist",
@@ -1437,6 +1484,8 @@ def zabbix_output():
     for ctid in sorted(all_ctids, key=int):
         services = 0
         cves = 0
+        invasive = 0
+        invasive_services = []
         details = []
         for key in sorted_keys:
             if not key.startswith(ctid + ":"):
@@ -1445,6 +1494,9 @@ def zabbix_output():
             _rest = key.split(":", 1)[1]
             user_uid, service = _rest.split(":", 1)
             svc = svc_display(user_uid, service, key in NON_SYSTEMD_KEYS)
+            if is_invasive(service):
+                invasive += 1
+                invasive_services.append(svc)
             if key in CONT_CVES:
                 for vl in CONT_CVES[key].split("\n"):
                     if not vl:
@@ -1478,6 +1530,8 @@ def zabbix_output():
             "cves": cves,
             "cves_ok": cves_ok,
             "state": state,
+            "invasive": invasive,
+            "invasive_services": invasive_services,
             "details": "\n".join(details),
         })
 

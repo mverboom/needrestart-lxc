@@ -22,6 +22,22 @@ needrestart-lxc
 If no services need a restart, or the command is run without a terminal (e.g.
 piped or from cron), it falls back to a plain message instead of a dialog.
 
+#### Potentially invasive (deferred) services
+
+Some services are disruptive to restart (e.g. `dbus.service`,
+`systemd-logind.service`, networking, display managers). needrestart does not
+restart these by default - it lists them as "Service restarts being deferred".
+needrestart-lxc mirrors that: the interactive list labels them `[invasive]` and
+leaves them **unchecked** (you can still tick them), and the script-server
+report shows them in a dedicated **Invasive** column.
+
+The list is built into the script (a copy of needrestart's shipped
+`$nrconf{override_rc}` / `$nrconf{blacklist_rc}` defaults) and is not read from
+`/etc/needrestart`. Containers commonly have no needrestart installed, and
+local `conf.d` customisations are therefore not reflected. `-r` still restarts
+every flagged service, invasive or not - the marking only changes the
+interactive default selection.
+
 ### List (non-interactive)
 
 To get a plain text report without any dialog, use the list (-l, --list)

@@ -11,8 +11,10 @@ macros). Tested against Zabbix 7.4.
 - A master item (`needrestart.lxc.master`) reads a JSON document with one entry
   per running container: `ctid`, `name`, `services` (needing restart), `cves`
   (unique CVEs fixed by the pending updates), `cves_ok` (whether CVE analysis is
-  complete), `state` (0 = no alert, 1 = warning, 2 = high) and `details`
-  (human-readable per-service breakdown).
+  complete), `state` (0 = no alert, 1 = warning, 2 = high), `invasive`/
+  `invasive_services` (count and names of flagged services needrestart would
+  defer as potentially invasive; used by the script-server report, not by the
+  triggers) and `details` (human-readable per-service breakdown).
 - A discovery rule (`needrestart.lxc.discovery`, dependent on the master)
   discovers every container; each gets dependent items including
   `needrestart.lxc.services[{#CTID}]`, `needrestart.lxc.cves[{#CTID}]`,

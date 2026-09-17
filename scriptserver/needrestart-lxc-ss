@@ -22,7 +22,8 @@
 #                  fresh data incl. CVE analysis, warms the hosts' 24h cache)
 #         cached = read the JSON the hosts' 15-min cron writes (instant,
 #                  up to 15 minutes old)
-#       Output: HTML tables. Rows with services to restart deep-link into the
+#       Output: HTML tables (Services / CVEs / State / Invasive columns).
+#       Rows with services to restart deep-link into the
 #       "restart" runner with Host/Container pre-filled (Action keeps the
 #       runner's default, restart).
 #   restart --hosts FQDN[,FQDN...] [--targets h1:c1,c2;h2:c3]
@@ -202,6 +203,8 @@ print("td,th{white-space:nowrap;text-align:left}")
 print("td.name{max-width:24ch;overflow:hidden;text-overflow:ellipsis}")
 print("td.details{white-space:pre-wrap}")
 print("td.sel{text-align:center;width:1%}")
+print("span.inv{background:#9a6700;color:#fff;padding:1px 8px;border-radius:10px;")
+print("font-size:smaller;white-space:nowrap}")
 print("button{padding:2px 10px;font-size:smaller;cursor:pointer}")
 print("p.failed{color:#cf222e}")
 print("p.notes{font-size:smaller;color:#6e7781}")
@@ -284,7 +287,9 @@ for path in files:
     th = "<th>"
     print(f"<tr><th title='tick to select/deselect all containers of this host'>"
           f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th>{th}CT</th>{th}Name</th>"
-          f"{th}Services</th>{th}CVEs</th>{th}State</th>{th}Details</th></tr>")
+          f"{th}Services</th>{th}CVEs</th>{th}State</th>"
+          f"<th title='services needrestart would defer restarting as potentially invasive'>"
+          f"Invasive</th>{th}Details</th></tr>")
     # Deep links must prefill the restart runner's Container multiselect, whose
     # values are the container name (unique) or the CTID (ambigous/unknown 
     # names) - same rule as the `containers` subcommand.
@@ -306,11 +311,16 @@ for path in files:
         else:
             sel = ""
         name = esc(c.get("name", "?"))
+        inv = c.get("invasive", 0) or 0
+        inv_names = ", ".join(c.get("invasive_services") or [])
+        inv_cell = (f'<span class=inv title="{esc(inv_names)}">'
+                    f'&#9888; {inv} deferred</span>') if inv else ""
         print(f'<tr><td class=sel>{sel}</td><td>{ct}</td>'
               f'<td class=name title="{name}">{name}</td>'
               f"<td style='text-align:right'>{svc}</td>"
               f"<td style='text-align:right'>{cves}</td>"
               f"<td>{badge(c.get('state', 0))}</td>"
+              f"<td>{inv_cell}</td>"
               f"<td class=details>{details}</td></tr>")
     print("</table>")
     if err:
