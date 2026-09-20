@@ -1,7 +1,5 @@
 {
   "hidden": true,
-  "requires_terminal": false,
-  "output_format": "html_iframe",
   "parameters": [
     {
       "name": "All hosts",

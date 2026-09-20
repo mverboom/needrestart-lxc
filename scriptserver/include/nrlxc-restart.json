@@ -1,6 +1,5 @@
 {
   "hidden": true,
-  "requires_terminal": true,
   "parameters": [
     {
       "name": "Hosts",

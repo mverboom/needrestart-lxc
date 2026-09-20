@@ -50,6 +50,41 @@ RESTART_MODE_RESTART_UI="Restart selected services"  # inner Restart mode option
 # and scriptserver/include/nrlxc-{status,restart}.json. Deep links must pass
 # the mapped UI labels, not the raw script values.
 
+# --- restart output as an html_iframe document ------------------------------
+# The runner uses output_format=html_iframe for both actions (the renderer is
+# fixed at page load, so an Action change never has to switch it). The status
+# report already emits a full HTML document; restart output is plain text, so
+# wrap stdout and stderr in a <pre> document and HTML-escape every line -
+# otherwise newlines collapse and '<'/'&' in ssh output would be parsed as
+# HTML inside the iframe's srcdoc. The head script keeps the view at the tail
+# while output streams; the tail script stops that once the run has finished.
+HTML_REPORT_HEAD='<!DOCTYPE html><html><head><meta charset="utf-8">'
+HTML_REPORT_HEAD+='<style>body{margin:0;font-family:monospace;font-size:.875em}'
+HTML_REPORT_HEAD+='pre{white-space:pre-wrap;overflow-wrap:break-word;margin:0;padding:1.5em}</style>'
+HTML_REPORT_HEAD+='<script>(function(){var t=setInterval(function(){'
+HTML_REPORT_HEAD+='if(window.__nrDone){clearInterval(t);return}'
+HTML_REPORT_HEAD+='window.scrollTo(0,document.documentElement.scrollHeight)},250)})()</script>'
+HTML_REPORT_HEAD+='</head><body><pre>'
+HTML_REPORT_TAIL='<script>window.__nrDone=1</script></pre></body></html>'
+
+# html_escape: HTML-escape stdin line by line (-u keeps the stream live).
+html_escape() {
+    sed -u -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# run_html <command> [args...]
+# Run <command> with stdout+stderr rendered as an HTML <pre> document; return
+# the command's own exit status (PIPESTATUS, ignoring the escaper's status).
+run_html() {
+    printf '%s' "$HTML_REPORT_HEAD"
+    local rc
+    set +e
+    "$@" 2>&1 | html_escape
+    rc=${PIPESTATUS[0]}
+    printf '%s' "$HTML_REPORT_TAIL"
+    return "$rc"
+}
+
 usage() {
     awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"
     exit 1
@@ -428,9 +463,9 @@ do_restart() {
     #   --allow-all     permit restarting ALL flagged containers when no
     #                   targets are given (safety: without it, a real restart
     #                   with an empty container selection is refused)
-    # Runs execute sequentially in one terminal, one scan per host; exit code
+    # Runs execute sequentially in one HTML log, one scan per host; exit code
     # is non-zero if any host failed.
-    local hostspec="" exclude="" action="dry-run" allow_all=0
+    local hostspec="" targets="" exclude="" action="dry-run" allow_all=0
     while (($#)); do
         case $1 in
             --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
@@ -517,7 +552,7 @@ case "${1:-}" in
     hosts)      shift; list_hosts "$@" ;;
     status)     shift; do_status "$@" ;;
     containers) shift; do_containers "$@" ;;
-    restart)    shift; do_restart "$@" ;;
+    restart)    shift; run_html do_restart "$@" ;;
     -h|--help|"" ) usage ;;
     *) echo "unknown subcommand: $1"; usage ;;
 esac

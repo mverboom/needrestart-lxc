@@ -3,6 +3,8 @@
   "script_path": "sudo -u cdist -i needrestart-ss",
   "description": "Report on services running outdated libraries (plus pending kernel/microcode updates) on the managed hosts, or restart flagged services. The Action pulldown changes the fields shown.",
   "group": "needrestart",
+  "requires_terminal": false,
+  "output_format": "html_iframe",
   "parameters": [
     {
       "name": "Action",

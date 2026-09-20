@@ -32,16 +32,20 @@ only declare the `Action` pulldown:
 
 The include files live in `scriptserver/include/` and are referenced by
 **absolute path** into the checkout, so they need no separate symlinks — a
-`git pull` activates changes. They can override the fields that must differ per
-action, which is why the base runner sets neither `requires_terminal` nor
-`output_format` (base values win on merge, so they must stay unset):
+`git pull` activates changes. They vary only the *parameters* per action:
 
-- `needrestart-status.json` / `nrlxc-status.json`:
-  `requires_terminal: false`, `output_format: html_iframe`, plus `All hosts`,
-  `Hosts` and (lxc only) `Data`.
-- `needrestart-restart.json` / `nrlxc-restart.json`:
-  `requires_terminal: true`, plus `Hosts`, `Services`/`Containers`,
-  `Allow all`, `Exclude` and `Restart mode` (dry-run / restart).
+- `needrestart-status.json` / `nrlxc-status.json`: `All hosts`, `Hosts`
+  and (lxc only) `Data`.
+- `needrestart-restart.json` / `nrlxc-restart.json`: `Hosts`,
+  `Services`/`Containers`, `Allow all`, `Exclude` and `Restart mode`
+  (dry-run / restart).
+
+Both base runners set `requires_terminal: false` and
+`output_format: html_iframe`, so the renderer is fixed at page load. This is
+deliberate: script-server only pushes `output_format` to the browser on the
+initial load / a full model reload, never after a plain parameter change, so
+an action that changed `output_format` would be applied server-side but never
+switch the UI renderer (the report would be dumped as raw text).
 
 ## Runners
 
@@ -75,13 +79,15 @@ everything with `Restart mode = Dry run`; a real restart with an empty
 selection additionally requires **Allow all** (safety switch — never restart
 everything by accident).
 
-Each host is scanned fresh and processed sequentially with live terminal
-output. Restarting includes the escalation ladder (restart → kill + start →
-SIGKILL). Non-systemd processes and scope units are reported but never
-restarted automatically, mirroring the script's own safety rules. Potentially
-invasive services (needrestart's deferred list, shown in the report's Invasive
-column) are restarted like any other flagged service; that marking is
-informational and does not skip them.
+Each host is scanned fresh and processed sequentially. The wrapper renders
+restart output as a `<pre>` HTML log (HTML-escaped stdout+stderr in a minimal
+document, auto-scrolled to the tail), since the runner renders in the
+html_iframe output. Restarting includes the escalation ladder (restart → kill
++ start → SIGKILL). Non-systemd processes and scope units are reported but
+never restarted automatically, mirroring the script's own safety rules.
+Potentially invasive services (needrestart's deferred list, shown in the
+report's Invasive column) are restarted like any other flagged service; that
+marking is informational and does not skip them.
 
 ## Installation / update
 
