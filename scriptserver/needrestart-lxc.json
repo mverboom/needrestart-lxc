@@ -1,0 +1,20 @@
+{
+  "name": "needrestart-lxc",
+  "script_path": "sudo -u cdist -i needrestart-lxc-ss",
+  "description": "Report on services in LXC containers that run outdated libraries, or restart them. The Action pulldown changes the fields shown.",
+  "group": "needrestart-lxc",
+  "parameters": [
+    {
+      "name": "Action",
+      "required": true,
+      "type": "list",
+      "description": "Status report is read-only; Restart applies the changes.",
+      "values": ["status", "restart"],
+      "values_ui_mapping": {
+        "status": "Status report (read-only)",
+        "restart": "Restart flagged services"
+      }
+    }
+  ],
+  "include": "/home/cdist/files.external/needrestart-lxc.git/scriptserver/include/nrlxc-${Action}.json"
+}

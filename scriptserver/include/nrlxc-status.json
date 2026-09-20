@@ -1,8 +1,5 @@
 {
-  "name": "nrlxc-list",
-  "script_path": "sudo -u cdist -i needrestart-lxc-ss status",
-  "description": "Which LXC containers on the Proxmox hosts have services running outdated libraries.",
-  "group": "needrestart-lxc",
+  "hidden": true,
   "requires_terminal": false,
   "output_format": "html_iframe",
   "parameters": [

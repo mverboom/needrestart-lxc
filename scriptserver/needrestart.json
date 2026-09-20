@@ -1,0 +1,20 @@
+{
+  "name": "needrestart",
+  "script_path": "sudo -u cdist -i needrestart-ss",
+  "description": "Report on services running outdated libraries (plus pending kernel/microcode updates) on the managed hosts, or restart flagged services. The Action pulldown changes the fields shown.",
+  "group": "needrestart",
+  "parameters": [
+    {
+      "name": "Action",
+      "required": true,
+      "type": "list",
+      "description": "Status report is read-only; Restart applies the changes.",
+      "values": ["status", "restart"],
+      "values_ui_mapping": {
+        "status": "Status report (read-only)",
+        "restart": "Restart flagged services"
+      }
+    }
+  ],
+  "include": "/home/cdist/files.external/needrestart-lxc.git/scriptserver/include/needrestart-${Action}.json"
+}

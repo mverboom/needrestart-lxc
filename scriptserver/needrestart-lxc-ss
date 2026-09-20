@@ -23,9 +23,9 @@
 #         cached = read the JSON the hosts' 15-min cron writes (instant,
 #                  up to 15 minutes old)
 #       Output: HTML tables (Services / CVEs / State / Invasive columns).
-#       Rows with services to restart deep-link into the
-#       "restart" runner with Host/Container pre-filled (Action keeps the
-#       runner's default, restart).
+#       Rows with services to restart deep-link into the "needrestart-lxc"
+#       runner with Action=Restart and Restart mode=Restart pre-filled, plus
+#       Host and Container.
 #   restart --hosts FQDN[,FQDN...] [--targets h1:c1,c2;h2:c3]
 #           [--exclude REGEX] [--action dry-run|restart] [--allow-all]
 #       Run `needrestart-lxc [-n] -r [-c ID[,ID...]] [-e REGEX]` on one host.
@@ -40,7 +40,15 @@ set -euo pipefail
 
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
-RESTART_RUNNER="nrlxc-restart"
+RESTART_RUNNER="needrestart-lxc"
+ACTION_RESTART_UI="Restart flagged services"        # top-level Action option
+RESTART_MODE="Restart mode"                          # inner restart parameter name
+RESTART_MODE_RESTART_UI="Restart selected services"  # inner Restart mode option
+
+# KEEP IN SYNC: the runner name and the labels above must match the `name`
+# field and the values_ui_mapping labels in scriptserver/needrestart-lxc.json
+# and scriptserver/include/nrlxc-{status,restart}.json. Deep links must pass
+# the mapped UI labels, not the raw script values.
 
 usage() {
     awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"
@@ -126,40 +134,46 @@ do_status() {
     local rc=0
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
-    python3 - "$STATUS_TMP" "$MODE" "$RESTART_RUNNER" <<'PYEOF'
+    python3 - "$STATUS_TMP" "$MODE" "$RESTART_RUNNER" "$ACTION_RESTART_UI" \
+        "$RESTART_MODE" "$RESTART_MODE_RESTART_UI" <<'PYEOF'
 import glob, html, json, os, sys
 from datetime import datetime
 from urllib.parse import quote
 
-tmpdir, mode, restart_runner = sys.argv[1], sys.argv[2], sys.argv[3]
+(tmpdir, mode, restart_runner, action_restart_ui,
+ restart_mode, restart_mode_restart_ui) = sys.argv[1:7]
 runner_enc = quote(restart_runner, safe="")
+
+
+def qkey(name):
+    return quote(name, safe="")
 
 
 def esc(s):
     return html.escape(str(s), quote=True)
 
 
-# UI label of the restart runner's Action=restart option. The deep link must
-# pass this mapped label, not the raw script value: the UI sees list values
-# through values_ui_mapping (see scriptserver/needrestart-restart.json), so a
-# raw "restart" would match no option and render the select empty. The server
-# maps the label back to "restart" when the run executes. KEEP IN SYNC with
-# values_ui_mapping in the runner JSON.
-ACTION_RESTART_UI = "Restart all flagged services"
-
-
+# Deep link into the consolidated runner's restart action. The runner name and
+# labels come from the shell constants above and must stay in sync with
+# scriptserver/needrestart-lxc.json and include/nrlxc-restart.json. Labels (not
+# raw script values) are passed because the UI shows list values through
+# values_ui_mapping; the server maps them back to the raw values.
 def restart_query(host, cval):
     # repeated query keys: the runner's Hosts and Containers params are
     # multiselects whose prefill expects arrays (comma strings are NOT split).
-    # Action= is pinned to restart here: with any predefinedParameters present,
-    # the UI's reloaded-model handler replaces the value state with exactly the
+    # Both Action= (top-level, selects the include) and Restart mode= (inner)
+    # are pinned: with any predefinedParameters present, the UI's
+    # reloaded-model handler replaces the value state with exactly the
     # deep-link params, so parameters NOT in the link get no value at all (the
-    # runner default does NOT apply). With the forceAllowedValues frontend
+    # runner default does NOT apply). The Action param comes first so the
+    # restart include (which defines Hosts/Containers/Restart mode) is loaded
+    # before those values are applied. With the forceAllowedValues frontend
     # patch (script-server-dev recipe) the forced values are also not wiped
     # while the dependent Containers list is still loading.
-    parts = [f"Hosts={quote(host, safe='')}"]
-    parts.append(f"Containers={quote(host + ':' + cval, safe='')}")
-    parts.append(f"Action={quote(ACTION_RESTART_UI, safe='')}")
+    parts = [f"Action={quote(action_restart_ui, safe='')}",
+             f"{qkey(restart_mode)}={quote(restart_mode_restart_ui, safe='')}",
+             f"Hosts={quote(host, safe='')}",
+             f"Containers={quote(host + ':' + cval, safe='')}"]
     return "&amp;".join(parts)
 
 
@@ -212,7 +226,9 @@ print("p.meta{font-size:smaller}")
 print("label.all{font-size:smaller;cursor:pointer}")
 print("</style><script>")
 print(f"var RUNNER = {restart_runner!r};")
-print(f"var ACTION_RESTART_UI = {ACTION_RESTART_UI!r};")
+print(f"var ACTION_RESTART_UI = {action_restart_ui!r};")
+print(f"var RESTART_MODE = {restart_mode!r};")
+print(f"var RESTART_MODE_RESTART_UI = {restart_mode_restart_ui!r};")
 print("""
 function toggleAll(master, hostOnly) {
     var scope = hostOnly ? master.closest('table') : document;
@@ -234,14 +250,15 @@ function goSelected() {
         }
     }
     if (!containers.length) { alert('No containers selected.'); return; }
-    // Action is pinned to restart (UI-mapped label): parameters missing from
-    // the deep link get no value at all, the runner default does NOT apply
-    var q = '';
+    // Action and Restart mode are pinned (UI-mapped labels): parameters not
+    // in the deep link get no value at all, the runner default does NOT apply
+    var q = '&Action=' + encodeURIComponent(ACTION_RESTART_UI)
+        + '&' + encodeURIComponent(RESTART_MODE) + '='
+        + encodeURIComponent(RESTART_MODE_RESTART_UI);
     for (var i = 0; i < hosts.length; i++)
         q += '&Hosts=' + encodeURIComponent(hosts[i]);
     for (var i = 0; i < containers.length; i++)
         q += '&Containers=' + encodeURIComponent(containers[i]);
-    q += '&Action=' + encodeURIComponent(ACTION_RESTART_UI);
     window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
 }
 </script></head><body>""")

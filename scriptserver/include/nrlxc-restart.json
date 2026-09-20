@@ -1,8 +1,5 @@
 {
-  "name": "nr-restart",
-  "script_path": "sudo -u cdist -i needrestart-ss restart",
-  "description": "Restart flagged services on one or several hosts in one run.",
-  "group": "needrestart",
+  "hidden": true,
   "requires_terminal": true,
   "parameters": [
     {
@@ -10,19 +7,19 @@
       "required": true,
       "param": "--hosts",
       "type": "multiselect",
-      "description": "Host(s) to run on. The Services list refreshes from a fresh scan of the selection.",
+      "description": "Proxmox host(s) to run on. The Containers list refreshes from the cached report of the selection.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-ss hosts",
+        "script": "sudo -u cdist -i needrestart-lxc-ss hosts",
         "shell": false
       }
     },
     {
-      "name": "Services",
+      "name": "Containers",
       "param": "--targets",
       "type": "multiselect",
-      "description": "host:service entries to restart. Usually prefilled from the needrestart report. Empty selection = only a dry run, or a real restart of ALL flagged services if 'Allow all' is ticked.",
+      "description": "host:container entries to restart. Usually prefilled from the list report. Empty selection = only a dry run, or a real restart of ALL flagged containers if 'Allow all' is ticked.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-ss services --hosts ${Hosts}",
+        "script": "sudo -u cdist -i needrestart-lxc-ss containers --hosts ${Hosts}",
         "shell": false
       }
     },
@@ -31,7 +28,7 @@
       "param": "--allow-all",
       "type": "text",
       "no_value": true,
-      "description": "Safety switch: with an EMPTY Services selection, a real restart of ALL flagged services on every selected host is only allowed when this is ticked. Dry run never needs it."
+      "description": "Safety switch: with an EMPTY Containers selection, a real restart of ALL flagged containers on every selected host is only allowed when this is ticked. Dry run never needs it."
     },
     {
       "name": "Exclude",
@@ -40,7 +37,7 @@
       "description": "Optional: regex of services to exclude on every host (can use alternation, e.g. `^dbus|^rsyslog`)."
     },
     {
-      "name": "Action",
+      "name": "Restart mode",
       "required": true,
       "param": "--action",
       "type": "list",

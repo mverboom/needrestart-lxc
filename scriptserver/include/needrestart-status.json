@@ -1,8 +1,5 @@
 {
-  "name": "nr-list",
-  "script_path": "sudo -u cdist -i needrestart-ss status",
-  "description": "List which hosts have services running outdated libraries, a pending kernel update or outdated microcode.",
-  "group": "needrestart",
+  "hidden": true,
   "requires_terminal": false,
   "output_format": "html_iframe",
   "parameters": [

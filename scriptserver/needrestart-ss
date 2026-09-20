@@ -22,9 +22,9 @@
 #       Per-host HTML report (batch scan: `needrestart -b -w`) of services
 #       running outdated libraries, kernel and microcode status, and user
 #       sessions. Rows flag services needrestart would defer as potentially
-#       invasive (Invasive column). Service rows deep-link into the
-#       "needrestart restart" runner with Host and Services pre-filled
-#       (Action pinned to restart).
+#       invasive (Invasive column). Service rows deep-link into the same
+#       "needrestart" runner with Action=Restart and Restart mode=Restart
+#       pre-filled, plus Host and Services.
 #   services --hosts FQDN[,FQDN...]
 #       List the flagged systemd service units on the given host(s), one per
 #       line as "host:unit" - the value list for the restart runner's
@@ -43,12 +43,18 @@ SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-
 SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
 GUARD_TIMEOUT=30          # systemctl show timeout, seconds
 RESTART_TIMEOUT=300       # systemctl restart timeout, seconds
-RESTART_RUNNER="nr-restart"
-ACTION_RESTART_UI="Restart selected services"
+RESTART_RUNNER="needrestart"
+LXC_RUNNER="needrestart-lxc"
+ACTION_RESTART_UI="Restart flagged services"        # top-level Action option
+ACTION_STATUS_UI="Status report (read-only)"         # top-level Action option
+LXC_DATA_SCAN_UI="Scan now (fresh, includes CVE analysis)"  # LXC Data option
+RESTART_MODE="Restart mode"                          # inner restart parameter name
+RESTART_MODE_RESTART_UI="Restart selected services"  # inner Restart mode option
 
-# KEEP IN SYNC: RESTART_RUNNER must be the runner JSON's `name` and
-# ACTION_RESTART_UI the UI label of its Action=restart option (deep links must
-# pass the values_ui_mapping label, not the raw script value).
+# KEEP IN SYNC: the runner names and the labels above must match the `name`
+# fields and the values_ui_mapping labels in scriptserver/needrestart.json,
+# needrestart-lxc.json and scriptserver/include/{needrestart,nrlxc}-*.json.
+# Deep links must pass the mapped UI labels, not the raw script values.
 
 usage() {
     awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"
@@ -161,13 +167,22 @@ do_status() {
     local rc=0
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
-    python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$ACTION_RESTART_UI" <<'PYEOF'
+    python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$LXC_RUNNER" "$ACTION_RESTART_UI" \
+        "$ACTION_STATUS_UI" "$LXC_DATA_SCAN_UI" "$RESTART_MODE" \
+        "$RESTART_MODE_RESTART_UI" <<'PYEOF'
 import glob, html, os, re, sys
 from datetime import datetime
 from urllib.parse import quote
 
-tmpdir, restart_runner, action_restart_ui = sys.argv[1], sys.argv[2], sys.argv[3]
+(tmpdir, restart_runner, lxc_runner, action_restart_ui,
+ action_status_ui, lxc_data_scan_ui, restart_mode,
+ restart_mode_restart_ui) = sys.argv[1:9]
 runner_enc = quote(restart_runner, safe="")
+lxc_runner_enc = quote(lxc_runner, safe="")
+
+
+def qkey(name):
+    return quote(name, safe="")
 UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
 
 
@@ -203,23 +218,27 @@ def is_invasive(service):
     return any(p.search(service) for p in INVASIVE_PATTERNS)
 
 
-# UI label of the restart runner's Action=restart option. The deep link must
-# pass this mapped label, not the raw script value: the UI sees list values
-# through values_ui_mapping (see runners/needrestart-restart.json), so a raw
-# "restart" would match no option and render the select empty. KEEP IN SYNC
-# with values_ui_mapping in the runner JSON.
+# Deep link into the consolidated runner's restart action. The runner names
+# and labels come from the shell constants above and must stay in sync with
+# scriptserver/needrestart.json and include/needrestart-restart.json. Labels
+# (not raw script values) are passed because the UI shows list values through
+# values_ui_mapping; the server maps them back to the raw values.
 def restart_query(host, svals):
     # repeated query keys: the runner's Hosts and Services params are
     # multiselects whose prefill expects arrays (comma strings are NOT split).
-    # Action= is pinned to restart: with any predefinedParameters present, the
-    # UI's reloaded-model handler replaces the value state with exactly the
+    # Both Action= (top-level, selects the include) and Restart mode= (inner)
+    # are pinned: with any predefinedParameters present, the UI's
+    # reloaded-model handler replaces the value state with exactly the
     # deep-link params, so parameters NOT in the link get no value at all (the
-    # runner default does NOT apply). With the forceAllowedValues frontend
+    # runner default does NOT apply). The Action param comes first so the
+    # restart include (which defines Hosts/Services/Restart mode) is loaded
+    # before those values are applied. With the forceAllowedValues frontend
     # patch (script-server-dev recipe) the forced values are also not wiped
     # while the dependent Services list is still loading.
-    parts = [f"Hosts={quote(host, safe='')}"]
+    parts = [f"Action={quote(action_restart_ui, safe='')}",
+             f"{qkey(restart_mode)}={quote(restart_mode_restart_ui, safe='')}",
+             f"Hosts={quote(host, safe='')}"]
     parts += [f"Services={quote(host + ':' + v, safe='')}" for v in svals]
-    parts.append(f"Action={quote(action_restart_ui, safe='')}")
     return "&amp;".join(parts)
 
 
@@ -343,6 +362,8 @@ print("label.all{font-size:smaller;cursor:pointer}")
 print("</style><script>")
 print(f"var RUNNER = {restart_runner!r};")
 print(f"var ACTION_RESTART_UI = {action_restart_ui!r};")
+print(f"var RESTART_MODE = {restart_mode!r};")
+print(f"var RESTART_MODE_RESTART_UI = {restart_mode_restart_ui!r};")
 print("""
 function toggleAll(master, hostOnly) {
     var scope = hostOnly ? master.closest('table') : document;
@@ -363,14 +384,15 @@ function goSelected() {
         }
     }
     if (!services.length) { alert('No services selected.'); return; }
-    // Action is pinned to restart (UI-mapped label): parameters missing from
-    // the deep link get no value at all, the runner default does NOT apply
-    var q = '';
+    // Action and Restart mode are pinned (UI-mapped labels): parameters not
+    // in the deep link get no value at all, the runner default does NOT apply
+    var q = '&Action=' + encodeURIComponent(ACTION_RESTART_UI)
+        + '&' + encodeURIComponent(RESTART_MODE) + '='
+        + encodeURIComponent(RESTART_MODE_RESTART_UI);
     for (var i = 0; i < hosts.length; i++)
         q += '&Hosts=' + encodeURIComponent(hosts[i]);
     for (var i = 0; i < services.length; i++)
         q += '&Services=' + encodeURIComponent(services[i]);
-    q += '&Action=' + encodeURIComponent(ACTION_RESTART_UI);
     window.top.location.hash = '#/' + encodeURIComponent(RUNNER) + '?' + q;
 }
 </script></head><body>""")
@@ -430,9 +452,11 @@ for (state, host, services, sessions, ksta, ucsta,
           f"{len(services)} service(s) with outdated libraries &bull; "
           f"kernel: {esc(kernel_note(ksta, kcur, kexp))} &bull; "
           f"microcode: {esc(ucode_note(ucsta, uccur, ucexp))} &bull; "
-          f'<a target="_top" title="open the needrestart-lxc list runner '
+          f'<a target="_top" title="open the needrestart-lxc status report '
           f'for this host" '
-          f'href="#/list?Hosts={quote(host, safe="")}">LXC containers</a>'
+          f'href="#/{lxc_runner_enc}?Action={quote(action_status_ui, safe="")}'
+          f'&amp;Data={quote(lxc_data_scan_ui, safe="")}'
+          f'&amp;Hosts={quote(host, safe="")}">LXC containers</a>'
           f"</p>")
     if state == 2:
         print("<p class=reboot>reboot required: kernel or microcode update "
