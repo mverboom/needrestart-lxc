@@ -19,7 +19,7 @@
       "multiselect_argument_type": "argument_per_value"
     },
     {
-      "name": "Data",
+      "name": "Data source",
       "required": true,
       "param": "--mode",
       "type": "list",

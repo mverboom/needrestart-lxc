@@ -47,7 +47,8 @@ RESTART_RUNNER="needrestart"
 LXC_RUNNER="needrestart-lxc"
 ACTION_RESTART_UI="Restart flagged services"        # top-level Action option
 ACTION_STATUS_UI="Status report (read-only)"         # top-level Action option
-LXC_DATA_SCAN_UI="Scan now (fresh, includes CVE analysis)"  # LXC Data option
+LXC_DATA_PARAM="Data source"                     # LXC Data source param name
+LXC_DATA_SCAN_UI="Scan now (fresh, includes CVE analysis)"  # LXC Data source default
 RESTART_MODE="Restart mode"                          # inner restart parameter name
 RESTART_MODE_RESTART_UI="Restart selected services"  # inner Restart mode option
 
@@ -203,15 +204,15 @@ do_status() {
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
     python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$LXC_RUNNER" "$ACTION_RESTART_UI" \
-        "$ACTION_STATUS_UI" "$LXC_DATA_SCAN_UI" "$RESTART_MODE" \
+        "$ACTION_STATUS_UI" "$LXC_DATA_PARAM" "$LXC_DATA_SCAN_UI" "$RESTART_MODE" \
         "$RESTART_MODE_RESTART_UI" <<'PYEOF'
 import glob, html, os, re, sys
 from datetime import datetime
 from urllib.parse import quote
 
-(tmpdir, restart_runner, lxc_runner, action_restart_ui,
- action_status_ui, lxc_data_scan_ui, restart_mode,
- restart_mode_restart_ui) = sys.argv[1:9]
+(tmpdir, restart_runner, lxc_runner, action_restart_ui, action_status_ui,
+ lxc_data_param, lxc_data_scan_ui, restart_mode,
+ restart_mode_restart_ui) = sys.argv[1:10]
 runner_enc = quote(restart_runner, safe="")
 lxc_runner_enc = quote(lxc_runner, safe="")
 
@@ -490,7 +491,7 @@ for (state, host, services, sessions, ksta, ucsta,
           f'<a target="_top" title="open the needrestart-lxc status report '
           f'for this host" '
           f'href="#/{lxc_runner_enc}?Action={quote(action_status_ui, safe="")}'
-          f'&amp;Data={quote(lxc_data_scan_ui, safe="")}'
+          f'&amp;{qkey(lxc_data_param)}={quote(lxc_data_scan_ui, safe="")}'
           f'&amp;Hosts={quote(host, safe="")}">LXC containers</a>'
           f"</p>")
     if state == 2:

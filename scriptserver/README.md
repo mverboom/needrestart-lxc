@@ -35,7 +35,7 @@ The include files live in `scriptserver/include/` and are referenced by
 `git pull` activates changes. They vary only the *parameters* per action:
 
 - `needrestart-status.json` / `nrlxc-status.json`: `All hosts`, `Hosts`
-  and (lxc only) `Data`.
+  and (lxc only) `Data source`.
 - `needrestart-restart.json` / `nrlxc-restart.json`: `Hosts`,
   `Services`/`Containers`, `Allow all`, `Exclude` and `Restart mode`
   (dry-run / restart).
