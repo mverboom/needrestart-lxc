@@ -20,7 +20,6 @@
     },
     {
       "name": "Data source",
-      "required": true,
       "param": "--mode",
       "type": "list",
       "default": "scan",

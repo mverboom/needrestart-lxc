@@ -40,6 +40,13 @@ The include files live in `scriptserver/include/` and are referenced by
   `Services`/`Containers`, `Allow all`, `Exclude` and `Restart mode`
   (dry-run / restart).
 
+Action-specific parameters must **not** be marked `required`: script-server
+never clears a validation error for a parameter that an Action switch removes,
+so a stale `X: required` would permanently block the other action. The wrapper
+enforces what it needs instead. (`Hosts` is required in the restart include but
+this is safe because the same name also exists in the status include, so its
+error is re-evaluated and cleared when the action changes.)
+
 Both base runners set `requires_terminal: false` and
 `output_format: html_iframe`, so the renderer is fixed at page load. This is
 deliberate: script-server only pushes `output_format` to the browser on the
