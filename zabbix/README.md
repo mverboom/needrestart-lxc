@@ -172,3 +172,16 @@ Notes:
   UPDATE ids SET nextid = (SELECT MAX(triggerid) FROM triggers) WHERE table_name='triggers';
   UPDATE ids SET nextid = (SELECT MAX(functionid) FROM functions) WHERE table_name='functions';
   ```
+
+## template_needrestart.xml
+
+Export of the Zabbix template `Template needrestart` (the host-level counterpart of the lxc one).
+This was previously unversioned; added 2026-09-25 when `needrestart.ucode.status` was fixed.
+
+That item parses `NEEDRESTART-UCSTA:` from `needrestart -b`, which only exists in needrestart >= 3.7
+(Debian 13). On Debian 12/11 (needrestart 3.6) the line is absent, which used to make the item
+unsupported - on 13 hosts. Its REGEX preprocessing step now has
+`error_handler=CUSTOM_VALUE, error_handler_params=1`, i.e. "no microcode upgrade pending", which is
+what the trigger `Microcode upgrade pending` (`<>1`) expects. Note that hosts carrying a
+*standalone* copy of the item (not inherited from the template, `templateid` NULL) are not updated
+by a template change and need the same edit applied directly.
