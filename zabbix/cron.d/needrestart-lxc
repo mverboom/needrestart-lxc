@@ -2,7 +2,7 @@
 # The full scan (including the CVE analysis) takes several seconds and would
 # exceed the Zabbix server Timeout if run synchronously by the agent.
 #
-# The Zabbix master item polls every hour; this cron keeps the file fresh.
+# The Zabbix master item polls every 15 minutes; this cron keeps the file fresh.
 # The script writes /var/cache/needrestart-lxc/zabbix.json itself (creating the
 # directory if needed), so no shell redirect is required here.
 # flock prevents overlapping runs (a slow scan plus a manual script-server

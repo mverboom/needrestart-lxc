@@ -23,21 +23,20 @@ macros). Tested against Zabbix 7.4.
   is open at a time, so the alert list stays clean). Both read the container's
   single consolidated `state` item (0/1/2) as the firing source:
   - **WARNING** — `{#CTNAME}: {ITEM.VALUE1} services need restart`, opdata
-    `{ITEM.VALUE2} CVEs` — fires when `state` = 1 (restart needed, CVE analysis
-    complete with a genuine zero)
+    `{ITEM.VALUE2} CVEs` — fires when `state` = 1 (restart needed without known
+    CVEs — including the indeterminate-analysis case)
   - **HIGH** — same name and opdata — fires when `state` = 2 (the pending
     updates fix known CVEs, e.g. `test.lnw.verbo.net: 16 services need restart`,
     opdata `15 CVEs`)
 
-The `cves_ok` flag guards against a false WARNING. The CVE count comes from an
-online security lookup with a changelog fallback; if that lookup fails *and*
-no changelog verdict is available the count is unknowable (it could be 0 or
-many). In that indeterminate case `cves_ok` = 0, so `state` = 0 and **no**
-trigger fires — the alert is deferred to the next scan (15 min later) rather
-than risking a false "no CVEs" WARNING that would be superseded by a HIGH once
-the lookup succeeds. Containers where CVE analysis is not applicable
-(non-Debian/Ubuntu, no dpkg) keep `cves_ok` = 1 and still get the WARNING when
-services need a restart.
+`cves_ok` records whether the CVE analysis completed (1) or was indeterminate
+(0 — the online lookup failed *and* no changelog verdict was available, so the
+true count is unknowable). Indeterminate containers still alert: `state` = 1
+(WARNING), matching the aggregate `summary.state`, so a lookup outage can never
+hide restart findings; the WARNING may upgrade to HIGH on a later scan once the
+lookup succeeds. `cves_ok` stays in the JSON so the indeterminate state remains
+visible in the data. Containers where CVE analysis is not applicable
+(non-Debian/Ubuntu, no dpkg) get the WARNING like any other restart finding.
 
 > **Why the trigger uses `state` instead of combining `services`/`cves`/`cves_ok`:**
 > the old expression compared three separate dependent items. Dependent items
@@ -77,7 +76,7 @@ items plus two aggregate triggers:
 > part of `template_needrestart_lxc.xml`** — they are created once on the
 > template via the API (`trigger.create`, expression referencing
 > `needrestart.lxc.summary.count`/`.cves`/`.text`), which propagates them to
-> every linked host. See `zabbix/create_aggregate_triggers.py` for the exact
+> every linked host. See `zabbix/create_aggregate_triggers` for the exact
 > call; re-run it after re-importing the template if the triggers are missing.
 
 Both aggregate triggers carry the tag `needrestart=aggregate`; the per-container
@@ -100,8 +99,8 @@ tag:
 The per-container triggers stay active and visible in the Zabbix problem list
 for per-container tracking; they just no longer generate their own emails.
 
-The master item polls every hour; a cron job refreshes the JSON every 15
-minutes, so data is at most ~1 hour old.
+The master item polls every 15 minutes, matching the cron job that refreshes
+the JSON every 15 minutes, so data is at most ~30 minutes old.
 
 ## Architecture
 

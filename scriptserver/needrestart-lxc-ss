@@ -26,7 +26,7 @@
 #       Rows with services to restart deep-link into the "needrestart-lxc"
 #       runner with Action=Restart and Restart mode=Restart pre-filled, plus
 #       Host and Container.
-#   restart --hosts FQDN[,FQDN...] [--targets h1:c1,c2;h2:c3]
+#   restart --hosts FQDN[,FQDN...] [--targets h1:c1,c2,h2:c3]
 #           [--exclude REGEX] [--action dry-run|restart] [--allow-all]
 #       Run `needrestart-lxc [-n] -r [-c ID[,ID...]] [-e REGEX]` on one host.
 #       dry-run (default) shows what would be restarted; restart actually
@@ -36,7 +36,7 @@
 #       restart (from the host's cached report), one per line - the value
 #       list for the restart runner's dynamic Container multiselect.
 # ============================================================================
-set -euo pipefail
+set -u
 
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
@@ -78,7 +78,6 @@ html_escape() {
 run_html() {
     printf '%s' "$HTML_REPORT_HEAD"
     local rc
-    set +e
     "$@" 2>&1 | html_escape
     rc=${PIPESTATUS[0]}
     printf '%s' "$HTML_REPORT_TAIL"
@@ -117,11 +116,11 @@ list_hosts() {
 run_on() {
     local host=$1 out=$2 err=$3 cached=${4:-}
     if [[ $cached == cached ]]; then
-        timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
+        timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" -- "$host" \
             "cat /var/cache/needrestart-lxc/zabbix.json" \
             >"$out" 2>"$err"
     else
-        timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
+        timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" -- "$host" \
             "timeout $SCAN_TIMEOUT /usr/local/bin/needrestart-lxc --zabbix" \
             >"$out" 2>"$err"
     fi
@@ -130,6 +129,7 @@ run_on() {
 do_status() {
     local hosts=()
     local all_hosts=0
+    local MODE=
     while (($#)); do
         case $1 in
             --mode) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
@@ -151,6 +151,15 @@ do_status() {
     fi
     ((${#hosts[@]})) || { echo "no hosts selected (pick hosts in the pulldown, or tick 'All hosts')" >&2; exit 1; }
 
+    # Validate before use: hosts become ssh destinations (a leading dash
+    # would be parsed as an ssh option) and tmp file names. Deep links set
+    # Hosts= freely, so UI values are not to be trusted.
+    local vh
+    for vh in "${hosts[@]}"; do
+        [[ $vh =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
+            || { echo "bad host name: '$vh'" >&2; exit 1; }
+    done
+
     # Global (not local): the EXIT trap below must still see it at script
     # exit, where function locals are out of scope (set -u would abort).
     STATUS_TMP=$(mktemp -d)
@@ -169,7 +178,7 @@ do_status() {
     local rc=0
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
-    python3 - "$STATUS_TMP" "$MODE" "$RESTART_RUNNER" "$ACTION_RESTART_UI" \
+    if ! python3 - "$STATUS_TMP" "$MODE" "$RESTART_RUNNER" "$ACTION_RESTART_UI" \
         "$RESTART_MODE" "$RESTART_MODE_RESTART_UI" <<'PYEOF'
 import glob, html, json, os, sys
 from datetime import datetime
@@ -178,10 +187,6 @@ from urllib.parse import quote
 (tmpdir, mode, restart_runner, action_restart_ui,
  restart_mode, restart_mode_restart_ui) = sys.argv[1:7]
 runner_enc = quote(restart_runner, safe="")
-
-
-def qkey(name):
-    return quote(name, safe="")
 
 
 def esc(s):
@@ -206,7 +211,7 @@ def restart_query(host, cval):
     # patch (script-server-dev recipe) the forced values are also not wiped
     # while the dependent Containers list is still loading.
     parts = [f"Action={quote(action_restart_ui, safe='')}",
-             f"{qkey(restart_mode)}={quote(restart_mode_restart_ui, safe='')}",
+             f"{quote(restart_mode, safe='')}={quote(restart_mode_restart_ui, safe='')}",
              f"Hosts={quote(host, safe='')}",
              f"Containers={quote(host + ':' + cval, safe='')}"]
     return "&amp;".join(parts)
@@ -336,12 +341,11 @@ for path in files:
     print(f'<p class=meta>{len(flagged)} of {len(containers)} '
           f"container(s) need a restart</p>")
     print(f'<table border=1 cellpadding=4 cellspacing=0 data-host="{esc(host)}">')
-    th = "<th>"
     print(f"<tr><th title='tick to select/deselect all containers of this host'>"
-          f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th>{th}CT</th>{th}Name</th>"
-          f"{th}Services</th>{th}CVEs</th>{th}State</th>"
+          f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th><th>CT</th><th>Name</th>"
+          f"<th>Services</th><th>CVEs</th><th>State</th>"
           f"<th title='services needrestart would defer restarting as potentially invasive'>"
-          f"Invasive</th>{th}Details</th></tr>")
+          f"Invasive</th><th>Details</th></tr>")
     # Deep links must prefill the restart runner's Container multiselect, whose
     # values are the container name (unique) or the CTID (ambigous/unknown 
     # names) - same rule as the `containers` subcommand.
@@ -384,6 +388,10 @@ print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
 print(f"<p>{CONTROLS}</p>")
 print("</body></html>")
 PYEOF
+    then
+        echo "report generation failed" >&2
+        exit 1
+    fi
     return $rc
 }
 
@@ -417,7 +425,7 @@ do_containers() {
     ((${#raw[@]})) || { echo "--hosts is required" >&2; exit 1; }
     local hostspec
     hostspec=$(printf '%s' "${raw[*]}" | tr -d "[]'\" ")
-    [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+    [[ $hostspec =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(,[A-Za-z0-9][A-Za-z0-9.-]*)*$ ]] \
         || { echo "bad --hosts format (expected host[,host...]): got '$hostspec'" >&2; exit 1; }
 
     # Read the hosts' cached reports (instant; the restart run itself rescans
@@ -434,12 +442,15 @@ do_containers() {
     for h in "${hostlist[@]}"; do
         run_on "$h" "$out" "$err" cached \
             || { echo "failed to read cached report from $h (rc $?)" >&2; rm -f "$out" "$err"; exit 1; }
-        python3 - "$out" "$h" <<'PYEOF'
+        if ! python3 - "$out" "$h" <<'PYEOF'
+# Container names resolve to exactly one restart target only when unique
+# across ALL containers on the host (a name shared with a clean container
+# would fail the remote -c lookup as ambiguous), so count names host-wide.
 import json, sys
 
 data = json.load(open(sys.argv[1]))
+names = [c.get("name") for c in data.get("containers", [])]
 containers = [c for c in data.get("containers", []) if c.get("services", 0) > 0]
-names = [c.get("name") for c in containers]
 containers.sort(key=lambda c: (-c.get("state", 0),
                                int(c["ctid"]) if str(c.get("ctid", "")).isdigit() else 0))
 for c in containers:
@@ -448,6 +459,11 @@ for c in containers:
         else str(c.get("ctid", "?"))
     print(f"{sys.argv[2]}:{val}")
 PYEOF
+        then
+            echo "failed to parse cached report from $h" >&2
+            rm -f "$out" "$err"
+            exit 1
+        fi
     done
     rm -f "$out" "$err"
 }
@@ -457,8 +473,8 @@ do_restart() {
     # restricted to hostname-ish characters (they end up as ssh destination /
     # shquoted remote args); anything else is rejected, never passed on.
     #   --hosts h1,h2            run on these host(s)
-    #   --targets h1:c1,c2;h2:c3  (from the list report; ':' grouping also
-    #                             accepted as ','-separated host:c pairs)
+    #   --targets h1:c1,c2,h2:c3  (from the list report; host-qualified,
+    #                             comma-separated host:container pairs)
     #   --exclude RE, --action dry-run|restart
     #   --allow-all     permit restarting ALL flagged containers when no
     #                   targets are given (safety: without it, a real restart
@@ -488,7 +504,7 @@ do_restart() {
     local -A groups=()
     local -a hostlist=()
     if [[ -n ${targets:-} ]]; then
-        [[ $targets =~ ^[A-Za-z0-9.-]+:[A-Za-z0-9._-]+(,[A-Za-z0-9.-]+:[A-Za-z0-9._-]+)*$ ]] \
+        [[ $targets =~ ^[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._-]+(,[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._-]+)*$ ]] \
             || { echo "bad --targets format (expected comma-separated host:container pairs)"; exit 1; }
         local -a toks
         local tok h cv
@@ -504,7 +520,7 @@ do_restart() {
             fi
         done
     else
-        [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+        [[ $hostspec =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(,[A-Za-z0-9][A-Za-z0-9.-]*)*$ ]] \
             || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
         IFS=',' read -ra hostlist <<< "$hostspec"
         for h in "${hostlist[@]}"; do groups[$h]=""; done
@@ -536,7 +552,7 @@ do_restart() {
         [[ -n $csv ]] && remote+=" -c $(shquote "$csv")"
         [[ -n $exclude ]] && remote+=" -e $(shquote "$exclude")"
         echo "=== $h ==="
-        if ! ssh "${SSH_OPTS[@]}" "$h" -- "$remote"; then
+        if ! ssh "${SSH_OPTS[@]}" -- "$h" "$remote"; then
             rc=1
         fi
     done

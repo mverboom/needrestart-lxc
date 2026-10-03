@@ -988,8 +988,15 @@ def owning_pkgs(root, paths):
     return found
 
 
+VER_CMP_CACHE = {}      # (a, b) -> -1|0|1; version pairs recur per changelog
+
+
 def ver_cmp(a, b):
     """Debian version comparison; returns -1, 0 or 1 (dpkg semantics)."""
+    cached = VER_CMP_CACHE.get((a, b))
+    if cached is not None:
+        return cached
+
     def dpkg_op(op):
         try:
             return subprocess.run(
@@ -998,10 +1005,13 @@ def ver_cmp(a, b):
         except subprocess.TimeoutExpired:
             return False
     if dpkg_op("eq"):
-        return 0
-    if dpkg_op("gt"):
-        return 1
-    return -1
+        result = 0
+    elif dpkg_op("gt"):
+        result = 1
+    else:
+        result = -1
+    VER_CMP_CACHE[(a, b)] = result
+    return result
 
 
 def epoch_from_date(datestr, tz):
@@ -1513,13 +1523,16 @@ def zabbix_output():
         # dependent items that update at slightly different moments on each
         # master refresh, so a trigger combining them can briefly see a mixed
         # snapshot and fire a false problem then immediately recover.
-        #   state 0 = no restart alert (clean, or CVE analysis indeterminate)
-        #   state 1 = restart needed, no CVEs pending, analysis complete
+        #   state 0 = clean (no restarts flagged)
+        #   state 1 = restart needed, no known CVEs pending
         #   state 2 = restart needed and pending updates fix CVEs
+        # Restart findings always alert (state >= 1) even when the CVE
+        # analysis is indeterminate (cves_ok=0 then), matching the
+        # summary.state behavior so an API outage cannot silence alerts.
         cves_ok = 0 if ctid in CT_CVE_UNKNOWN else 1
         if services > 0 and cves > 0:
             state = 2
-        elif services > 0 and cves_ok:
+        elif services > 0:
             state = 1
         else:
             state = 0
@@ -1569,18 +1582,14 @@ def zabbix_output():
     }
     text = json.dumps(out)
 
-    # Publish to the cache file the Zabbix agent reads, atomically with a
-    # unique temp name (concurrent cron + script-server runs), creating the
-    # dir if needed (so cron needs no redirect). On failure the previous
-    # cache file is left untouched and the JSON is still printed so the run
-    # is not lost.
+    # Publish to the cache file the Zabbix agent reads, via the same atomic
+    # write_cache() the API caches use, creating the dir if needed (so cron
+    # needs no redirect). On failure the previous cache file is left
+    # untouched and the JSON is still printed so the run is not lost.
     target = os.path.join(CACHE_DIR, "zabbix.json")
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix="zabbix.json.")
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text)
-        os.replace(tmp, target)
+        write_cache(target, out)
         os.chmod(target, 0o644)
     except OSError as err:
         log_error(f"failed to update {target}: {err}")
@@ -1602,8 +1611,8 @@ def main(argv):
         return value
 
     ap = argparse.ArgumentParser(prog=PROGNAME, add_help=False)
-    ap.add_argument("-l", "--list", dest="mode", action="store_const", const="list")
-    ap.add_argument("-r", "--restart", dest="mode", action="store_const", const="restart")
+    ap.add_argument("-l", "--list", dest="mode", action="append_const", const="list")
+    ap.add_argument("-r", "--restart", dest="mode", action="append_const", const="restart")
     ap.add_argument("-n", "--dry-run", action="store_true")
     ap.add_argument("-c", "--container", action="append")
     ap.add_argument("-e", "--exclude", action="append", type=regex_arg)
@@ -1613,7 +1622,15 @@ def main(argv):
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    MODE = args.mode or ("zabbix" if args.zabbix else "interactive")
+    modes = args.mode or []
+    if len(modes) > 1:
+        log_error("conflicting options: -l/--list and -r/--restart are mutually exclusive")
+        return 1
+    if modes and args.zabbix:
+        log_error("conflicting options: --zabbix cannot be combined with "
+                  "-l/--list or -r/--restart")
+        return 1
+    MODE = modes[0] if modes else ("zabbix" if args.zabbix else "interactive")
     SECURITY = 1 if (args.security or args.zabbix) else 0
     VERBOSE, DEEP, DRY_RUN = args.verbose, args.deep, args.dry_run
     for val in args.container or []:

@@ -15,7 +15,7 @@ summary.text. count / cves / text are kept in the expression for the
 {ITEM.VALUE1}/{ITEM.VALUE2}/{ITEM.VALUE3} macros (name, opdata, body).
 
 Usage:
-    python3 create_aggregate_triggers.py [--api-key /path/to/key]
+    create_aggregate_triggers [--api-key /path/to/key]
 
 The API key file contains the raw Zabbix API token (one line). The key is read
 from the file and never printed.
@@ -35,7 +35,10 @@ WARNING = 2
 HIGH = 4
 
 
-def call(token, method, params):
+def call(token: str, method: str, params) -> dict:
+    """Call the Zabbix JSON-RPC API and return the decoded response.
+    On HTTP or connection failure returns {"error": {"data": ...}} so the
+    caller can treat all failures uniformly."""
     payload = {"jsonrpc": "2.0", "method": method, "id": 1, "params": params}
     req = urllib.request.Request(
         API_URL,
@@ -53,7 +56,7 @@ def call(token, method, params):
         return {"error": {"data": f"connection failed: {e.reason}"}}
 
 
-def aggregate_expr(cmp_op, state_value):
+def aggregate_expr(cmp_op: str, state_value: int) -> str:
     """Build the aggregate trigger expression.
 
     The empty-string operand in the `summary.text <> ""` clause must appear as
@@ -68,7 +71,7 @@ def aggregate_expr(cmp_op, state_value):
     )
 
 
-def main():
+def main() -> None:
     key_file = DEFAULT_KEY_FILE
     argv = sys.argv[1:]
     if argv:
@@ -114,15 +117,23 @@ def main():
         trigger(">0", 2, HIGH, "the pending updates fix known CVEs"),
     ]
 
+    # Duplicate check up front: compare descriptions of the template's
+    # existing triggers instead of substring-matching an error message
+    # (whose wording varies between Zabbix versions).
+    r = call(token, "trigger.get",
+             {"output": ["description"], "host": [TEMPLATE]})
+    if "error" in r:
+        sys.exit(f"trigger.get failed: {r['error']}")
+    existing = {t["description"] for t in r.get("result", [])}
+
     created = 0
     for t in triggers:
+        if t["description"] in existing:
+            print(f"already present, skipping: {t['description']}")
+            continue
         r = call(token, "trigger.create", [t])
         if "error" in r:
-            data = r["error"].get("data", "")
-            if "already exists" in data:
-                print(f"already present, skipping: {t['description']}")
-            else:
-                print(f"trigger.create failed: {r['error']}")
+            print(f"trigger.create failed: {r['error']}")
         else:
             created += len(r.get("result", {}).get("triggerids", []))
             print(f"created trigger: {t['description']}")

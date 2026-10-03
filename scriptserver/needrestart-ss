@@ -85,7 +85,6 @@ html_escape() {
 run_html() {
     printf '%s' "$HTML_REPORT_HEAD"
     local rc
-    set +e
     "$@" 2>&1 | html_escape
     rc=${PIPESTATUS[0]}
     printf '%s' "$HTML_REPORT_TAIL"
@@ -122,7 +121,7 @@ list_hosts() {
 # containers (UCSTA line absent).
 run_scan() {
     local host=$1 out=$2 err=$3
-    timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" "$host" \
+    timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" -- "$host" \
         "timeout $SCAN_TIMEOUT needrestart -b -l -k -w" >"$out" 2>"$err"
 }
 
@@ -142,11 +141,7 @@ extract_flagged() {
 # is_flagged <unit>
 # Whether the unit is in FLAGGED_UNITS (exact match).
 is_flagged() {
-    local unit=$1 u
-    for u in "${FLAGGED_UNITS[@]}"; do
-        [[ $u == "$unit" ]] && return 0
-    done
-    return 1
+    [[ " ${FLAGGED_UNITS[*]} " == *" $1 "* ]]
 }
 
 # shquote <string>
@@ -185,6 +180,15 @@ do_status() {
         exit 1
     }
 
+    # Validate before use: hosts become ssh destinations (a leading dash
+    # would be parsed as an ssh option) and tmp file names. Deep links set
+    # Hosts= freely, so UI values are not to be trusted.
+    local vh
+    for vh in "${hosts[@]}"; do
+        [[ $vh =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
+            || { echo "bad host name: '$vh'" >&2; exit 1; }
+    done
+
     # Global (not local): the EXIT trap below must still see it at script
     # exit, where function locals are out of scope (set -u would abort).
     STATUS_TMP=$(mktemp -d)
@@ -203,7 +207,7 @@ do_status() {
     local rc=0
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
 
-    python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$LXC_RUNNER" "$ACTION_RESTART_UI" \
+    if ! python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$LXC_RUNNER" "$ACTION_RESTART_UI" \
         "$ACTION_STATUS_UI" "$LXC_DATA_PARAM" "$LXC_DATA_SCAN_UI" "$RESTART_MODE" \
         "$RESTART_MODE_RESTART_UI" <<'PYEOF'
 import glob, html, os, re, sys
@@ -215,10 +219,6 @@ from urllib.parse import quote
  restart_mode_restart_ui) = sys.argv[1:10]
 runner_enc = quote(restart_runner, safe="")
 lxc_runner_enc = quote(lxc_runner, safe="")
-
-
-def qkey(name):
-    return quote(name, safe="")
 UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
 
 
@@ -272,7 +272,7 @@ def restart_query(host, svals):
     # patch (script-server-dev recipe) the forced values are also not wiped
     # while the dependent Services list is still loading.
     parts = [f"Action={quote(action_restart_ui, safe='')}",
-             f"{qkey(restart_mode)}={quote(restart_mode_restart_ui, safe='')}",
+             f"{quote(restart_mode, safe='')}={quote(restart_mode_restart_ui, safe='')}",
              f"Hosts={quote(host, safe='')}"]
     parts += [f"Services={quote(host + ':' + v, safe='')}" for v in svals]
     return "&amp;".join(parts)
@@ -491,7 +491,7 @@ for (state, host, services, sessions, ksta, ucsta,
           f'<a target="_top" title="open the needrestart-lxc status report '
           f'for this host" '
           f'href="#/{lxc_runner_enc}?Action={quote(action_status_ui, safe="")}'
-          f'&amp;{qkey(lxc_data_param)}={quote(lxc_data_scan_ui, safe="")}'
+          f'&amp;{quote(lxc_data_param, safe="")}={quote(lxc_data_scan_ui, safe="")}'
           f'&amp;Hosts={quote(host, safe="")}">LXC containers</a>'
           f"</p>")
     if state == 2:
@@ -544,6 +544,10 @@ print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_sess} session(s), "
 print(f"<p>{CONTROLS}</p>")
 print("</body></html>")
 PYEOF
+    then
+        echo "report generation failed" >&2
+        exit 1
+    fi
     return $rc
 }
 
@@ -614,6 +618,7 @@ do_services() {
         echo "scan failed on every selected host" >&2
         exit 1
     fi
+    rm -rf "$tmpdir"
     trap - EXIT
 }
 
@@ -626,7 +631,7 @@ do_services() {
 # stdout when the unit must not be restarted, print nothing when it may be.
 unit_guard() {
     local host=$1 unit=$2 show load ref
-    show=$(timeout $GUARD_TIMEOUT ssh "${SSH_OPTS[@]}" "$host" -- \
+    show=$(timeout $GUARD_TIMEOUT ssh "${SSH_OPTS[@]}" -- "$host" \
         "systemctl show -p LoadState -p RefuseManualStop --value $(shquote "$unit")") \
         || { printf 'systemctl show failed on %s' "$host"; return; }
     load=$(sed -n 1p <<<"$show")
@@ -647,14 +652,15 @@ do_restart() {
     # passed on.
     #   --hosts h1,h2             run on these host(s)
     #   --targets h1:svc1,h2:svc2 (from the status report; host-qualified)
-    #   --exclude RE, --action dry-run|restart
+    #   --exclude RE, --action dry-run|restart (defaults to dry-run; the
+    #                             runner always passes --action explicitly)
     #   --allow-all     permit restarting ALL flagged services when no
     #                   targets are given (safety: without it, a real restart
     #                   with an empty service selection is refused)
     # Each host is scanned fresh and only still-flagged selections are
     # processed; execution is sequential in one HTML log, exit code is
     # non-zero if any host failed.
-    local hostspec="" exclude="" action="restart" allow_all=0
+    local hostspec="" exclude="" action="dry-run" allow_all=0
     while (($#)); do
         case $1 in
             --host|--hosts) [[ -n ${2:-} ]] || { echo "missing argument after $1"; exit 1; }
@@ -686,7 +692,7 @@ do_restart() {
     local -A groups=()
     local -a hostlist=()
     if [[ -n ${targets:-} ]]; then
-        [[ $targets =~ ^[A-Za-z0-9.-]+:[A-Za-z0-9._@-]+(,[A-Za-z0-9.-]+:[A-Za-z0-9._@-]+)*$ ]] \
+        [[ $targets =~ ^[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._@-]+(,[A-Za-z0-9][A-Za-z0-9.-]*:[A-Za-z0-9._@-]+)*$ ]] \
             || { echo "bad --targets format (expected comma-separated host:service pairs)"; exit 1; }
         local -a toks
         local tok h sv
@@ -702,7 +708,7 @@ do_restart() {
             fi
         done
     else
-        [[ $hostspec =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] \
+        [[ $hostspec =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(,[A-Za-z0-9][A-Za-z0-9.-]*)*$ ]] \
             || { echo "bad --hosts format (expected host[,host...])"; exit 1; }
         IFS=',' read -ra hostlist <<< "$hostspec"
         for h in "${hostlist[@]}"; do groups[$h]=""; done
@@ -723,13 +729,15 @@ do_restart() {
         fi
     fi
 
-    local rc=0 h csv unit reason out err
+    local rc=0 h csv unit reason out err scan_rc
     out=$(mktemp); err=$(mktemp)
     trap 'rm -f "$out" "$err"' EXIT
     for h in "${hostlist[@]}"; do
         echo "=== $h ==="
-        if ! run_scan "$h" "$out" "$err"; then
-            echo "scan failed on $h (rc $?); skipping host"
+        # 'if ! run_scan' would invert the status; capture the real rc
+        scan_rc=0; run_scan "$h" "$out" "$err" || scan_rc=$?
+        if [[ $scan_rc != 0 ]]; then
+            echo "scan failed on $h (rc $scan_rc); skipping host"
             tail -n 3 "$err" | sed 's/^/    /'
             rc=1
             continue
@@ -763,7 +771,7 @@ do_restart() {
                 echo "  (dry run) systemctl restart $unit"
             else
                 echo "  restarting $unit"
-                if ! timeout $RESTART_TIMEOUT ssh "${SSH_OPTS[@]}" "$h" -- \
+                if ! timeout $RESTART_TIMEOUT ssh "${SSH_OPTS[@]}" -- "$h" \
                     "systemctl restart $(shquote "$unit")"; then
                     echo "  $unit: systemctl restart FAILED"
                     rc=1
