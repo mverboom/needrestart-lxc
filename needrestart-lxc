@@ -140,11 +140,13 @@ CONT_CVES = {}         # key -> security analysis lines
 CONT_CVE_COUNTS = {}   # key -> total CVEs fixed
 CONT_UPDATE_COUNTS = {}  # "ctid|srcpkg|old|new" -> CVEs fixed by this update
 CONT_MAX_CVSS = {}     # ctid -> highest CVSS base score found for the container
+CONT_KEY_MAX_CVSS = {}  # "ctid:user_uid:service" -> highest CVSS among its updates
 CT_CVE_UNKNOWN = set()  # ctids where CVE analysis failed (data indeterminate)
 CT_OS_ID = {}          # ctid -> os id (debian/ubuntu/...)
 CT_OS_RELEASE = {}     # ctid -> VERSION_ID (e.g. 12, 22.04)
 CT_OS_CODENAME = {}    # ctid -> VERSION_CODENAME (e.g. bookworm, jammy)
 EXT_VERDICTS = {}      # "ctid|srcpkg|old|new" -> cached verdict line
+EXT_VERDICT_CVSS = {}  # "ctid|srcpkg|old|new" -> highest CVSS for that update
 CT_NOTES = {}          # ctid -> reason why analysis was skipped
 
 
@@ -695,7 +697,10 @@ def print_security_annotation(key):
     if SECURITY and not VERBOSE:
         n = CONT_CVE_COUNTS.get(key, 0)
         if n > 0:
-            print(f" ({n} CVE{'' if n == 1 else 's'})", end="")
+            best = CONT_KEY_MAX_CVSS.get(key)
+            cvss = f"{best:.1f}" if best is not None else "n/a"
+            print(f" ({n} CVE{'' if n == 1 else 's'}, highest CVSS {cvss})",
+                  end="")
     print()
 
 
@@ -875,7 +880,9 @@ def interactive_restart():
             cve_count = CONT_CVE_COUNTS.get(key, 0)
             if cve_count > 0:
                 plural = "" if cve_count == 1 else "s"
-                suffix += f" ({cve_count} CVE{plural})"
+                best = CONT_KEY_MAX_CVSS.get(key)
+                cvss = f"{best:.1f}" if best is not None else "n/a"
+                suffix += f" ({cve_count} CVE{plural}, highest CVSS {cvss})"
         if invasive:
             suffix += " [invasive]"
         # Truncate the base only, so the markers always survive.
@@ -1390,6 +1397,7 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
     root = ct_root(ctid)
     count = 0
     verdict = ""
+    best_cvss = None
 
     if not old:
         result = changelog_verdict(root, binpkg, srcpkg, "", new)
@@ -1441,6 +1449,7 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
                     except ValueError:
                         cvss_score = None
                     if cvss_score is not None:
+                        best_cvss = max(best_cvss or 0.0, cvss_score)
                         CONT_MAX_CVSS[ctid] = max(
                             CONT_MAX_CVSS.get(ctid, 0.0), cvss_score)
             if count > 0:
@@ -1460,6 +1469,7 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
                 verdict = f"{binpkg} {old} -> {new}: security data unavailable (offline?)"
                 CT_CVE_UNKNOWN.add(ctid)
 
+    EXT_VERDICT_CVSS[verdict_key] = best_cvss
     EXT_VERDICTS[verdict_key] = f"{count}\t{verdict}"
     return EXT_VERDICTS[verdict_key]
 
@@ -1507,6 +1517,10 @@ def analyze_service_libs(ctid, key, root, start_epoch, libs):
         result = security_analysis(ctid, srcpkg, binpkg, old, curver)
         count, verdict = result.split("\t", 1)
         CONT_UPDATE_COUNTS[vkey] = int(count)
+        update_cvss = EXT_VERDICT_CVSS.get(vkey)
+        if update_cvss is not None:
+            CONT_KEY_MAX_CVSS[key] = max(
+                CONT_KEY_MAX_CVSS.get(key, 0.0), update_cvss)
         CONT_CVES[key] = (CONT_CVES.get(key, "") +
                           ("\n" if CONT_CVES.get(key) else "") + verdict)
         CONT_CVE_COUNTS[key] = CONT_CVE_COUNTS.get(key, 0) + int(count)

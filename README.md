@@ -150,13 +150,14 @@ by -d or --deep.
 
 The security scan (`-s` or `--security`) goes one step further: for every stale library it determines the
 owning dpkg package, the version the stale process is actually running, and whether the pending update is
-a security fix — including how many CVEs it addresses.
+a security fix — including how many CVEs it addresses and the highest CVSS base score among them.
 
-With `-s` alone the output stays on a single line and appends the total CVE count:
+With `-s` alone the output stays on a single line and appends the total CVE count and the highest CVSS
+base score among those CVEs (`n/a` when none has a published score):
 
 ```
 needrestart-lxc -c 100 -s
-Container 100 (gw.cnw.verboom.net): service unbound.service needs restart (1 CVE)
+Container 100 (gw.cnw.verboom.net): service unbound.service needs restart (1 CVE, highest CVSS 7.5)
 ```
 
 With `-s -v` the per-package details are shown below the service line:
@@ -165,7 +166,7 @@ With `-s -v` the per-package details are shown below the service line:
 needrestart-lxc -c 100 -s -v
 Container 100 (gw.cnw.verboom.net): service unbound.service needs restart
   - /usr/lib/x86_64-linux-gnu/libcrypto.so.3
-  [security] libssl3 3.0.11-1~deb12u1 -> 3.0.11-1~deb12u2: SECURITY update, fixes 1 CVE (CVE-2023-5363) [OSV]
+  [security] libssl3 3.0.11-1~deb12u1 -> 3.0.11-1~deb12u2: SECURITY update, fixes 1 CVE (CVE-2023-5363, CVSS 7.5) [OSV]
 ```
 
 How it works:
@@ -185,9 +186,9 @@ is more accurate than assuming "last upgrade": a long-running daemon can be seve
    - **Fallback (offline)**: the package's `changelog.Debian.gz` inside the container is parsed for
      CVE references between the old and new versions. Security uploads are detected by the
      `-security`/`-updates` suite marker in the changelog entry headers.
-4. **Output** — with `-s` alone each service line gets a `(N CVEs)` suffix (the total across all
-packages of that service); with `-s -v` the per-package verdicts are printed below the line. The same
-applies in `-r`/`-n` (restart/dry-run) mode, right before the restart.
+4. **Output** — with `-s` alone each service line gets a `(N CVEs, highest CVSS x.y)` suffix (the total
+across all packages of that service); with `-s -v` the per-package verdicts are printed below the line. The
+same applies in `-r`/`-n` (restart/dry-run) mode, right before the restart.
 
 Caveats:
 
