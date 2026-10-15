@@ -320,6 +320,7 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                             <name>{#CTNAME}: {ITEM.VALUE1} services need restart</name>
                             <opdata>{ITEM.VALUE2} CVEs, highest CVSS {ITEM.VALUE4}</opdata>
                             <priority>WARNING</priority>
+                            <manual_close>YES</manual_close>
                             <description>Services inside the container run with outdated shared libraries; no known security fixes are pending (CVE analysis completed with a genuine zero). Restart the affected services (see the details item for specifics).</description>
                             <tags>
                                 <tag>
@@ -334,6 +335,7 @@ A cron job refreshes the JSON every 15 minutes; the agent check only reads the f
                             <name>{#CTNAME}: {ITEM.VALUE1} services need restart</name>
                             <opdata>{ITEM.VALUE2} CVEs, highest CVSS {ITEM.VALUE4}</opdata>
                             <priority>HIGH</priority>
+                            <manual_close>YES</manual_close>
                             <description>Pending updates in the container fix known CVEs; restart the affected services to apply them (see the details item for the CVE list).</description>
                             <tags>
                                 <tag>

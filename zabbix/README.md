@@ -32,6 +32,11 @@ macros). Tested against Zabbix 7.4.
     updates fix known CVEs, e.g. `test.lnw.verbo.net: 16 services need restart`,
     opdata `15 CVEs, highest CVSS 9.8`)
 
+Both trigger prototypes allow **manual close** (matching the host-level
+`Template needrestart` triggers), so an operator can close a restart alert they
+have handled; the problem re-fires on the next problem cycle after the trigger
+recovers.
+
 `cves_ok` records whether the CVE analysis completed (1) or was indeterminate
 (0 — the online lookup failed *and* no changelog verdict was available, so the
 true count is unknowable). Indeterminate containers still alert: `state` = 1
@@ -84,6 +89,7 @@ items plus two aggregate triggers:
   (count &gt; 0 and CVEs &gt; 0). Anchored on the single `summary.state` value for the
   same race-resistance as the per-container triggers; the `max_cvss` term is a
   harmless always-true clause that only gives the item a `{ITEM.VALUE5}` slot.
+  Both aggregate triggers also allow **manual close**.
 
 > **Note:** Zabbix 7.0 does not support template-level triggers in the XML
 > export format (the template schema only allows triggers nested under items

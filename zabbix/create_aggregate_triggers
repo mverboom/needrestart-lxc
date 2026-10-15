@@ -108,6 +108,7 @@ def main() -> None:
             "description": "{HOST.NAME}: {ITEM.VALUE1} containers need restart",
             "opdata": "{ITEM.VALUE2} CVEs, highest CVSS {ITEM.VALUE5}",
             "priority": priority,
+            "manual_close": 1,
             "comments": (
                 "Aggregate alert: one or more containers have services needing a "
                 f"restart and {cause}. The notification message can include the "
@@ -130,7 +131,7 @@ def main() -> None:
     # expandExpression returns the readable expression so it can be compared.
     r = call(token, "trigger.get",
              {"output": ["triggerid", "description", "opdata", "priority",
-                         "expression"],
+                         "expression", "manual_close"],
               "templateids": [templateid], "expandExpression": True})
     if "error" in r:
         sys.exit(f"trigger.get failed: {r['error']}")
@@ -150,13 +151,15 @@ def main() -> None:
                 print(f"created trigger: {t['description']}")
             continue
         if (old.get("opdata", "") == t["opdata"]
-                and old.get("expression", "") == t["expression"]):
+                and old.get("expression", "") == t["expression"]
+                and old.get("manual_close", "0") == str(t["manual_close"])):
             print(f"already up to date, skipping: {t['description']}")
             continue
         r = call(token, "trigger.update",
                  {"triggerid": old["triggerid"],
                   "expression": t["expression"],
-                  "opdata": t["opdata"]})
+                  "opdata": t["opdata"],
+                  "manual_close": t["manual_close"]})
         if "error" in r:
             print(f"trigger.update failed: {r['error']}")
         else:
