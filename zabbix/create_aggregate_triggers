@@ -122,21 +122,25 @@ def main() -> None:
         trigger(">0", 2, HIGH, "the pending updates fix known CVEs"),
     ]
 
-    # Update existing triggers in place when their opdata differs (idempotent
-    # re-run after the template gained summary.max_cvss); create the missing
-    # ones. Compare opdata rather than the expression because trigger.get
-    # returns expressions with functions collapsed to {itemid} references.
+    # Update existing triggers in place when their expression or opdata
+    # differs (idempotent re-run after the template gained summary.max_cvss);
+    # create the missing ones. The two aggregate triggers deliberately share
+    # one name, so they are keyed by (name, severity): keying by name alone
+    # updates the same trigger twice and leaves the other one stale.
+    # expandExpression returns the readable expression so it can be compared.
     r = call(token, "trigger.get",
-             {"output": ["triggerid", "description", "opdata"],
-              "host": [TEMPLATE]})
+             {"output": ["triggerid", "description", "opdata", "priority",
+                         "expression"],
+              "templateids": [templateid], "expandExpression": True})
     if "error" in r:
         sys.exit(f"trigger.get failed: {r['error']}")
-    existing = {t["description"]: t for t in r.get("result", [])}
+    existing = {(t["description"], t["priority"]): t
+                for t in r.get("result", [])}
 
     created = 0
     updated = 0
     for t in triggers:
-        old = existing.get(t["description"])
+        old = existing.get((t["description"], str(t["priority"])))
         if old is None:
             r = call(token, "trigger.create", [t])
             if "error" in r:
@@ -145,7 +149,8 @@ def main() -> None:
                 created += len(r.get("result", {}).get("triggerids", []))
                 print(f"created trigger: {t['description']}")
             continue
-        if old.get("opdata", "") == t["opdata"]:
+        if (old.get("opdata", "") == t["opdata"]
+                and old.get("expression", "") == t["expression"]):
             print(f"already up to date, skipping: {t['description']}")
             continue
         r = call(token, "trigger.update",
