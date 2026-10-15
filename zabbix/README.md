@@ -11,23 +11,26 @@ macros). Tested against Zabbix 7.4.
 - A master item (`needrestart.lxc.master`) reads a JSON document with one entry
   per running container: `ctid`, `name`, `services` (needing restart), `cves`
   (unique CVEs fixed by the pending updates), `cves_ok` (whether CVE analysis is
-  complete), `state` (0 = no alert, 1 = warning, 2 = high), `invasive`/
+  complete), `max_cvss` (highest CVSS base score among those CVEs, or `n/a`),
+  `state` (0 = no alert, 1 = warning, 2 = high), `invasive`/
   `invasive_services` (count and names of flagged services needrestart would
   defer as potentially invasive; used by the script-server report, not by the
   triggers) and `details` (human-readable per-service breakdown).
 - A discovery rule (`needrestart.lxc.discovery`, dependent on the master)
   discovers every container; each gets dependent items including
   `needrestart.lxc.services[{#CTID}]`, `needrestart.lxc.cves[{#CTID}]`,
-  `needrestart.lxc.state[{#CTID}]` and `needrestart.lxc.details[{#CTID}]`.
+  `needrestart.lxc.state[{#CTID}]`, `needrestart.lxc.max_cvss[{#CTID}]` and
+  `needrestart.lxc.details[{#CTID}]`.
 - Two mutually exclusive trigger prototypes per container (exactly one problem
   is open at a time, so the alert list stays clean). Both read the container's
   single consolidated `state` item (0/1/2) as the firing source:
   - **WARNING** — `{#CTNAME}: {ITEM.VALUE1} services need restart`, opdata
-    `{ITEM.VALUE2} CVEs` — fires when `state` = 1 (restart needed without known
-    CVEs — including the indeterminate-analysis case)
+    `{ITEM.VALUE2} CVEs, highest CVSS {ITEM.VALUE4}` — fires when `state` = 1
+    (restart needed without known CVEs — including the indeterminate-analysis
+    case)
   - **HIGH** — same name and opdata — fires when `state` = 2 (the pending
     updates fix known CVEs, e.g. `test.lnw.verbo.net: 16 services need restart`,
-    opdata `15 CVEs`)
+    opdata `15 CVEs, highest CVSS 9.8`)
 
 `cves_ok` records whether the CVE analysis completed (1) or was indeterminate
 (0 — the online lookup failed *and* no changelog verdict was available, so the
@@ -48,14 +51,22 @@ visible in the data. Containers where CVE analysis is not applicable
 > makes the trigger atomic and eliminates the race.
 
 The severity reflects risk rather than an outage: pending restarts are
-WARNING, pending restarts that fix known CVEs are HIGH.
+WARNING, pending restarts that fix known CVEs are HIGH. The CVSS figure does
+not change the severity; it is informational only.
+
+> **CVSS source:** for Ubuntu containers the score is the `cvss3` value from
+> the Ubuntu Security API; for Debian containers it is the base score computed
+> from the CVSS vector in the OSV response. Neither is a new network
+> dependency (the host already performs these lookups for the CVE count). A
+> CVE with no published metric, or with only a CVSS v4 vector, yields no score,
+> and a container where none of its CVEs are scored reports `n/a`.
 
 ### Aggregate alert (one email instead of one per container)
 
 When many containers need a restart at once, the per-container triggers would
 otherwise generate one notification each (e.g. 130 emails). To collapse this
 into a single email while keeping the full impact visible, the JSON also
-carries a `summary` block and the template adds three host-level dependent
+carries a `summary` block and the template adds four host-level dependent
 items plus two aggregate triggers:
 
 - `needrestart.lxc.summary.count` — how many containers need a restart
@@ -64,20 +75,25 @@ items plus two aggregate triggers:
   container with its service/CVE counts (the email body)
 - `needrestart.lxc.summary.state` — consolidated alert state for the episode
   (0 = none, 1 = warning, 2 = high)
+- `needrestart.lxc.summary.max_cvss` — highest CVSS base score across all
+  containers needing a restart, or `n/a`
 - **WARNING** aggregate trigger — `{HOST.NAME}: {ITEM.VALUE1} containers need
-  restart`, opdata `{ITEM.VALUE2} CVEs` — fires when `summary.state` = 1
+  restart`, opdata `{ITEM.VALUE2} CVEs, highest CVSS {ITEM.VALUE5}` — fires when
+  `summary.state` = 1
 - **HIGH** aggregate trigger — same name/opdata — fires when `summary.state` = 2
   (count &gt; 0 and CVEs &gt; 0). Anchored on the single `summary.state` value for the
-  same race-resistance as the per-container triggers.
+  same race-resistance as the per-container triggers; the `max_cvss` term is a
+  harmless always-true clause that only gives the item a `{ITEM.VALUE5}` slot.
 
 > **Note:** Zabbix 7.0 does not support template-level triggers in the XML
 > export format (the template schema only allows triggers nested under items
 > or as LLD trigger prototypes). The two aggregate triggers are therefore **not
 > part of `template_needrestart_lxc.xml`** — they are created once on the
 > template via the API (`trigger.create`, expression referencing
-> `needrestart.lxc.summary.count`/`.cves`/`.text`), which propagates them to
-> every linked host. See `zabbix/create_aggregate_triggers` for the exact
-> call; re-run it after re-importing the template if the triggers are missing.
+> `needrestart.lxc.summary.count`/`.cves`/`.text`/`.max_cvss`), which propagates
+> them to every linked host. See `zabbix/create_aggregate_triggers` for the exact
+> call; re-run it after re-importing the template if the triggers are missing
+> or their text needs the new `max_cvss` clause.
 
 Both aggregate triggers carry the tag `needrestart=aggregate`; the per-container
 triggers carry `needrestart=container`. To get **one email per episode** with
@@ -94,7 +110,8 @@ tag:
    {ITEM.VALUE3}
    ```
 
-   `{ITEM.VALUE1}` is the container count and `{ITEM.VALUE2}` the CVE count.
+   `{ITEM.VALUE1}` is the container count, `{ITEM.VALUE2}` the CVE count and
+   `{ITEM.VALUE5}` the highest CVSS base score.
 
 The per-container triggers stay active and visible in the Zabbix problem list
 for per-container tracking; they just no longer generate their own emails.

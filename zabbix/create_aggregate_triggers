@@ -11,8 +11,9 @@ after re-importing the template if the triggers are missing.
 The firing condition is anchored on the consolidated summary.state item
 (value 1 = warning, value 2 = high) so the aggregate trigger evaluates a
 single value instead of racing across summary.count / summary.cves /
-summary.text. count / cves / text are kept in the expression for the
-{ITEM.VALUE1}/{ITEM.VALUE2}/{ITEM.VALUE3} macros (name, opdata, body).
+summary.text. count / cves / text / max_cvss are kept in the expression for
+the {ITEM.VALUE1}/{ITEM.VALUE2}/{ITEM.VALUE3}/{ITEM.VALUE5} macros (name,
+opdata, body; VALUE4 is summary.state).
 
 Usage:
     create_aggregate_triggers [--api-key /path/to/key]
@@ -60,14 +61,18 @@ def aggregate_expr(cmp_op: str, state_value: int) -> str:
     """Build the aggregate trigger expression.
 
     The empty-string operand in the `summary.text <> ""` clause must appear as
-    two double-quote characters in the final expression.
+    two double-quote characters in the final expression. The trailing
+    max_cvss term is always true; it only exists to give the item a position
+    so {ITEM.VALUE5} resolves in the alert text.
     """
     empty = '""'
+    never = '"__never__"'
     return (
         f"last(/{TEMPLATE}/needrestart.lxc.summary.count)>0 and "
         f"last(/{TEMPLATE}/needrestart.lxc.summary.cves){cmp_op} and "
         f"last(/{TEMPLATE}/needrestart.lxc.summary.text)<>{empty} and "
-        f"last(/{TEMPLATE}/needrestart.lxc.summary.state)={state_value}"
+        f"last(/{TEMPLATE}/needrestart.lxc.summary.state)={state_value} and "
+        f"last(/{TEMPLATE}/needrestart.lxc.summary.max_cvss,#1)<>{never}"
     )
 
 
@@ -101,7 +106,7 @@ def main() -> None:
         return {
             "expression": aggregate_expr(cmp_op, state_value),
             "description": "{HOST.NAME}: {ITEM.VALUE1} containers need restart",
-            "opdata": "{ITEM.VALUE2} CVEs",
+            "opdata": "{ITEM.VALUE2} CVEs, highest CVSS {ITEM.VALUE5}",
             "priority": priority,
             "comments": (
                 "Aggregate alert: one or more containers have services needing a "
@@ -117,29 +122,44 @@ def main() -> None:
         trigger(">0", 2, HIGH, "the pending updates fix known CVEs"),
     ]
 
-    # Duplicate check up front: compare descriptions of the template's
-    # existing triggers instead of substring-matching an error message
-    # (whose wording varies between Zabbix versions).
+    # Update existing triggers in place when their opdata differs (idempotent
+    # re-run after the template gained summary.max_cvss); create the missing
+    # ones. Compare opdata rather than the expression because trigger.get
+    # returns expressions with functions collapsed to {itemid} references.
     r = call(token, "trigger.get",
-             {"output": ["description"], "host": [TEMPLATE]})
+             {"output": ["triggerid", "description", "opdata"],
+              "host": [TEMPLATE]})
     if "error" in r:
         sys.exit(f"trigger.get failed: {r['error']}")
-    existing = {t["description"] for t in r.get("result", [])}
+    existing = {t["description"]: t for t in r.get("result", [])}
 
     created = 0
+    updated = 0
     for t in triggers:
-        if t["description"] in existing:
-            print(f"already present, skipping: {t['description']}")
+        old = existing.get(t["description"])
+        if old is None:
+            r = call(token, "trigger.create", [t])
+            if "error" in r:
+                print(f"trigger.create failed: {r['error']}")
+            else:
+                created += len(r.get("result", {}).get("triggerids", []))
+                print(f"created trigger: {t['description']}")
             continue
-        r = call(token, "trigger.create", [t])
+        if old.get("opdata", "") == t["opdata"]:
+            print(f"already up to date, skipping: {t['description']}")
+            continue
+        r = call(token, "trigger.update",
+                 {"triggerid": old["triggerid"],
+                  "expression": t["expression"],
+                  "opdata": t["opdata"]})
         if "error" in r:
-            print(f"trigger.create failed: {r['error']}")
+            print(f"trigger.update failed: {r['error']}")
         else:
-            created += len(r.get("result", {}).get("triggerids", []))
-            print(f"created trigger: {t['description']}")
+            updated += 1
+            print(f"updated trigger: {t['description']}")
 
-    print(f"done. created {created} aggregate trigger(s) on template "
-          f"'{TEMPLATE}' (id {templateid}).")
+    print(f"done. created {created} and updated {updated} aggregate trigger(s) "
+          f"on template '{TEMPLATE}' (id {templateid}).")
 
 
 if __name__ == "__main__":

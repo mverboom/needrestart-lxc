@@ -179,7 +179,7 @@ is more accurate than assuming "last upgrade": a long-running daemon can be seve
 3. **CVE lookup** — the version delta is checked against security data, queried online and cached for
 24h in `/var/cache/needrestart-lxc`:
    - **Debian**: the [OSV](https://osv.dev) API (per-package query by version, filtered to the
-     container's Debian release).
+     container's Debian release); the CVSS base score is computed from the CVSS vector OSV reports.
    - **Ubuntu**: the [Ubuntu Security API](https://ubuntu.com/security/api/docs) (`cves.json` per
      source package, filtered by release codename and `released` status; includes CVSS scores).
    - **Fallback (offline)**: the package's `changelog.Debian.gz` inside the container is parsed for
@@ -252,8 +252,11 @@ lookup is indeterminate (online lookup failed and no changelog verdict), no
 trigger fires and the alert is deferred to the next scan, avoiding a false
 WARNING that would later be superseded by a HIGH.
 
-The problem reads `container: N services need restart` with the CVE count as
-operational data; exactly one problem is open per container at a time.
+The problem reads `container: N services need restart` with the CVE count and
+the highest CVSS base score among those CVEs as operational data; exactly one
+problem is open per container at a time. The score is derived from the online
+security data (the Ubuntu API's `cvss3`, or the CVSS vector OSV reports for
+Debian) and is `n/a` when no CVE has a published score.
 
 The scan runs via cron so the agent check stays fast; see
 [`zabbix/README.md`](zabbix/README.md) for the full installation guide,
@@ -262,5 +265,5 @@ the template and the config snippets. Requires Zabbix 7.0 or newer.
 ```
 needrestart-lxc --zabbix
 {"containers": [{"ctid": "124", "name": "test.lnw.verboom.net",
-  "services": 6, "cves": 15, "cves_ok": 1, "details": "..."}, ...]}
+  "services": 6, "cves": 15, "cves_ok": 1, "max_cvss": "9.8", "details": "..."}, ...]}
 ```
