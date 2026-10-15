@@ -312,6 +312,7 @@ print(f"<p class=meta>mode: {esc(mode)} &mdash; generated {esc(datetime.now().st
       f"&nbsp; {CONTROLS}</p>")
 
 total_svc = total_cve = 0
+total_max_cvss = None
 files = sorted(glob.glob(os.path.join(tmpdir, "*.json")))
 for path in files:
     host = os.path.basename(path)[:-len(".json")]
@@ -337,13 +338,20 @@ for path in files:
     flagged = [c for c in containers if c.get("services", 0) > 0]
     total_svc += sum(c["services"] for c in flagged)
     total_cve += sum(c.get("cves", 0) for c in flagged)
+    for c in flagged:
+        try:
+            score = float(c.get("max_cvss"))
+        except (TypeError, ValueError):
+            continue
+        total_max_cvss = (score if total_max_cvss is None
+                          else max(total_max_cvss, score))
     print(f"<h3>{esc(host)}</h3>")
     print(f'<p class=meta>{len(flagged)} of {len(containers)} '
           f"container(s) need a restart</p>")
     print(f'<table border=1 cellpadding=4 cellspacing=0 data-host="{esc(host)}">')
     print(f"<tr><th title='tick to select/deselect all containers of this host'>"
           f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th><th>CT</th><th>Name</th>"
-          f"<th>Services</th><th>CVEs</th><th>State</th>"
+          f"<th>Services</th><th>CVEs</th><th>CVSS</th><th>State</th>"
           f"<th title='services needrestart would defer restarting as potentially invasive'>"
           f"Invasive</th><th>Details</th></tr>")
     # Deep links must prefill the restart runner's Container multiselect, whose
@@ -367,6 +375,9 @@ for path in files:
         else:
             sel = ""
         name = esc(c.get("name", "?"))
+        cvss = c.get("max_cvss") or "n/a"
+        cvss_cell = (esc(cvss) if cvss != "n/a"
+                     else "<span style='color:#6e7781'>n/a</span>")
         inv = c.get("invasive", 0) or 0
         inv_names = ", ".join(c.get("invasive_services") or [])
         inv_cell = (f'<span class=inv title="{esc(inv_names)}">'
@@ -375,6 +386,7 @@ for path in files:
               f'<td class=name title="{name}">{name}</td>'
               f"<td style='text-align:right'>{svc}</td>"
               f"<td style='text-align:right'>{cves}</td>"
+              f"<td style='text-align:right'>{cvss_cell}</td>"
               f"<td>{badge(c.get('state', 0))}</td>"
               f"<td>{inv_cell}</td>"
               f"<td class=details>{details}</td></tr>")
@@ -384,7 +396,8 @@ for path in files:
               f"<pre style='margin:2px'>{esc(err[-2000:])}</pre></p>")
 
 print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s) "
-      f"across {len(files)} host(s).</p>")
+      f"across {len(files)} host(s); highest CVSS "
+      f"{f'{total_max_cvss:.1f}' if total_max_cvss is not None else 'n/a'}.</p>")
 print(f"<p>{CONTROLS}</p>")
 print("</body></html>")
 PYEOF

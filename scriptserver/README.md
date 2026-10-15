@@ -63,7 +63,8 @@ switch the UI renderer (the report would be dumped as raw text).
   sessions; rows flag services needrestart would defer as potentially invasive
   (Invasive column).
 - `needrestart-lxc`: HTML report per host: containers, state badge (clean /
-  restart / CVEs), services and CVE verdicts, Invasive badge. Two data
+  restart / CVEs), services, CVE count and highest CVSS score, CVE verdicts,
+  Invasive badge. Two data
   sources — **Scan now** (`needrestart-lxc --zabbix`, fresh incl. CVE analysis)
   and **Cached** (`/var/cache/needrestart-lxc/zabbix.json`, at most 15 minutes
   old).
