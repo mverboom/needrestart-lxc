@@ -8,7 +8,7 @@
       "type": "multiselect",
       "description": "Host(s) to run on. The Services list refreshes from a fresh scan of the selection.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-ss hosts",
+        "script": "run-needrestart-ss hosts",
         "shell": false
       }
     },
@@ -18,7 +18,7 @@
       "type": "multiselect",
       "description": "host:service entries to restart. Usually prefilled from the needrestart report. Empty selection = only a dry run, or a real restart of ALL flagged services if 'Allow all' is ticked.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-ss services --hosts ${Hosts}",
+        "script": "run-needrestart-ss services --hosts ${Hosts}",
         "shell": false
       }
     },

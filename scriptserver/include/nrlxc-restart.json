@@ -8,7 +8,7 @@
       "type": "multiselect",
       "description": "Proxmox host(s) to run on. The Containers list refreshes from the cached report of the selection.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-lxc-ss hosts",
+        "script": "run-needrestart-lxc-ss hosts",
         "shell": false
       }
     },
@@ -18,7 +18,7 @@
       "type": "multiselect",
       "description": "host:container entries to restart. Usually prefilled from the list report. Empty selection = only a dry run, or a real restart of ALL flagged containers if 'Allow all' is ticked.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-lxc-ss containers --hosts ${Hosts}",
+        "script": "run-needrestart-lxc-ss containers --hosts ${Hosts}",
         "shell": false
       }
     },

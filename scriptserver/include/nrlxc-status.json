@@ -13,7 +13,7 @@
       "type": "multiselect",
       "description": "Proxmox hosts to report on (distro explorer == proxmox). May stay empty when 'All hosts' is ticked.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-lxc-ss hosts",
+        "script": "run-needrestart-lxc-ss hosts",
         "shell": false
       },
       "multiselect_argument_type": "argument_per_value"

@@ -7,9 +7,12 @@ needrestart and needrestart-lxc across the managed hosts.
 
 - The cdist user's SSH lands as root on every managed host, where cdist deploys
   `/usr/local/bin/needrestart-lxc` (see `manifest/autorun/zabbix-agent-config`).
-- script-server runners execute as the cdist user
-  (`sudo -u cdist -i needrestart-ss ...` / `... needrestart-lxc-ss ...`), so the
-  wrappers can simply `ssh <host>` to run scans or restarts.
+- The runner JSON contains no user or privilege: it calls `run-needrestart-ss` /
+  `run-needrestart-lxc-ss`. The `run-<command>` prefix means "the same command,
+  executed with whatever privilege this site needs", so the installer provides
+  those files; they are not in this repository. With the recommended shim that
+  is `sudo -u cdist -i`, and the wrapper can then simply `ssh <host>` to run
+  scans or restarts.
 - There are **two runners**, one per tool: `needrestart` and
   `needrestart-lxc`. Each has an **Action** pulldown (`Status report` /
   `Restart flagged services`); the selected value is passed to the wrapper as
@@ -103,7 +106,26 @@ On the cdist control host:
 
 ```sh
 cd /home/cdist/files.external/needrestart-lxc.git && git pull --ff-only origin master
-# wrappers: symlinked into ~cdist/bin (survive git pulls)
+
+# site wrappers: only these lines decide the user/privilege and the mechanism
+# (sudo, doas, or nothing). They live in script-server's own scripts folder,
+# which is appended to the service PATH (so it cannot shadow system commands)
+# in /etc/default/script-server-dev; restart the service once after a PATH
+# change. Any directory already on PATH works too.
+mkdir -p /etc/script-server-dev/scripts
+cat > /etc/script-server-dev/scripts/run-needrestart-ss <<'EOF'
+#!/bin/sh
+exec sudo -u cdist -i -- /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart-ss "$@"
+EOF
+chmod 755 /etc/script-server-dev/scripts/run-needrestart-ss
+
+cat > /etc/script-server-dev/scripts/run-needrestart-lxc-ss <<'EOF'
+#!/bin/sh
+exec sudo -u cdist -i -- /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart-lxc-ss "$@"
+EOF
+chmod 755 /etc/script-server-dev/scripts/run-needrestart-lxc-ss
+
+# wrappers: symlinked into ~cdist/bin for interactive use (survive git pulls)
 ln -sfn ../files.external/needrestart-lxc.git/scriptserver/needrestart-ss \
         /home/cdist/bin/needrestart-ss
 ln -sfn ../files.external/needrestart-lxc.git/scriptserver/needrestart-lxc-ss \
@@ -124,7 +146,8 @@ symlinks into the checkout, the action includes are read from the checkout by
 absolute path, and script-server re-reads runner files from disk on every page
 load — no service restart needed. (Caveat: editing a runner through
 script-server's admin UI would write through the symlink into the git
-checkout; treat the checkout as the single source of truth.)
+checkout; treat the checkout as the single source of truth.) The site shims
+change only when the user, the privilege mechanism or the checkout path does.
 
 ## Host lists
 

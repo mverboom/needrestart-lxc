@@ -13,7 +13,7 @@
       "type": "multiselect",
       "description": "Hosts to report on (hosts with the needrestart package installed per cdist explorer data). May stay empty when 'All hosts' is ticked.",
       "values": {
-        "script": "sudo -u cdist -i needrestart-ss hosts",
+        "script": "run-needrestart-ss hosts",
         "shell": false
       },
       "multiselect_argument_type": "argument_per_value"

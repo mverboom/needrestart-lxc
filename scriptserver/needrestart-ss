@@ -3,9 +3,10 @@
 # needrestart-ss - script-server wrapper for plain needrestart (host level).
 #
 # Installed on the cdist control host as ~cdist/bin/needrestart-ss and invoked
-# by the script-server runners in /etc/script-server-dev/runners/ as
-# `sudo -u cdist -i needrestart-ss ...`. It reaches the managed hosts over the
-# cdist user's root SSH and runs needrestart there in batch mode.
+# by the script-server runners in /etc/script-server-dev/runners/ through a
+# site-provided run-needrestart-ss shim (conventionally `sudo -u cdist -i --`).
+# It reaches the managed hosts over the cdist user's root SSH and runs
+# needrestart there in batch mode.
 #
 # Host list: cdist explorer data - hosts whose explorer `packages` file lists
 # the needrestart package (fresh on every cdist run of that host).

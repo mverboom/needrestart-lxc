@@ -4,9 +4,10 @@
 #
 # Installed on the cdist control host as ~cdist/bin/needrestart-lxc-ss (a
 # symlink into the needrestart-lxc.git checkout under files.external/) and
-# invoked by the script-server runners in /etc/script-server-dev/runners/ as
-# `sudo -u cdist -i needrestart-lxc-ss ...`. It reaches the PVE hosts over the
-# cdist user's root SSH and runs /usr/local/bin/needrestart-lxc there
+# invoked by the script-server runners in /etc/script-server-dev/runners/
+# through a site-provided run-needrestart-lxc-ss shim (conventionally
+# `sudo -u cdist -i --`). It reaches the PVE hosts over the cdist user's root
+# SSH and runs /usr/local/bin/needrestart-lxc there
 # (deployed by cdist, see config/manifest/autorun/zabbix-agent-config).
 #
 # Subcommands:

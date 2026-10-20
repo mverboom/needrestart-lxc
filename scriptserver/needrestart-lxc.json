@@ -1,6 +1,6 @@
 {
   "name": "needrestart-lxc",
-  "script_path": "sudo -u cdist -i needrestart-lxc-ss",
+  "script_path": "run-needrestart-lxc-ss",
   "description": "Report on services in LXC containers that run outdated libraries, or restart them. The Action pulldown changes the fields shown.",
   "group": "needrestart-lxc",
   "requires_terminal": false,
