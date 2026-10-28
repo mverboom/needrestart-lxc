@@ -18,5 +18,5 @@
       }
     }
   ],
-  "include": "/home/cdist/files.external/needrestart-lxc.git/scriptserver/include/needrestart-${Action}.json"
+  "include": "include/needrestart-${Action}.json"
 }

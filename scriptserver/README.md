@@ -21,21 +21,35 @@ needrestart and needrestart-lxc across the managed hosts.
 - Runner definitions live in `/etc/script-server-dev/runners/`
   (`needrestart.json`, `needrestart-lxc.json`); each is a symlink into this
   repo's clone at `/home/cdist/files.external/needrestart-lxc.git/scriptserver/`,
-  as are the wrappers in `~cdist/bin`.
+  as are the wrappers in `~cdist/bin` and the action includes in
+  `runners/include/`.
 
 ## Action includes
 
-script-server's `include` mechanism (same pattern as the `Updates` runner)
-merges an action-specific JSON into the runner. The two base runners therefore
-only declare the `Action` pulldown:
+script-server's `include` mechanism (same pattern as the `Updates` and `eq`
+runners) merges an action-specific JSON into the runner. The two base runners
+therefore only declare the `Action` pulldown:
 
 ```json
-"include": "/home/cdist/files.external/needrestart-lxc.git/scriptserver/include/needrestart-${Action}.json"
+"include": "include/needrestart-${Action}.json"
 ```
 
-The include files live in `scriptserver/include/` and are referenced by
-**absolute path** into the checkout, so they need no separate symlinks — a
-`git pull` activates changes. They vary only the *parameters* per action:
+script-server resolves a relative `include` against its **runners folder**
+(`/etc/script-server-dev/runners`), not against the directory of the runner
+file. The installation therefore symlinks each include file into
+`/etc/script-server-dev/runners/include/` (a directory that already exists for
+other runners):
+
+```sh
+for f in needrestart-status needrestart-restart nrlxc-status nrlxc-restart; do
+    ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/include/$f.json \
+            /etc/script-server-dev/runners/include/$f.json
+done
+```
+
+This keeps site-specific paths out of the repository; the symlinks survive
+`git pull`, so a pull activates include changes. The include files vary only the
+*parameters* per action:
 
 - `needrestart-status.json` / `nrlxc-status.json`: `All hosts`, `Hosts`
   and (lxc only) `Data source`.
@@ -135,16 +149,22 @@ ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart.
         /etc/script-server-dev/runners/needrestart.json
 ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart-lxc.json \
         /etc/script-server-dev/runners/needrestart-lxc.json
+# action includes: must sit in the runners folder, because script-server
+# resolves a relative "include" against that folder, not the runner file
+for f in needrestart-status needrestart-restart nrlxc-status nrlxc-restart; do
+    ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/include/$f.json \
+            /etc/script-server-dev/runners/include/$f.json
+done
 ```
 
 Remove the superseded runner symlinks if present:
 `needrestart-list.json`, `needrestart-restart.json`,
 `needrestart-lxc-list.json`, `needrestart-lxc-restart.json`.
 
-A `git pull` is enough after that: the wrappers and both runner definitions are
-symlinks into the checkout, the action includes are read from the checkout by
-absolute path, and script-server re-reads runner files from disk on every page
-load — no service restart needed. (Caveat: editing a runner through
+A `git pull` is enough after that: the wrappers, both runner definitions and
+the four action includes are symlinks into the checkout, and script-server
+re-reads runner files from disk on every page load — no service restart
+needed. (Caveat: editing a runner through
 script-server's admin UI would write through the symlink into the git
 checkout; treat the checkout as the single source of truth.) The site shims
 change only when the user, the privilege mechanism or the checkout path does.

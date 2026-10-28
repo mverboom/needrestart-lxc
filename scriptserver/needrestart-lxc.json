@@ -18,5 +18,5 @@
       }
     }
   ],
-  "include": "/home/cdist/files.external/needrestart-lxc.git/scriptserver/include/nrlxc-${Action}.json"
+  "include": "include/nrlxc-${Action}.json"
 }
