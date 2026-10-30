@@ -23,9 +23,11 @@
 #       Per-host HTML report (batch scan: `needrestart -b -w`) of services
 #       running outdated libraries, kernel and microcode status, and user
 #       sessions. Rows flag services needrestart would defer as potentially
-#       invasive (Invasive column). Service rows deep-link into the same
-#       "needrestart" runner with Action=Restart and Restart mode=Restart
-#       pre-filled, plus Host and Services.
+#       invasive (Invasive column) and carry the CVEs/CVSS scores resolved by
+#       the host-side `needrestart-cve` helper (needrestart itself has no CVE
+#       data). Service rows deep-link into the same "needrestart" runner with
+#       Action=Restart and Restart mode=Restart pre-filled, plus Host and
+#       Services.
 #   services --hosts FQDN[,FQDN...]
 #       List the flagged systemd service units on the given host(s), one per
 #       line as "host:unit" - the value list for the restart runner's
@@ -41,7 +43,9 @@
 set -u
 
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
+SCAN_TIMEOUT=300          # per-host remote needrestart scan timeout, seconds
+CVE_TIMEOUT=120           # per-host needrestart-cve helper timeout, seconds
+CVE_MARKER=NEEDRESTART-CVE-JSON:   # separates the batch text from the CVE JSON
 GUARD_TIMEOUT=30          # systemctl show timeout, seconds
 RESTART_TIMEOUT=300       # systemctl restart timeout, seconds
 RESTART_RUNNER="needrestart"
@@ -113,17 +117,25 @@ list_hosts() {
 # scanning
 # ---------------------------------------------------------------------------
 
-# run_scan <host> <outfile> <errfile>
+# run_scan <host> <outfile> <errfile> [cve]
 # Fresh batch scan on one host; report to outfile, notes to errfile.
 # -l -k -w select the checks (batch services + kernel + microcode):
 # needrestart only defaults to all checks when NONE of them is passed, so
 # all three must be given explicitly. needrestart skips kernel checks itself
 # inside containers (KSTA lines absent) and microcode checks on VMs and
 # containers (UCSTA line absent).
+# With [cve] the host's needrestart-cve helper runs in the same ssh call and
+# its JSON document follows the CVE_MARKER line. The helper is installed by
+# cdist; a host without it degrades to "no CVE data" instead of failing the
+# scan, and a helper timeout never loses the batch output already printed.
 run_scan() {
-    local host=$1 out=$2 err=$3
-    timeout $((SCAN_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" -- "$host" \
-        "timeout $SCAN_TIMEOUT needrestart -b -l -k -w" >"$out" 2>"$err"
+    local host=$1 out=$2 err=$3 with_cve=${4:-}
+    local cmd="timeout $SCAN_TIMEOUT needrestart -b -l -k -w"
+    if [[ $with_cve == cve ]]; then
+        cmd+="; echo $CVE_MARKER; timeout $CVE_TIMEOUT /usr/local/bin/needrestart-cve 2>/dev/null || echo '{}'"
+    fi
+    timeout $((SCAN_TIMEOUT + CVE_TIMEOUT + 30)) ssh "${SSH_OPTS[@]}" -- "$host" \
+        "$cmd" >"$out" 2>"$err"
 }
 
 # extract_flagged <outfile>
@@ -198,7 +210,7 @@ do_status() {
     local h pids=()
     for h in "${hosts[@]}"; do
         : >"$STATUS_TMP/$h.json"; : >"$STATUS_TMP/$h.err"; : >"$STATUS_TMP/$h.rc"
-        ( if run_scan "$h" "$STATUS_TMP/$h.json" "$STATUS_TMP/$h.err"; then
+        ( if run_scan "$h" "$STATUS_TMP/$h.json" "$STATUS_TMP/$h.err" cve; then
               echo 0 >"$STATUS_TMP/$h.rc"
           else
               echo $? >"$STATUS_TMP/$h.rc"
@@ -210,14 +222,14 @@ do_status() {
 
     if ! python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$LXC_RUNNER" "$ACTION_RESTART_UI" \
         "$ACTION_STATUS_UI" "$LXC_DATA_PARAM" "$LXC_DATA_SCAN_UI" "$RESTART_MODE" \
-        "$RESTART_MODE_RESTART_UI" <<'PYEOF'
-import glob, html, os, re, sys
+        "$RESTART_MODE_RESTART_UI" "$CVE_MARKER" <<'PYEOF'
+import glob, html, json, os, re, sys
 from datetime import datetime
 from urllib.parse import quote
 
 (tmpdir, restart_runner, lxc_runner, action_restart_ui, action_status_ui,
  lxc_data_param, lxc_data_scan_ui, restart_mode,
- restart_mode_restart_ui) = sys.argv[1:10]
+ restart_mode_restart_ui, cve_marker) = sys.argv[1:11]
 runner_enc = quote(restart_runner, safe="")
 lxc_runner_enc = quote(lxc_runner, safe="")
 UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
@@ -225,6 +237,53 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
 
 def esc(s):
     return html.escape(str(s), quote=True)
+
+
+def parse_cve(text):
+    """Parse the needrestart-cve JSON into ({unit: entry}, summary).
+    An absent/failed helper yields empty data, never an error: CVE analysis is
+    enrichment, the restart findings stay valid without it."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return {}, {}
+    services = {}
+    for entry in doc.get("services", []):
+        unit = entry.get("unit")
+        if unit:
+            services[unit] = entry
+    return services, doc.get("summary") or {}
+
+
+def finding_type(svc):
+    """Type label for a non-restartable finding. needrestart's pseudo-units
+    are not plain systemd units, but they are also not arbitrary processes:
+    systemd-manager must be cleared with `systemctl daemon-reexec`, and
+    systemd-user is the user's own `systemd --user` instance."""
+    if svc == "systemd-manager":
+        return "systemd (daemon-reexec)"
+    if svc == "systemd-user":
+        return "systemd --user (manual)"
+    if svc == "sysv-init":
+        return "sysv init (manual)"
+    return "manual (not a systemd unit)"
+
+
+def cve_cells(cvemap, svc):
+    """CVEs and CVSS table cells for one service (per-package verdicts as the
+    cell tooltip). A service the helper could not analyse keeps the original
+    needrestart finding and shows n/a rather than a misleading 0."""
+    entry = cvemap.get(svc)
+    if not entry:
+        return ("<td></td>"
+                "<td><span style='color:#6e7781'>n/a</span></td>")
+    tip = esc("\n".join(entry.get("details") or []))
+    cvss = entry.get("max_cvss") or "n/a"
+    cvss_cell = (esc(cvss) if cvss != "n/a"
+                 else "<span style='color:#6e7781'>n/a</span>")
+    return (f"<td style='text-align:right' title='{tip}'>"
+            f"{int(entry.get('cves', 0))}</td>"
+            f"<td style='text-align:right'>{cvss_cell}</td>")
 
 
 # Services needrestart defers by default (override_rc => 0 / blacklist_rc):
@@ -442,7 +501,8 @@ CONTROLS = ("<label class=all title='tick to select/deselect every service on ev
 print(f"<p class=meta>generated {esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))} "
       f"&nbsp; {CONTROLS}</p>")
 
-total_svc = total_sess = total_reboot = 0
+total_svc = total_sess = total_reboot = total_cve = 0
+total_max_cvss = None
 excluded = []
 files = sorted(glob.glob(os.path.join(tmpdir, "*.json")))
 shown = []
@@ -451,13 +511,16 @@ for path in files:
     err = open(path[:-len("json")] + "err").read().strip()
     rc = open(path[:-len("json")] + "rc").read().strip()
     try:
-        text = open(path).read()
+        raw = open(path).read()
+        # The CVE document follows the batch text in the same scan output.
+        text, _, cve_text = raw.partition(cve_marker)
         # needrestart is silent only when it failed: treat a non-zero rc
         # without a batch header as a failed scan, never as "clean".
         if rc != "0" and "NEEDRESTART-VER" not in text:
             raise ValueError
         (services, sessions, ksta, ucsta,
          kcur, kexp, uccur, ucexp) = parse(text)
+        cvemap, cvesum = parse_cve(cve_text)
     except ValueError:
         services = None
 
@@ -473,20 +536,33 @@ for path in files:
         continue
 
     shown.append((state, host, services, sessions, ksta, ucsta,
-                  kcur, kexp, uccur, ucexp, err, rc))
+                  kcur, kexp, uccur, ucexp, err, rc, cvemap, cvesum))
 
 # reboot-pending hosts first, then hosts with services; name within each
 shown.sort(key=lambda t: (-t[0], t[1]))
 
 for (state, host, services, sessions, ksta, ucsta,
-     kcur, kexp, uccur, ucexp, err, rc) in shown:
+     kcur, kexp, uccur, ucexp, err, rc, cvemap, cvesum) in shown:
     total_svc += len(services)
     total_sess += len(sessions)
     if state == 2:
         total_reboot += 1
+    host_cves = int(cvesum.get("cves", 0) or 0)
+    total_cve += host_cves
+    try:
+        host_max = float(cvesum.get("max_cvss"))
+    except (TypeError, ValueError):
+        host_max = None
+    if host_max is not None:
+        total_max_cvss = (host_max if total_max_cvss is None
+                          else max(total_max_cvss, host_max))
+    cve_note = (f"{host_cves} CVE(s), highest CVSS "
+                f"{cvesum.get('max_cvss', 'n/a')}" if cvesum
+                else "CVE data unavailable")
     print(f"<h3>{esc(host)} {badge(state)}</h3>")
     print(f'<p class=meta>'
           f"{len(services)} service(s) with outdated libraries &bull; "
+          f"{cve_note} &bull; "
           f"kernel: {esc(kernel_note(ksta, kcur, kexp))} &bull; "
           f"microcode: {esc(ucode_note(ucsta, uccur, ucexp))} &bull; "
           f'<a target="_top" title="open the needrestart-lxc status report '
@@ -504,6 +580,9 @@ for (state, host, services, sessions, ksta, ucsta,
         print(f"<tr><th title='tick to select/deselect all services of this host'>"
               f"<input type=checkbox onchange=\"toggleAll(this, true)\"></th>"
               f"<th>Service</th><th>Type</th>"
+              f"<th title='CVEs fixed by the pending update; tooltip lists the per-package verdicts'>"
+              f"CVEs</th>"
+              f"<th title='highest CVSS base score among those CVEs'>CVSS</th>"
               f"<th title='services needrestart would defer restarting as potentially invasive'>"
               f"Invasive</th></tr>")
         # restartable .service units first, other findings (interpreter /
@@ -520,13 +599,15 @@ for (state, host, services, sessions, ksta, ucsta,
                   f'<td class=service><a target="_top" href="{href}" '
                   f'title="open restart runner with this service">'
                   f'{esc(svc)}</a></td>'
-                  f"<td>systemd unit</td><td>{inv}</td></tr>")
+                  f"<td>systemd unit</td>"
+                  f"{cve_cells(cvemap, svc)}<td>{inv}</td></tr>")
         for svc in others:
             inv = ('<span class=inv title="needrestart would defer restarting '
                    'this service by default">&#9888; deferred</span>'
                    if is_invasive(svc) else "")
             print(f'<tr><td class=sel></td><td class=service>{esc(svc)}</td>'
-                  f"<td>manual (not a systemd unit)</td><td>{inv}</td></tr>")
+                  f"<td>{esc(finding_type(svc))}</td>"
+                  f"{cve_cells(cvemap, svc)}<td>{inv}</td></tr>")
         print("</table>")
     else:
         print("<p class=notes>no services to restart; host shown for the "
@@ -539,8 +620,11 @@ for (state, host, services, sessions, ksta, ucsta,
 if excluded:
     print(f"<p class=notes>{len(excluded)} host(s) not shown: "
           f"{esc(', '.join(excluded))}</p>")
-print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_sess} session(s), "
-      f"{total_reboot} host(s) with a pending reboot - shown for "
+print(f"<hr><p><b>Totals:</b> {total_svc} service(s), {total_cve} CVE(s), "
+      f"{total_sess} session(s), "
+      f"{total_reboot} host(s) with a pending reboot - highest CVSS "
+      f"{f'{total_max_cvss:.1f}' if total_max_cvss is not None else 'n/a'} "
+      f"- shown for "
       f"{len(shown)} of {len(files)} host(s).</p>")
 print(f"<p>{CONTROLS}</p>")
 print("</body></html>")

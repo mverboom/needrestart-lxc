@@ -78,7 +78,9 @@ switch the UI renderer (the report would be dumped as raw text).
 - `needrestart`: per-host HTML report (batch scan `needrestart -b -w`) of
   services running outdated libraries, kernel/microcode status and user
   sessions; rows flag services needrestart would defer as potentially invasive
-  (Invasive column).
+  (Invasive column) and carry the CVEs/CVSS scores resolved by the host-side
+  `needrestart-cve` helper. needrestart itself reports only *which* services
+  are stale, so without the helper the CVEs/CVSS columns show `n/a`.
 - `needrestart-lxc`: HTML report per host: containers, state badge (clean /
   restart / CVEs), services, CVE count and highest CVSS score, CVE verdicts,
   Invasive badge. Two data

@@ -268,3 +268,50 @@ needrestart-lxc --zabbix
 {"containers": [{"ctid": "124", "name": "test.lnw.verboom.net",
   "services": 6, "cves": 15, "cves_ok": 1, "max_cvss": "9.8", "details": "..."}, ...]}
 ```
+
+## Host-level CVE analysis (`needrestart-cve`)
+
+The script-server `needrestart` runner and `Template needrestart` cover the
+managed hosts, not containers. Upstream needrestart has no CVE or CVSS concept:
+`needrestart -b` only says *which* services map outdated libraries, so a restart
+finding cannot be told apart from a security update. `needrestart-cve` fills
+that gap on the host:
+
+1. it takes needrestart's own `NEEDRESTART-SVC:` list as the authoritative set
+   of flagged services (the alert set never changes);
+2. for each unit it finds the processes in that unit's cgroup and collects the
+   executable mappings that are `(deleted)`;
+3. it resolves those library paths to the owning dpkg binary package, derives
+   the version in effect when the process started from `dpkg.log` timestamps,
+   and compares it with the installed version;
+4. it asks the same sources needrestart-lxc uses — OSV for Debian (CVSS base
+   score computed from the reported vector) and the Ubuntu Security API — how
+   many CVEs the pending update fixes, with the highest CVSS among them;
+   changelogs in `/usr/share/doc` are the offline fallback.
+
+Results are cached for 24h in `/var/cache/needrestart-cve`, and the document is
+written to `/var/cache/needrestart-cve/zabbix.json`:
+
+```
+needrestart-cve
+{"host": "shell.lnw.verboom.net", "generated": "2026-10-30T11:00:00",
+ "services": [{"unit": "libssl3.service", "pids": 1, "cves": 1,
+               "max_cvss": "7.5", "state": 2, "cves_ok": 1,
+               "details": ["libssl3 3.0.11-1~deb12u1 -> 3.0.11-1~deb12u2: SECURITY update, fixes 1 CVE (CVE-2023-5363, CVSS 7.5) [OSV]"]}],
+ "summary": {"services": 1, "cves": 1, "cves_ok": 1, "max_cvss": "7.5",
+             "state": 2, "text": "1 service(s) need restart (1 CVEs): ..."}}
+```
+
+`state` is 0 (clean), 1 (restart needed, no known CVEs — also when the analysis
+is indeterminate), 2 (restart needed and CVEs are fixed) or 9 (the agent found
+no cache document, so the helper is not reporting). The Zabbix template splits
+the old single HIGH trigger into WARNING (state 1) and HIGH (state 2) on that
+value, and raises a separate WARNING for state 9; the script-server report shows
+a CVEs and a CVSS column per service, with the per-package verdicts as the cell
+tooltip.
+
+Like needrestart-lxc's scan it needs `python3` and outbound HTTPS for the
+lookups. It must run as root (to read `/proc/*/maps`) and is deployed by cdist
+as `/usr/local/bin/needrestart-cve` plus a 15-minute cron job. A host without
+the helper keeps reporting its restart findings; the CVE columns simply show
+`n/a`.

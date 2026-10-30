@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+"""needrestart-cve - attach CVE/CVSS data to needrestart's host findings.
+
+`needrestart -b` only reports *which* systemd services map outdated libraries;
+upstream needrestart has no notion of CVEs. This helper resolves, for every
+service needrestart flags on this host:
+
+    stale library -> owning dpkg binary package
+                  -> version in effect when the process started
+                  -> installed version
+                  -> CVEs fixed between the two, with CVSS base scores
+
+and writes a JSON document consumed by the Zabbix agent and by the
+script-server `needrestart` runner.
+
+Data sources (identical to needrestart-lxc, so host and container reports
+agree):
+  - Debian: the OSV API; the CVSS base score is computed from the CVSS v3
+    vector OSV reports.
+  - Ubuntu: the Ubuntu Security API (already carries cvss3).
+  - Offline fallback: /usr/share/doc/<pkg>/changelog.Debian.gz.
+Lookups are cached for 24h in /var/cache/needrestart-cve.
+
+Usage:
+  needrestart-cve            print the JSON and refresh the cache document
+  needrestart-cve -h         show this help
+
+Exit status is non-zero only when the scan itself could not run (needrestart
+missing, not root). A host that needs no restart yields an empty document.
+"""
+
+import glob
+import gzip
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+PROGNAME = os.path.basename(sys.argv[0])
+CACHE_TTL = 86400                 # seconds to keep cached API responses
+CACHE_DIR = "/var/cache/needrestart-cve"
+SUBPROC_TIMEOUT = 120             # needrestart/pct can hang on a stuck host
+
+# Special device / tmp paths to ignore (needrestart: blacklist_mappings).
+BLACKLIST_PATTERNS = [re.compile(p) for p in (
+    r"^/memfd:",
+    r"^/dev/",
+    r"^/SYSV[0-9a-fA-F]{8}",                    # SysV shared memory segments
+    r"^/\[aio\]",
+    r"^\[",
+    r"^(/var)?/tmp/",
+    r"^(/var)?/run/",
+    r"/orcexec\.[\w\d]+( \(deleted\))?$",      # Oil Runtime Compiler JIT
+    r"/jna[0-9]+\.tmp( \(deleted\))?$",        # Java Native Access temp files
+    r"/\.cache/JNA/",
+    r"^/usr/bin/sudo",                          # not daemons
+    r"^/usr/bin/apt-get",
+)]
+
+DPKG_STATUS = {}       # binpkg -> "version\tsrcpkg"
+EXT_VERDICTS = {}      # "srcpkg|old|new" -> "count\tverdict"
+EXT_VERDICT_CVSS = {}  # "srcpkg|old|new" -> highest CVSS for that update
+VER_CMP_CACHE = {}     # (a, b) -> -1|0|1
+DPKG_LOG_TEXT = None   # /var/log/dpkg.log* concatenated once per run
+TZ_NAME = None         # /etc/timezone contents, once per run
+
+
+def is_blacklisted(path):
+    return any(p.search(path) for p in BLACKLIST_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# needrestart + process/unit discovery
+# ---------------------------------------------------------------------------
+
+def needrestart_services():
+    """Return the systemd services `needrestart -b -l` flags, sorted unique.
+
+    `-l` selects only the library/service check (no kernel/microcode work).
+    Pseudo-units needrestart emits: systemd-manager (PID 1), systemd-user
+    (`systemd --user` manager), sysv-init (non-systemd init)."""
+    try:
+        res = subprocess.run(["needrestart", "-b", "-l"],
+                             capture_output=True, text=True, check=False,
+                             timeout=SUBPROC_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise RuntimeError(f"needrestart failed to run: {err}")
+    services = set()
+    for line in res.stdout.splitlines():
+        if line.startswith("NEEDRESTART-SVC: "):
+            name = line[len("NEEDRESTART-SVC: "):].strip()
+            if name:
+                services.add(name)
+    return sorted(services)
+
+
+def read_proc_cgroups():
+    """Return [(pid, cgroup_path)] for every process we can read."""
+    procs = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/cgroup") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        path = ""
+        for line in lines:
+            parts = line.split(":", 2)
+            # cgroup v2: "0::/path"; v1: "N:controller:/path"
+            if len(parts) == 3 and parts[0] == "0" and parts[2].startswith("/"):
+                path = parts[2]
+                break
+        if not path:
+            # cgroup v1 fallback: systemd's own hierarchy
+            for line in lines:
+                parts = line.split(":", 2)
+                if (len(parts) == 3 and parts[2].startswith("/")
+                        and (parts[1] == "name=systemd" or parts[0] == "1")):
+                    path = parts[2]
+                    break
+        if path:
+            procs.append((pid, path))
+    return procs
+
+
+def pids_for_unit(unit, procs):
+    """PIDs belonging to one needrestart service name."""
+    if unit == "systemd-manager":
+        return [pid for pid, path in procs
+                if path == "/init.scope" or pid == 1]
+    if unit == "systemd-user":
+        return [pid for pid, path in procs
+                if re.search(r"/user@\d+\.service/init\.scope$", path)]
+    if unit == "sysv-init":
+        return [pid for pid, path in procs if pid == 1]
+
+    # Exact unit cgroup first (cgroup v2 puts unit processes there directly).
+    exact = [pid for pid, path in procs
+             if path == "/" + unit or path.endswith("/" + unit)]
+    if exact:
+        return exact
+    # Units that delegate children into sub-cgroups.
+    return [pid for pid, path in procs if ("/" + unit + "/") in path]
+
+
+def stale_libs(pids):
+    """Deleted executable mappings shared by the given processes."""
+    libs = set()
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/maps") as fh:
+                maps = fh.read().splitlines()
+        except OSError:
+            continue
+        for line in maps:
+            parts = line.split(None, 5)
+            if len(parts) < 6 or "x" not in parts[1]:
+                continue
+            path = parts[5]
+            if not path.endswith(" (deleted)"):
+                continue
+            clean = path[:-len(" (deleted)")].strip()
+            if clean.startswith("/") and not is_blacklisted(clean):
+                libs.add(clean)
+    return sorted(libs)
+
+
+def proc_start_epoch(pid):
+    """Process start time as a Unix epoch (btime + starttime/CLK_TCK)."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = fh.read()
+        with open("/proc/stat") as fh:
+            btime = next(int(line.split()[1]) for line in fh
+                         if line.startswith("btime "))
+    except (OSError, StopIteration, ValueError):
+        return None
+    # The comm field may contain spaces/parentheses: split after its last ')'.
+    fields = stat.rsplit(")", 1)[1].split()
+    try:
+        starttime = int(fields[19])   # field 22 of /proc/<pid>/stat
+    except (IndexError, ValueError):
+        return None
+    return btime + starttime // os.sysconf("SC_CLK_TCK")
+
+
+# ---------------------------------------------------------------------------
+# dpkg: owning package, version at process start
+# ---------------------------------------------------------------------------
+
+def parse_dpkg_status():
+    """Parse the local dpkg status database into DPKG_STATUS (once per run)."""
+    if DPKG_STATUS:
+        return True
+    if not os.path.isfile("/var/lib/dpkg/status"):
+        return False
+    pkg = ver = src = status = ""
+    with open("/var/lib/dpkg/status", errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("Package: "):
+                pkg = line[len("Package: "):].strip()
+            elif line.startswith("Version: "):
+                ver = line[len("Version: "):].strip()
+            elif line.startswith("Source: "):
+                value = line[len("Source: "):].strip()
+                src = value.split()[0] if value else ""
+            elif line.startswith("Status: "):
+                status = line[len("Status: "):].strip()
+            elif line == "\n":
+                if pkg and status.startswith("install"):
+                    DPKG_STATUS[pkg] = f"{ver}\t{src}"
+                pkg = ver = src = status = ""
+    return True
+
+
+def owning_pkgs(paths):
+    """Single pass over /var/lib/dpkg/info/*.list; maps wanted path -> binpkgs."""
+    wanted = set(paths)
+    found = {p: set() for p in wanted}
+    for list_file in glob.glob("/var/lib/dpkg/info/*.list"):
+        base = os.path.basename(list_file)[:-len(".list")].split(":")[0]
+        try:
+            with open(list_file, errors="ignore") as fh:
+                for line in fh:
+                    p = line.rstrip("\n")
+                    if p in wanted:
+                        found[p].add(base)
+        except OSError:
+            continue
+    return found
+
+
+def ver_cmp(a, b):
+    """Debian version comparison; returns -1, 0 or 1 (dpkg semantics)."""
+    cached = VER_CMP_CACHE.get((a, b))
+    if cached is not None:
+        return cached
+
+    def dpkg_op(op):
+        try:
+            return subprocess.run(
+                ["dpkg", "--compare-versions", a, op, b],
+                capture_output=True, check=False, timeout=10).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    if dpkg_op("eq"):
+        result = 0
+    elif dpkg_op("gt"):
+        result = 1
+    else:
+        result = -1
+    VER_CMP_CACHE[(a, b)] = result
+    return result
+
+
+def epoch_from_date(datestr, tz):
+    """Parse a dpkg.log 'YYYY-MM-DD HH:MM:SS' timestamp into an epoch."""
+    try:
+        dt = datetime.strptime(datestr.strip(), "%Y-%m-%d %H:%M:%S")
+        if tz:
+            dt = dt.replace(tzinfo=ZoneInfo(tz))
+        return int(dt.timestamp())   # naive dt: interpreted in host timezone
+    except Exception:
+        return None
+
+
+def timezone_name():
+    global TZ_NAME
+    if TZ_NAME is None:
+        TZ_NAME = ""
+        try:
+            with open("/etc/timezone") as fh:
+                TZ_NAME = re.sub(r"\s", "", fh.read())
+        except OSError:
+            pass
+    return TZ_NAME
+
+
+def dpkg_log_text():
+    global DPKG_LOG_TEXT
+    if DPKG_LOG_TEXT is None:
+        DPKG_LOG_TEXT = ""
+        for path in sorted(glob.glob("/var/log/dpkg.log*")):
+            if not os.path.isfile(path):
+                continue
+            try:
+                if path.endswith(".gz"):
+                    with gzip.open(path, "rt", errors="ignore") as fh:
+                        DPKG_LOG_TEXT += fh.read() + "\n"
+                else:
+                    with open(path, errors="ignore") as fh:
+                        DPKG_LOG_TEXT += fh.read() + "\n"
+            except OSError:
+                pass
+    return DPKG_LOG_TEXT
+
+
+def version_at_start(binpkg, start_epoch):
+    """Version in effect when a process started, from dpkg.log timestamps."""
+    all_data = dpkg_log_text()
+    if not all_data:
+        return ""
+    tz = timezone_name()
+    best = ""
+    best_ts = 0
+    for line in all_data.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[2] not in ("upgrade", "install"):
+            continue
+        if parts[3].split(":")[0] != binpkg:
+            continue
+        # "upgrade pkg old new" / "install pkg <none> new": effective version last
+        version = parts[5] if len(parts) >= 6 else parts[4]
+        if not version or version == "<none>":
+            continue
+        ts = epoch_from_date(line[:19], tz)
+        if ts is None or ts > start_epoch or ts < best_ts:
+            continue
+        best_ts = ts
+        best = version
+    return best
+
+
+# ---------------------------------------------------------------------------
+# CVE lookup: OSV (Debian) / Ubuntu Security API / changelog fallback
+# ---------------------------------------------------------------------------
+
+def load_cache(cache):
+    if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < CACHE_TTL:
+        try:
+            with open(cache) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def write_cache(cache, data):
+    """Atomically replace the cache file (15-min cron + on-demand scan race)."""
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache),
+                               prefix=os.path.basename(cache) + ".")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, cache)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def cvss3_base(vector):
+    """Base score of a CVSS v3.0/v3.1 vector string, or None if unparsable.
+    OSV reports Debian severity as a vector, not a number, so this turns the
+    vector into the same base score NVD would publish."""
+    if not vector or not vector.startswith("CVSS:3."):
+        return None
+    m = {}
+    for part in vector.split("/")[1:]:
+        key, _, value = part.partition(":")
+        m[key] = value
+    try:
+        av = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}[m["AV"]]
+        ac = {"L": 0.77, "H": 0.44}[m["AC"]]
+        ui = {"N": 0.85, "R": 0.62}[m["UI"]]
+        changed = m["S"] == "C"
+        pr = ({"N": 0.85, "L": 0.68, "H": 0.5} if changed
+              else {"N": 0.85, "L": 0.62, "H": 0.27})[m["PR"]]
+        conf = {"H": 0.56, "L": 0.22, "N": 0.0}[m["C"]]
+        integ = {"H": 0.56, "L": 0.22, "N": 0.0}[m["I"]]
+        avail = {"H": 0.56, "L": 0.22, "N": 0.0}[m["A"]]
+    except KeyError:
+        return None
+    iss = 1 - ((1 - conf) * (1 - integ) * (1 - avail))
+    impact = (7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+              if changed else 6.42 * iss)
+    exploitability = 8.22 * av * ac * pr * ui
+    if impact <= 0:
+        return 0.0
+    combined = impact + exploitability
+    raw = min(1.08 * combined if changed else combined, 10)
+    # CVSS v3.1 roundup: ceiling to one decimal, no-op on exact tenths.
+    scaled = round(raw * 100000)
+    if scaled % 10000 == 0:
+        return scaled / 100000.0
+    return (scaled // 10000 + 1) / 10.0
+
+
+def osv_cvss_vector(severity):
+    """Best scoreable CVSS vector from an OSV severity list (v3 preferred)."""
+    for entry in severity or []:
+        if entry.get("type") == "CVSS_V3":
+            return entry.get("score", "")
+    return ""
+
+
+def osv_collect(srcpkg, version, release):
+    """Query (cached) the OSV API for a Debian package version; returns a list
+    of "CVE-ID<TAB>fixed-version<TAB>cvss3" lines, or None on network failure."""
+    version = re.sub(r"\+b\d+$", "", version)
+    cache_name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{release}-{srcpkg}-{version}")
+    cache = os.path.join(CACHE_DIR, f"osv-{cache_name}.json")
+
+    data = load_cache(cache)
+    if data is None:
+        body = json.dumps({"package": {"name": srcpkg, "ecosystem": "Debian"},
+                           "version": version}).encode()
+        try:
+            req = urllib.request.Request(
+                "https://api.osv.dev/v1/query", data=body,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "needrestart-cve"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.load(resp)
+        except Exception:
+            return None
+        write_cache(cache, data)
+
+    vulns = data.get("vulns", [])
+    # A CVE can appear both as a Debian advisory (no severity) and as a
+    # DEBIAN-CVE record (with severity). Resolve each CVE's score across all
+    # records first, so whichever row survives the dedup below carries it.
+    scores = {}
+    for vuln in vulns:
+        cve = (vuln.get("upstream") or [vuln.get("id", "")])[0]
+        score = cvss3_base(osv_cvss_vector(vuln.get("severity")))
+        if score is not None:
+            scores[cve] = max(scores.get(cve, 0.0), score)
+
+    out = []
+    for vuln in vulns:
+        fixed = None
+        for affected in vuln.get("affected", []):
+            package = affected.get("package", {})
+            if package.get("name") != srcpkg:
+                continue
+            ecosystem = package.get("ecosystem", "")
+            if ecosystem != release and not ecosystem.startswith(release + ":"):
+                continue
+            for rng in affected.get("ranges", []):
+                if rng.get("type") != "ECOSYSTEM":
+                    continue
+                for event in rng.get("events", []):
+                    if event.get("fixed") not in (None, "", "0"):
+                        fixed = event["fixed"]
+        if fixed:
+            cve = (vuln.get("upstream") or [vuln.get("id", "")])[0]
+            score = scores.get(cve)
+            score_text = f"{score:.1f}" if score is not None else ""
+            out.append(f"{cve}\t{fixed}\t{score_text}")
+    return out
+
+
+def ubuntu_collect(srcpkg, codename):
+    """Query (cached) the Ubuntu Security API for all CVEs of a source package;
+    returns a list of "CVE-ID<TAB>fixed-version<TAB>cvss3" lines, or None on
+    network failure."""
+    cache_name = re.sub(r"[^A-Za-z0-9._-]", "_", f"ubuntu-{srcpkg}")
+    cache = os.path.join(CACHE_DIR, f"{cache_name}.json")
+
+    data = load_cache(cache)
+    if data is None:
+        try:
+            data = fetch_all_ubuntu(srcpkg, cache)
+        except Exception:
+            return None
+
+    out = []
+    for cve in data.get("cves", []):
+        for entry in cve.get("packages", []):
+            if entry.get("name") != srcpkg:
+                continue
+            for status in entry.get("statuses", []):
+                if status.get("release_codename") != codename:
+                    continue
+                if status.get("status") != "released":
+                    continue
+                fixed = (status.get("description") or "").strip()
+                if not fixed:
+                    continue
+                out.append(f"{cve.get('id', '')}\t{fixed}\t{cve.get('cvss3') or ''}")
+                break
+    return out
+
+
+def fetch_all_ubuntu(pkg, cache):
+    BASE = "https://ubuntu.com/security/cves.json"
+    PAGE = 20          # max accepted by the API
+    PAGE_SLEEP = 2.0   # be gentle; the API rate-limits bursts (429)
+    RETRY_SLEEP = 15.0  # backoff between retries on HTTP 429
+    MAX_PAGES = 100
+    merged = []
+    offset = 0
+    total = 1
+    pages = 0
+    while offset < total and pages < MAX_PAGES:
+        url = f"{BASE}?package={pkg}&limit={PAGE}&offset={offset}"
+        data = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "needrestart-cve"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.load(resp)
+                break
+            except urllib.error.HTTPError as err:
+                if err.code == 429 and attempt < 2:
+                    time.sleep(RETRY_SLEEP)
+                    continue
+                raise
+        if data is None:
+            raise RuntimeError("no response")
+        cves = data.get("cves", [])
+        merged.extend(cves)
+        total = data.get("total_results", 0) or len(merged)
+        if len(cves) < PAGE:
+            break
+        offset += PAGE
+        pages += 1
+        time.sleep(PAGE_SLEEP)
+    write_cache(cache, {"cves": merged, "total_results": total})
+    return {"cves": merged, "total_results": total}
+
+
+def parse_changelog(path):
+    """Yield ("ENTRY", version, suite) and ("BODY", text) tuples."""
+    fh = (gzip.open(path, "rt", errors="ignore") if path.endswith(".gz")
+          else open(path, "r", errors="ignore"))
+    with fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            m = re.match(r"^[^ ]+ \(([^)]+)\) ([^;]+); urgency=", line)
+            if m:
+                yield ("ENTRY", m.group(1), m.group(2))
+            elif line.startswith("-- "):
+                continue
+            else:
+                yield ("BODY", line)
+
+
+def cve_summary(cves, limit=6):
+    """", "-joined list of the first `limit` CVEs plus an overflow note."""
+    text = ", ".join(cves[:limit])
+    if len(cves) > limit:
+        text += f", and {len(cves) - limit} more"
+    return text
+
+
+def changelog_verdict(binpkg, srcpkg, old, new):
+    """Offline verdict from the package changelog: count CVE references in the
+    entries between old and new versions. Returns "count<TAB>verdict" or ""
+    if no changelog is available."""
+    file = None
+    for docpkg in (binpkg, srcpkg):
+        for cand in (
+            f"/usr/share/doc/{docpkg}/changelog.Debian.gz",
+            f"/usr/share/doc/{docpkg}/changelog.Debian",
+            f"/usr/share/doc/{docpkg}/changelog.gz",
+            f"/usr/share/doc/{docpkg}/changelog",
+        ):
+            if os.path.isfile(cand):
+                file = cand
+                break
+        if file:
+            break
+    if not file:
+        return ""
+
+    cves = set()
+    want_entry = False
+    top_entry = False
+    for kind, *fields in parse_changelog(file):
+        if kind == "ENTRY":
+            if top_entry:
+                break
+            version = fields[0]
+            want_entry = False
+            if old:
+                if ver_cmp(version, old) > 0:
+                    if ver_cmp(version, new) <= 0:
+                        want_entry = True
+                else:
+                    # Reached the old version; changelogs are newest-first.
+                    break
+            else:
+                want_entry = True
+                top_entry = True
+        elif kind == "BODY" and want_entry:
+            for cve in re.findall(r"CVE-\d{4}-\d+", fields[0]):
+                cves.add(cve)
+
+    cves = sorted(cves)
+    n = len(cves)
+    cvelist = cve_summary(cves)
+    plural = "" if n == 1 else "s"
+    if old:
+        if n > 0:
+            return (f"{n}\t{binpkg} {old} -> {new}: fixes {n} CVE{plural} "
+                    f"({cvelist}) [changelog]")
+        return (f"{n}\t{binpkg} {old} -> {new}: no CVEs listed in changelog "
+                f"for this update [changelog]")
+    if n > 0:
+        return (f"{n}\t{binpkg} -> {new} (old version unknown): latest "
+                f"changelog entry lists {n} CVE{plural} ({cvelist}) [changelog]")
+    return (f"{n}\t{binpkg} -> {new} (old version unknown): latest changelog "
+            f"entry lists no CVEs [changelog]")
+
+
+def os_release():
+    """(id, version_id, codename) from /etc/os-release."""
+    info = {}
+    try:
+        with open("/etc/os-release") as fh:
+            for line in fh:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    key, _, value = line.partition("=")
+                    info[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return info.get("ID", ""), info.get("VERSION_ID", ""), info.get("VERSION_CODENAME", "")
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+
+def security_analysis(srcpkg, binpkg, old, new):
+    """Verdict for one source package update; returns (count, verdict, cvss)."""
+    key = f"{srcpkg}|{old}|{new}"
+    if key in EXT_VERDICTS:
+        result = EXT_VERDICTS[key]
+        count, verdict = result.split("\t", 1)
+        return int(count), verdict, EXT_VERDICT_CVSS.get(key)
+
+    count = 0
+    verdict = ""
+    best_cvss = None
+
+    if not old:
+        result = changelog_verdict(binpkg, srcpkg, "", new)
+        if result:
+            count_text, verdict = result.split("\t", 1)
+            count = int(count_text)
+        else:
+            verdict = (f"{binpkg} -> {new} (old version unknown): no "
+                       f"changelog available")
+    elif ver_cmp(old, new) >= 0:
+        verdict = f"{binpkg} {old} -> {new}: no version change since process start"
+    else:
+        distro, release, codename = os_release()
+        online_ok = False
+        src_label = ""
+        rows = []
+        if distro == "debian" and release:
+            res = osv_collect(srcpkg, old, f"Debian:{release}")
+            if res is not None:
+                online_ok, src_label, rows = True, "OSV", res
+        elif distro == "ubuntu" and codename:
+            res = ubuntu_collect(srcpkg, codename)
+            if res is not None:
+                online_ok, src_label, rows = True, "Ubuntu Security API", res
+
+        if online_ok:
+            cves = []
+            cvss_list = []
+            seen = set()
+            for row in rows:
+                parts = row.split("\t")
+                if len(parts) < 2:
+                    continue
+                cve_id, fixed = parts[0], parts[1]
+                cvss3 = parts[2] if len(parts) > 2 else ""
+                if not cve_id or not fixed:
+                    continue
+                if not (ver_cmp(old, fixed) < 0 and ver_cmp(fixed, new) <= 0):
+                    continue
+                if cve_id in seen:
+                    continue
+                seen.add(cve_id)
+                count += 1
+                cves.append(cve_id)
+                if cvss3:
+                    cvss_list.append(cvss3)
+                    try:
+                        score = float(cvss3)
+                    except ValueError:
+                        score = None
+                    if score is not None:
+                        best_cvss = max(best_cvss or 0.0, score)
+            if count > 0:
+                plural = "" if count == 1 else "s"
+                cvss = f", CVSS {','.join(cvss_list)}" if cvss_list else ""
+                verdict = (f"{binpkg} {old} -> {new}: SECURITY update, fixes "
+                           f"{count} CVE{plural} ({cve_summary(cves)}{cvss}) "
+                           f"[{src_label}]")
+            else:
+                verdict = (f"{binpkg} {old} -> {new}: no security-relevant "
+                           f"CVEs found [{src_label}]")
+        else:
+            result = changelog_verdict(binpkg, srcpkg, old, new)
+            if result:
+                count_text, verdict = result.split("\t", 1)
+                count = int(count_text)
+            else:
+                verdict = (f"{binpkg} {old} -> {new}: security data "
+                           f"unavailable (offline?)")
+
+    EXT_VERDICT_CVSS[key] = best_cvss
+    EXT_VERDICTS[key] = f"{count}\t{verdict}"
+    return count, verdict, best_cvss
+
+
+def unit_findings(unit, procs):
+    """(pids, stale libs, process start epoch) for one needrestart service."""
+    pids = pids_for_unit(unit, procs)
+    libs = stale_libs(pids)
+    starts = [ts for ts in (proc_start_epoch(pid) for pid in pids) if ts]
+    return pids, libs, (min(starts) if starts else None)
+
+
+def analyze_unit(unit, pids, libs, start_epoch, owners):
+    """CVE analysis for one needrestart service. Returns a service dict."""
+    entry = {"unit": unit, "pids": len(pids), "cves": 0,
+             "max_cvss": "n/a", "state": 1, "cves_ok": 1, "details": []}
+
+    if not libs:
+        entry["cves_ok"] = 0
+        entry["details"].append(
+            "no deleted libraries found for this unit (analysis inconclusive)")
+        return entry
+
+    binpkgs = []
+    seen_pkgs = set()
+    for path in libs:
+        for bp in sorted(owners.get(path, ())):
+            if bp not in seen_pkgs:
+                seen_pkgs.add(bp)
+                binpkgs.append(bp)
+    if not binpkgs:
+        entry["cves_ok"] = 0
+        entry["details"].append("no owning dpkg package found for stale libraries")
+        return entry
+
+    best = None
+    seen_updates = set()
+    for binpkg in binpkgs:
+        status = DPKG_STATUS.get(binpkg, "")
+        if not status:
+            entry["details"].append(f"no dpkg status entry for {binpkg}")
+            entry["cves_ok"] = 0
+            continue
+        curver, srcpkg = status.split("\t", 1)
+        if not srcpkg:
+            srcpkg = binpkg
+        old = version_at_start(binpkg, start_epoch) if start_epoch else ""
+
+        ukey = f"{srcpkg}|{old}|{curver}"
+        if ukey in seen_updates:
+            continue
+        seen_updates.add(ukey)
+
+        count, verdict, update_cvss = security_analysis(
+            srcpkg, binpkg, old, curver)
+        entry["details"].append(verdict)
+        entry["cves"] += count
+        if update_cvss is not None:
+            best = max(best or 0.0, update_cvss)
+
+    if best is not None:
+        entry["max_cvss"] = f"{best:.1f}"
+    entry["state"] = 2 if entry["cves"] > 0 else 1
+    return entry
+
+
+def build_document():
+    if os.geteuid() != 0:
+        raise RuntimeError("must run as root to read /proc/*/maps")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    if not parse_dpkg_status():
+        raise RuntimeError("no dpkg status database (not a dpkg-based host?)")
+
+    services = needrestart_services()
+    procs = read_proc_cgroups() if services else []
+    findings = [(unit, *unit_findings(unit, procs)) for unit in services]
+    # Resolve every stale library to its package in ONE pass over
+    # /var/lib/dpkg/info/*.list, not once per flagged service.
+    all_libs = {lib for _unit, _pids, libs, _start in findings for lib in libs}
+    owners = owning_pkgs(all_libs) if all_libs else {}
+    entries = [analyze_unit(unit, pids, libs, start, owners)
+               for unit, pids, libs, start in findings]
+
+    total_cves = sum(e["cves"] for e in entries)
+    scored = [float(e["max_cvss"]) for e in entries if e["max_cvss"] != "n/a"]
+    cves_ok = 0 if any(not e["cves_ok"] for e in entries) else 1
+    if not entries:
+        state = 0
+    elif total_cves > 0:
+        state = 2
+    else:
+        state = 1
+
+    if entries:
+        lines = [f"- {e['unit']}: {e['cves']} CVEs, highest CVSS {e['max_cvss']}"
+                 for e in entries]
+        text = (f"{len(entries)} service(s) need restart ({total_cves} CVEs):\n"
+                + "\n".join(lines))
+    else:
+        text = "No services need a restart."
+
+    return {
+        "host": socket.getfqdn(),
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "services": entries,
+        "summary": {
+            "services": len(entries),
+            "cves": total_cves,
+            "cves_ok": cves_ok,
+            "max_cvss": f"{max(scored):.1f}" if scored else "n/a",
+            "state": state,
+            "text": text,
+        },
+    }
+
+
+def main(argv):
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        return 0
+    try:
+        doc = build_document()
+    except RuntimeError as err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 1
+    target = os.path.join(CACHE_DIR, "zabbix.json")
+    try:
+        write_cache(target, doc)
+        os.chmod(target, 0o644)
+    except OSError as err:
+        print(f"ERROR: failed to update {target}: {err}", file=sys.stderr)
+    print(json.dumps(doc))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

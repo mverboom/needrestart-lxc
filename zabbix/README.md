@@ -207,3 +207,62 @@ unsupported - on 13 hosts. Its REGEX preprocessing step now has
 what the trigger `Microcode upgrade pending` (`<>1`) expects. Note that hosts carrying a
 *standalone* copy of the item (not inherited from the template, `templateid` NULL) are not updated
 by a template change and need the same edit applied directly.
+
+### Host CVE / CVSS enrichment (needrestart-cve)
+
+`needrestart` has no CVE or CVSS concept: `needrestart -b` only lists the units
+whose processes map outdated libraries, so the original `Services need restart`
+trigger could not tell a security update from a routine version bump (it was
+HIGH for both). The host helper `needrestart-cve` adds the missing context
+without changing the alert set: it starts from needrestart's own `-SVC:` list,
+resolves each unit's deleted libraries to the owning dpkg package, derives the
+version the process actually started with from `dpkg.log`, and asks OSV
+(Debian) or the Ubuntu Security API how many CVEs the installed version fixes.
+For each CVE it also stores the highest CVSS base score (computed from OSV's
+CVSS v3 vector, or taken from the Ubuntu API's `cvss3`). The algorithm is the
+same one needrestart-lxc uses for containers, so host and container reports
+agree.
+
+The helper runs from cron (every 15 minutes) and writes
+`/var/cache/needrestart-cve/zabbix.json`. The write is atomic (temp file +
+rename), so a cron run and an on-demand script-server scan cannot tear the
+document. The agent item `needrestart.cve.master` reads that file, so the
+Zabbix poll never performs an online lookup:
+
+| Item | Meaning |
+|---|---|
+| `needrestart.cve.master` | the JSON document itself |
+| `needrestart.cve.services` | services needrestart flags |
+| `needrestart.cve.count` | unique CVEs fixed by restarting them |
+| `needrestart.cve.cves_ok` | 0 when the analysis is indeterminate |
+| `needrestart.cve.max_cvss` | highest CVSS score, or `n/a` |
+| `needrestart.cve.state` | 0 clean, 1 restart without known CVEs, 2 restart with CVEs, 9 no data |
+| `needrestart.cve.details` | per-service verdicts (service: CVEs, highest CVSS) |
+
+Severity now follows risk, and the two restart triggers are mutually
+exclusive because both read the single `needrestart.cve.state` value:
+
+- **WARNING** `{HOST.NAME}: N services need restart` — `state` = 1: a restart is
+  needed but no known CVEs are fixed by it (maintenance), including the case
+  where the analysis is indeterminate (`cves_ok` = 0).
+- **HIGH** — `state` = 2: the pending updates fix known CVEs. Operational data
+  on both: `N CVEs, highest CVSS x.y`.
+- **WARNING** `Needrestart CVE analysis is not reporting` — `state` = 9: the
+  agent read no cache document (helper not installed, not yet run, or
+  unreadable). This guards the failure that would otherwise be silent: the
+  legacy trigger is disabled, so if the helper stops producing data the restart
+  alerts must not disappear unnoticed. It is deliberately *not* a `nodata()`
+  trigger: a host that is powered off reports no value at all, and must stay
+  quiet instead of raising a permanent "not reporting" problem.
+
+The legacy `Services need restart` trigger is imported as **DISABLED**; it is
+superseded by the pair above and would otherwise raise a duplicate problem for
+one and the same finding. `needrestart.master` and its other items are
+untouched, so kernel, microcode and session monitoring keep working even if the
+CVE helper is not deployed on a host.
+
+Deployment is handled by cdist (`manifest/autorun/zabbix-agent-config`, the
+`needrestart` block): it installs `/usr/local/bin/needrestart-cve`, the
+`needrestart.conf` UserParameters and the 15-minute cron job, then links the
+template. The helper needs `python3` and outbound HTTPS to `api.osv.dev` /
+`ubuntu.com`; lookups are cached for 24h in `/var/cache/needrestart-cve`.
