@@ -855,9 +855,10 @@ def build_document():
     else:
         text = "No services need a restart."
 
+    now = datetime.now()
     return {
         "host": socket.getfqdn(),
-        "generated": datetime.now().isoformat(timespec="seconds"),
+        "generated": now.isoformat(timespec="seconds"),
         "services": entries,
         "summary": {
             "services": len(entries),
@@ -865,6 +866,10 @@ def build_document():
             "cves_ok": cves_ok,
             "max_cvss": f"{max(scored):.1f}" if scored else "n/a",
             "state": state,
+            # Epoch of this report. Zabbix compares it with now() so a cron job
+            # that silently stops writing (e.g. the 2026-10-30 PATH bug) is
+            # detected even though the agent keeps serving the stale document.
+            "generated_epoch": int(now.timestamp()),
             "text": text,
         },
     }

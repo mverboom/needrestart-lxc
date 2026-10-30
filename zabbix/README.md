@@ -237,6 +237,7 @@ Zabbix poll never performs an online lookup:
 | `needrestart.cve.cves_ok` | 0 when the analysis is indeterminate |
 | `needrestart.cve.max_cvss` | highest CVSS score, or `n/a` |
 | `needrestart.cve.state` | 0 clean, 1 restart without known CVEs, 2 restart with CVEs, 9 no data |
+| `needrestart.cve.generated` | epoch of the report the agent is serving (freshness check) |
 | `needrestart.cve.details` | per-service verdicts (service: CVEs, highest CVSS) |
 
 Severity now follows risk, and the two restart triggers are mutually
@@ -254,10 +255,16 @@ exclusive because both read the single `needrestart.cve.state` value:
   alerts must not disappear unnoticed. It is deliberately *not* a `nodata()`
   trigger: a host that is powered off reports no value at all, and must stay
   quiet instead of raising a permanent "not reporting" problem.
+- **WARNING** `Needrestart CVE data is stale` — `now() - last(needrestart.cve.generated)
+  > 3600` while `state` is not 9: the agent is still serving a report that
+  the cron job has stopped refreshing (four missed runs). This is the case
+  that a state check alone cannot see: the document exists and looks
+  plausible, it is simply old. A missing document raises state 9 instead, and a
+  powered-off host raises neither.
 
 The legacy `Services need restart` trigger is imported as **DISABLED**; it is
-superseded by the pair above and would otherwise raise a duplicate problem for
-one and the same finding. `needrestart.master` and its other items are
+superseded by the triggers above and would otherwise raise a duplicate problem
+for one and the same finding. `needrestart.master` and its other items are
 untouched, so kernel, microcode and session monitoring keep working even if the
 CVE helper is not deployed on a host.
 

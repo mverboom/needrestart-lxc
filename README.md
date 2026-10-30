@@ -299,16 +299,19 @@ needrestart-cve
                "max_cvss": "7.5", "state": 2, "cves_ok": 1,
                "details": ["libssl3 3.0.11-1~deb12u1 -> 3.0.11-1~deb12u2: SECURITY update, fixes 1 CVE (CVE-2023-5363, CVSS 7.5) [OSV]"]}],
  "summary": {"services": 1, "cves": 1, "cves_ok": 1, "max_cvss": "7.5",
-             "state": 2, "text": "1 service(s) need restart (1 CVEs): ..."}}
+             "state": 2, "generated_epoch": 1793354400,
+             "text": "1 service(s) need restart (1 CVEs): ..."}}
 ```
 
 `state` is 0 (clean), 1 (restart needed, no known CVEs — also when the analysis
 is indeterminate), 2 (restart needed and CVEs are fixed) or 9 (the agent found
 no cache document, so the helper is not reporting). The Zabbix template splits
 the old single HIGH trigger into WARNING (state 1) and HIGH (state 2) on that
-value, and raises a separate WARNING for state 9; the script-server report shows
-a CVEs and a CVSS column per service, with the per-package verdicts as the cell
-tooltip.
+value, raises a separate WARNING for state 9, and raises one when the report is
+more than an hour old (`generated_epoch` stops advancing, i.e. the cron stopped
+writing while the agent keeps serving a stale document). The script-server
+report shows a CVEs and a CVSS column per service, with the per-package
+verdicts as the cell tooltip.
 
 Like needrestart-lxc's scan it needs `python3` and outbound HTTPS for the
 lookups. It must run as root (to read `/proc/*/maps`) and is deployed by cdist
