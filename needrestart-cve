@@ -34,6 +34,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -43,6 +44,15 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# cron runs with PATH=/usr/bin:/bin, which does not contain /usr/sbin - where
+# needrestart lives. Prepend the standard sbin/bin directories so the helper
+# behaves identically under cron and interactively (needrestart-lxc does the
+# same for pct).
+os.environ["PATH"] = (
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    + ":" + os.environ.get("PATH", "")
+)
 
 PROGNAME = os.path.basename(sys.argv[0])
 CACHE_TTL = 86400                 # seconds to keep cached API responses
@@ -81,6 +91,29 @@ def is_blacklisted(path):
 # needrestart + process/unit discovery
 # ---------------------------------------------------------------------------
 
+NEEDRESTART_CANDIDATES = (
+    "/usr/sbin/needrestart",       # Debian/Ubuntu package location
+    "/usr/bin/needrestart",
+    "/usr/local/sbin/needrestart",
+    "/usr/local/bin/needrestart",
+)
+
+
+def needrestart_binary():
+    """Absolute path to needrestart, or a clear error instead of the opaque
+    FileNotFoundError subprocess raises when PATH lacks /usr/sbin."""
+    for cand in NEEDRESTART_CANDIDATES:
+        if os.access(cand, os.X_OK):
+            return cand
+    found = shutil.which("needrestart")
+    if found:
+        return found
+    raise RuntimeError(
+        "needrestart not found (looked for "
+        + ", ".join(NEEDRESTART_CANDIDATES) + ")"
+    )
+
+
 def needrestart_services():
     """Return the systemd services `needrestart -b -l` flags, sorted unique.
 
@@ -88,7 +121,7 @@ def needrestart_services():
     Pseudo-units needrestart emits: systemd-manager (PID 1), systemd-user
     (`systemd --user` manager), sysv-init (non-systemd init)."""
     try:
-        res = subprocess.run(["needrestart", "-b", "-l"],
+        res = subprocess.run([needrestart_binary(), "-b", "-l"],
                              capture_output=True, text=True, check=False,
                              timeout=SUBPROC_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as err:
