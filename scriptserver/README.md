@@ -52,7 +52,11 @@ This keeps site-specific paths out of the repository; the symlinks survive
 *parameters* per action:
 
 - `needrestart-status.json` / `nrlxc-status.json`: `All hosts`, `Hosts`
-  and (lxc only) `Data source`.
+  and (lxc only) `Data source`. `All hosts` is a `no_value` checkbox with
+  `"default": "true"`, so it is ticked on page load; untick it to use the
+  `Hosts` pulldown (`--all-hosts` wins over a host selection in the wrapper).
+  Note that deep-link pre-fill replaces the whole value state, so a link that
+  pins `Hosts` gets an unticked `All hosts` — exactly what it wants.
 - `needrestart-restart.json` / `nrlxc-restart.json`: `Hosts`,
   `Services`/`Containers`, `Allow all`, `Exclude` and `Restart mode`
   (dry-run / restart).
