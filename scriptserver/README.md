@@ -5,8 +5,12 @@ needrestart and needrestart-lxc across the managed hosts.
 
 ## How it works
 
-- The cdist user's SSH lands as root on every managed host, where cdist deploys
-  `/usr/local/bin/needrestart-lxc` (see `manifest/autorun/zabbix-agent-config`).
+- The cdist user's SSH lands as root on every managed host, where the site
+  deploys `/usr/local/bin/needrestart-lxc` (on the reference site below:
+  `manifest/autorun/zabbix-agent-config`).
+- Two things are site-specific and are **not** in this repository's wrappers:
+  the privilege mechanism (`run-<command>` shims) and the host list (a
+  `needrestart-ss-hosts` command, see [Host lists](#host-lists)).
 - The runner JSON contains no user or privilege: it calls `run-needrestart-ss` /
   `run-needrestart-lxc-ss`. The `run-<command>` prefix means "the same command,
   executed with whatever privilege this site needs", so the installer provides
@@ -161,26 +165,58 @@ for f in needrestart-status needrestart-restart nrlxc-status nrlxc-restart; do
     ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/include/$f.json \
             /etc/script-server-dev/runners/include/$f.json
 done
+
+# host list: the wrappers run `needrestart-ss-hosts <tool>` and use its stdout.
+# cdist sites can use the reference implementation shipped here; other sites
+# write their own (see "Host lists").
+ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/hosts-cdist-explore \
+        /home/cdist/bin/needrestart-ss-hosts
 ```
 
 Remove the superseded runner symlinks if present:
 `needrestart-list.json`, `needrestart-restart.json`,
 `needrestart-lxc-list.json`, `needrestart-lxc-restart.json`.
 
-A `git pull` is enough after that: the wrappers, both runner definitions and
-the four action includes are symlinks into the checkout, and script-server
-re-reads runner files from disk on every page load — no service restart
-needed. (Caveat: editing a runner through
+A `git pull` is enough after that: the wrappers, the host-list command, both
+runner definitions and the four action includes are symlinks into the
+checkout, and script-server re-reads runner files from disk on every page
+load — no service restart needed. (Caveat: editing a runner through
 script-server's admin UI would write through the symlink into the git
 checkout; treat the checkout as the single source of truth.) The site shims
-change only when the user, the privilege mechanism or the checkout path does.
+and the host-list command change only when the user, the privilege mechanism,
+the checkout path or the discovery mechanism does.
 
 ## Host lists
 
-- `needrestart-ss hosts`: hosts whose cdist explorer `packages` file lists the
+The wrappers contain no host names and no discovery logic. Both `hosts`
+subcommands run a site-supplied command and print its stdout:
+
+```sh
+needrestart-ss-hosts needrestart      # plain needrestart runner
+needrestart-ss-hosts needrestart-lxc  # needrestart-lxc runner
+```
+
+The command is looked up on `PATH` (so `/usr/local/bin`, the script-server
+`scripts` folder, or `~cdist/bin` all work) and must print one FQDN per line
+on stdout; anything on stderr is shown as the error. It is a **requirement**:
+when it is missing the `Hosts` list reports `no host-list command` instead of
+guessing, so a fresh site always knows what to provide. `HOSTS_CMD` (or the
+`NEEDRESTART_SS_HOSTS_CMD` environment variable) overrides the name, which is
+handy for testing.
+
+This decouples the runners from any one discovery model — a static file
+(`cat /etc/needrestart-hosts`), an Ansible inventory, a Zabbix API query or a
+monitoring database are all equally valid.
+
+The repository ships one implementation, `scriptserver/hosts-cdist-explore`,
+for the reference cdist site. It is invoked with the tool name and prints:
+
+- `needrestart`: hosts whose cdist explorer `packages` file lists the
   `needrestart` package.
-- `needrestart-lxc-ss hosts`: cdist explorer data
-  (`/home/cdist/explore/<fqdn>/distro` == `proxmox`) intersected with the
-  zabbix-agent-config gate (`/home/cdist/config/files/zabbix/agents/<fqdn>`
-  existing) — i.e. exactly the hosts where the manifest deploys
-  needrestart-lxc.
+- `needrestart-lxc`: hosts whose explorer `distro` is `proxmox` **and** that
+  have a `config/files/zabbix/agents/<fqdn>` entry — the gate of the
+  `zabbix-agent-config` manifest, which is what deploys needrestart-lxc, so a
+  PVE host that is not zabbix-managed (and therefore has no binary) never
+  shows up as a permanent failure. Both paths default to the reference site's
+  layout and can be overridden; set `ZABBIX_AGENTS_DIR=` (empty) to drop the
+  second requirement if your PVE hosts get the binary another way.

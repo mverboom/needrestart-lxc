@@ -8,8 +8,10 @@
 # It reaches the managed hosts over the cdist user's root SSH and runs
 # needrestart there in batch mode.
 #
-# Host list: cdist explorer data - hosts whose explorer `packages` file lists
-# the needrestart package (fresh on every cdist run of that host).
+# Host list: supplied by the site. The wrapper knows no host names; it runs
+# `needrestart-ss-hosts needrestart` (HOSTS_CMD, PATH lookup) and uses its
+# stdout as the Hosts value list. The repository ships one implementation for
+# cdist sites, hosts-cdist-explore (install it under that name).
 #
 # Containers are filtered out on the wrapper side (NEEDRESTART-CONT lines are
 # ignored): LXC containers are handled by the separate needrestart-lxc
@@ -17,8 +19,9 @@
 #
 # Subcommands:
 #   hosts
-#       Print the host FQDNs whose explorer package list contains
-#       needrestart, one per line - the runners' dynamic Hosts value list.
+#       Print the site's host list for this tool, one FQDN per line
+#       (`needrestart-ss-hosts needrestart`) - the runners' dynamic Hosts
+#       value list.
 #   status [--all-hosts] HOST [HOST...]
 #       Per-host HTML report (batch scan: `needrestart -b -w`) of services
 #       running outdated libraries, kernel and microcode status, and user
@@ -46,6 +49,8 @@ SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-
 SCAN_TIMEOUT=300          # per-host remote needrestart scan timeout, seconds
 CVE_TIMEOUT=120           # per-host needrestart-cve helper timeout, seconds
 CVE_MARKER=NEEDRESTART-CVE-JSON:   # separates the batch text from the CVE JSON
+HOSTS_CMD=${NEEDRESTART_SS_HOSTS_CMD:-needrestart-ss-hosts}  # site host list
+TOOL_NAME=needrestart     # argument passed to HOSTS_CMD
 GUARD_TIMEOUT=30          # systemctl show timeout, seconds
 RESTART_TIMEOUT=300       # systemctl restart timeout, seconds
 RESTART_RUNNER="needrestart"
@@ -102,15 +107,13 @@ usage() {
 }
 
 list_hosts() {
-    # Hosts where needrestart is installed, per cdist explorer data
-    # (/home/cdist/explore/<fqdn>/packages, one "name version" per line).
-    local packages_file fqdn
-    for packages_file in /home/cdist/explore/*/packages; do
-        [[ -r "$packages_file" ]] || continue
-        grep -q '^needrestart ' "$packages_file" || continue
-        fqdn=$(basename "$(dirname "$packages_file")")
-        printf '%s\n' "$fqdn"
-    done
+    if ! command -v "$HOSTS_CMD" >/dev/null; then
+        printf '%s: no host-list command; this site must provide it (see\n' \
+               "$HOSTS_CMD" >&2
+        printf 'scriptserver/README.md, "Host lists")\n' >&2
+        return 1
+    fi
+    "$HOSTS_CMD" "$TOOL_NAME" "$@"
 }
 
 # ---------------------------------------------------------------------------

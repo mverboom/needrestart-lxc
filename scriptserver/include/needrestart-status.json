@@ -12,7 +12,7 @@
     {
       "name": "Hosts",
       "type": "multiselect",
-      "description": "Hosts to report on (hosts with the needrestart package installed per cdist explorer data). May stay empty when 'All hosts' is ticked.",
+      "description": "Hosts to report on (the site's needrestart-ss-hosts needrestart list). May stay empty when 'All hosts' is ticked.",
       "values": {
         "script": "run-needrestart-ss hosts",
         "shell": false

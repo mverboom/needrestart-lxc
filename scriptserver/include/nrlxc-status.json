@@ -12,7 +12,7 @@
     {
       "name": "Hosts",
       "type": "multiselect",
-      "description": "Proxmox hosts to report on (distro explorer == proxmox). May stay empty when 'All hosts' is ticked.",
+      "description": "Hosts to report on (the site's needrestart-ss-hosts needrestart-lxc list). May stay empty when 'All hosts' is ticked.",
       "values": {
         "script": "run-needrestart-lxc-ss hosts",
         "shell": false

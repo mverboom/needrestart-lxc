@@ -10,11 +10,15 @@
 # SSH and runs /usr/local/bin/needrestart-lxc there
 # (deployed by cdist, see config/manifest/autorun/zabbix-agent-config).
 #
+# Host list: supplied by the site. The wrapper knows no host names; it runs
+# `needrestart-ss-hosts needrestart-lxc` (HOSTS_CMD, PATH lookup) and uses its
+# stdout as the Hosts value list. The repository ships one implementation for
+# cdist sites, hosts-cdist-explore (install it under that name).
+#
 # Subcommands:
 #   hosts
-#       Print the PVE host FQDNs that have needrestart-lxc deployed (explorer
-#       distro == proxmox and a zabbix agent config present), one per line.
-#       Used by the runners as their dynamic value list.
+#       Print the site's host list for this tool, one FQDN per line - the
+#       runners' dynamic Hosts value list.
 #   status [--mode scan|cached] [--all-hosts] HOST [HOST...]
 #       Per-host report of containers needing service restarts. With --all-hosts
 #       every host that has needrestart-lxc deployed is reported on (the
@@ -40,6 +44,8 @@
 set -u
 
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+HOSTS_CMD=${NEEDRESTART_SS_HOSTS_CMD:-needrestart-ss-hosts}  # site host list
+TOOL_NAME=needrestart-lxc  # argument passed to HOSTS_CMD
 SCAN_TIMEOUT=300          # per-host remote scan timeout, seconds
 RESTART_RUNNER="needrestart-lxc"
 ACTION_RESTART_UI="Restart flagged services"        # top-level Action option
@@ -91,20 +97,13 @@ usage() {
 }
 
 list_hosts() {
-    # Hosts where the needrestart-lxc deployment actually applies: the
-    # zabbix-agent-config manifest is gated on files/zabbix/agents/<fqdn>
-    # (config repo) and the needrestart-lxc block on distro == proxmox
-    # (explorer data). Require both so hosts without the binary don't show up
-    # as permanent failures in the value list.
-    local f
-    for f in /home/cdist/explore/*/distro; do
-        [[ -r "$f" ]] || continue
-        [[ $(<"$f") == proxmox ]] || continue
-        local fqdn
-        fqdn=$(basename "$(dirname "$f")")
-        [[ -f /home/cdist/config/files/zabbix/agents/$fqdn ]] || continue
-        echo "$fqdn"
-    done
+    if ! command -v "$HOSTS_CMD" >/dev/null; then
+        printf '%s: no host-list command; this site must provide it (see\n' \
+               "$HOSTS_CMD" >&2
+        printf 'scriptserver/README.md, "Host lists")\n' >&2
+        return 1
+    fi
+    "$HOSTS_CMD" "$TOOL_NAME" "$@"
 }
 
 # ---------------------------------------------------------------------------
