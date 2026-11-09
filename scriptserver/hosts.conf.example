@@ -1,0 +1,34 @@
+# Example config for needrestart-ss-hosts - the site's host lists.
+#
+# Copy to ~/.config/needrestart-ss/hosts.conf (or point
+# NEEDRESTART_SS_HOSTS_CONF at it). One `tool=command` per line; blank lines
+# and lines starting with # are ignored. Each command must print one FQDN per
+# line; it runs through `sh -c` with the wrapper's environment and PATH.
+#
+#   needrestart      plain needrestart runner  (host level, not containers)
+#   needrestart-lxc  needrestart-lxc runner    (PVE hosts, containers)
+
+# --- cdist site, queried with `eq` ---------------------------------------
+# eq reads the explorer data, so no path or file name is baked into anything:
+# the query names the explorer field and the value, not the layout.
+#
+# needrestart: hosts whose explorer `packages` list needrestart.
+#needrestart=eq -q 'packages contains needrestart' --sort host
+#
+# needrestart-lxc: PVE hosts, but only those the zabbix-agent-config manifest
+# manages (it is what deploys the binary). The inventory tag is the eq
+# equivalent of that gate; drop `-t zabbix` to report on every PVE host.
+#needrestart-lxc=eq -q 'distro == proxmox' -t zabbix --sort host
+
+# --- anything else -------------------------------------------------------
+# A static file, an Ansible inventory, a database or an API query are all
+# fine - the wrappers only care about one FQDN per line on stdout:
+#
+#needrestart=cat /etc/needrestart/hosts
+#needrestart-lxc=cat /etc/needrestart/pve-hosts
+#
+#needrestart-lxc=ansible-inventory --list | jq -r '.pve.hosts | keys[]'
+#
+#needrestart-lxc=curl -sS -H "Authorization: Bearer $(cat ~/.zabbix-token)" \
+#   -d '{"jsonrpc":"2.0","method":"host.get","params":{"output":["name"]}}' \
+#   https://zabbix.example.com/api_jsonrpc.php | jq -r '.result[].name'

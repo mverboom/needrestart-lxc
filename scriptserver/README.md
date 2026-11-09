@@ -167,10 +167,13 @@ for f in needrestart-status needrestart-restart nrlxc-status nrlxc-restart; do
 done
 
 # host list: the wrappers run `needrestart-ss-hosts <tool>` and use its stdout.
-# cdist sites can use the reference implementation shipped here; other sites
-# write their own (see "Host lists").
-ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/hosts-cdist-explore \
+# The script is a dispatcher; the site's commands live in a config file
+# (see "Host lists").
+ln -sfn /home/cdist/files.external/needrestart-lxc.git/scriptserver/needrestart-ss-hosts \
         /home/cdist/bin/needrestart-ss-hosts
+mkdir -p ~/.config/needrestart-ss
+cp /home/cdist/files.external/needrestart-lxc.git/scriptserver/hosts.conf.example \
+   ~/.config/needrestart-ss/hosts.conf   # then uncomment/edit the commands
 ```
 
 Remove the superseded runner symlinks if present:
@@ -189,41 +192,40 @@ the checkout path or the discovery mechanism does.
 ## Host lists
 
 The wrappers contain no host names and no discovery logic. Both `hosts`
-subcommands run a site-supplied command and print its stdout:
+subcommands run `needrestart-ss-hosts <tool>` (found on `PATH`, so
+`/usr/local/bin`, the script-server `scripts` folder or `~cdist/bin` all work;
+`NEEDRESTART_SS_HOSTS_CMD` overrides the name) and print its stdout:
 
 ```sh
 needrestart-ss-hosts needrestart      # plain needrestart runner
 needrestart-ss-hosts needrestart-lxc  # needrestart-lxc runner
 ```
 
-The command is looked up on `PATH` (so `/usr/local/bin`, the script-server
-`scripts` folder, or `~cdist/bin` all work) and must print one FQDN per line
-on stdout; anything on stderr is shown as the error. It is a **requirement**:
-when it is missing the `Hosts` list reports `no host-list command` instead of
-guessing, so a fresh site always knows what to provide. `HOSTS_CMD` (or the
-`NEEDRESTART_SS_HOSTS_CMD` environment variable) overrides the name, which is
-handy for testing.
+`scriptserver/needrestart-ss-hosts` is a thin dispatcher: it reads a config
+file and runs the command configured for that tool, so the discovery
+mechanism is site configuration and nothing about the install layout is
+baked in.
 
-This decouples the runners from any one discovery model — a static file
-(`cat /etc/needrestart-hosts`), an Ansible inventory, a Zabbix API query or a
-monitoring database are all equally valid.
+```sh
+# ~/.config/needrestart-ss/hosts.conf   (NEEDRESTART_SS_HOSTS_CONF overrides)
+needrestart=eq -q 'packages contains needrestart' --sort host
+needrestart-lxc=eq -q 'distro == proxmox' -t zabbix --sort host
+```
 
-The repository ships one implementation, `scriptserver/hosts-cdist-explore`,
-for the reference cdist site. It is invoked with the tool name and prints:
+One `tool=command` per line; blank lines and `#` comments are ignored; the
+command runs through `sh -c`, must print one FQDN per line, and its stdout
+and exit status are passed through (arguments after `<tool>` reach the command
+as `$1`...). A missing config file, an unconfigured tool, or a command that
+succeeds without printing anything are all reported on stderr, so an empty
+`Hosts` dropdown is never silent. `scriptserver/hosts.conf.example` has
+further examples (static file, Ansible inventory, Zabbix API).
 
-- `needrestart`: hosts whose cdist explorer package list (`<host>/packages`,
-  one `name version` per line) contains `needrestart`. The file name is
-  `PACKAGES_FILE` (default `packages`; a relative subdirectory works too),
-  because not every explorer writes it under that name.
-- `needrestart-lxc`: hosts whose explorer `distro` is `proxmox` **and** that
-  have a `config/files/zabbix/agents/<fqdn>` entry — the gate of the
-  `zabbix-agent-config` manifest, which is what deploys needrestart-lxc, so a
-  PVE host that is not zabbix-managed (and therefore has no binary) never
-  shows up as a permanent failure. The gate defaults to the reference site's
-  layout and can be switched off: set `ZABBIX_AGENTS_DIR=` (empty) if your
-  PVE hosts get the binary another way.
+On a **cdist site** `eq` queries the explorer data directly, so the query
+names explorer fields rather than files or paths:
 
-All three (`EXPLORE_DIR`, `PACKAGES_FILE`, `ZABBIX_AGENTS_DIR`) are
-environment variables. The wrapper inherits the environment the site shim
-provides, so with `sudo -u cdist -i` they belong in that user's `~/.profile`
-(or, for site-owned copies of the script, in the script itself).
+- `needrestart`: `packages contains needrestart` — the host's explorer
+  package list lines are `name version`.
+- `needrestart-lxc`: `distro == proxmox` plus `-t zabbix`, i.e. only PVE
+  hosts the `zabbix-agent-config` manifest manages (that manifest is what
+  deploys the binary, so an unmanaged PVE host would otherwise show up as a
+  permanent failure). Drop `-t zabbix` to report on every PVE host.

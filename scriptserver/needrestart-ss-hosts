@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# ============================================================================
+# needrestart-ss-hosts - site host list for the needrestart runners.
+#
+# The wrappers (needrestart-ss, needrestart-lxc-ss) contain no host names and
+# no discovery logic: they run `needrestart-ss-hosts <tool>` [1] and print its
+# stdout as the Hosts value list. This script is that command, as a thin
+# dispatcher: it looks <tool> up in a config file and runs the command found
+# there. The discovery mechanism - cdist `eq`, a static file, an Ansible
+# inventory, a Zabbix API query, curl - is therefore purely site configuration
+# and completely independent of the install layout.
+#
+# [1] the needrestart runner calls it with "needrestart", the needrestart-lxc
+#     runner with "needrestart-lxc".
+#
+# Config file: $NEEDRESTART_SS_HOSTS_CONF, default
+# ~/.config/needrestart-ss/hosts.conf. One `tool=command` per line; blank
+# lines and lines starting with # are ignored:
+#
+#     # host level needrestart (cdist site, explorer package list)
+#     needrestart=eq -q 'packages contains needrestart' --sort host
+#     # needrestart-lxc: PVE hosts that are zabbix-managed
+#     needrestart-lxc=eq -q 'distro == proxmox' -t zabbix --sort host
+#
+# The command runs through `sh -c` and must print one FQDN per line on stdout.
+# Its stdout is passed through and its exit status becomes this script's;
+# arguments after <tool> are appended to the command as positional parameters
+# ($1 ...) for site commands that want them.
+#
+# Usage: needrestart-ss-hosts <tool> [args...]
+# ============================================================================
+set -u
+
+PROG=needrestart-ss-hosts
+CONF=${NEEDRESTART_SS_HOSTS_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/needrestart-ss/hosts.conf}
+
+usage() {
+   awk 'NR==1{next} /^# ={10,}/{if(n++)exit; next} {sub(/^# ?/,""); print}' "$0"
+   exit 1
+}
+
+# strip leading and trailing whitespace of $1 into REPLY
+trim() {
+   REPLY=${1#"${1%%[![:space:]]*}"}
+   REPLY=${REPLY%"${REPLY##*[![:space:]]}"}
+}
+
+# print the command configured for a tool, or fail listing what is configured
+lookup_command() {
+   local tool=$1 line key found=()
+   while IFS= read -r line || [[ -n $line ]]; do
+      trim "$line"
+      line=$REPLY
+      [[ -z $line || $line == '#'* || $line != *=* ]] && continue
+      trim "${line%%=*}"
+      key=$REPLY
+      found+=("$key")
+      [[ $key == "$tool" ]] || continue
+      trim "${line#*=}"
+      printf '%s\n' "$REPLY"
+      return 0
+   done <"$CONF"
+   printf '%s: no command configured for "%s" in %s\n' \
+      "$PROG" "$tool" "$CONF" >&2
+   if ((${#found[@]})); then
+      printf 'configured tools: %s\n' "${found[*]}" >&2
+   else
+      printf 'the config file defines no tools\n' >&2
+   fi
+   return 1
+}
+
+main() {
+   local tool=${1:-} cmd out rc
+   case $tool in
+      -h|--help|"") usage ;;
+   esac
+   shift
+   if [[ ! -r $CONF ]]; then
+      printf '%s: no config file: %s\n' "$PROG" "$CONF" >&2
+      printf 'this site must list its hosts there (see scriptserver/README.md)\n' >&2
+      return 1
+   fi
+   cmd=$(lookup_command "$tool") || return 1
+   out=$(sh -c "$cmd" "$PROG" "$@")
+   rc=$?
+   if [[ $rc == 0 && -z $out ]]; then
+      printf '%s: the command for "%s" listed no hosts: %s\n' \
+         "$PROG" "$tool" "$cmd" >&2
+   fi
+   [[ -n $out ]] && printf '%s\n' "$out"
+   return "$rc"
+}
+
+main "$@"
