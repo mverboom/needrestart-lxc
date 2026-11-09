@@ -211,12 +211,19 @@ monitoring database are all equally valid.
 The repository ships one implementation, `scriptserver/hosts-cdist-explore`,
 for the reference cdist site. It is invoked with the tool name and prints:
 
-- `needrestart`: hosts whose cdist explorer `packages` file lists the
-  `needrestart` package.
+- `needrestart`: hosts whose cdist explorer package list (`<host>/packages`,
+  one `name version` per line) contains `needrestart`. The file name is
+  `PACKAGES_FILE` (default `packages`; a relative subdirectory works too),
+  because not every explorer writes it under that name.
 - `needrestart-lxc`: hosts whose explorer `distro` is `proxmox` **and** that
   have a `config/files/zabbix/agents/<fqdn>` entry — the gate of the
   `zabbix-agent-config` manifest, which is what deploys needrestart-lxc, so a
   PVE host that is not zabbix-managed (and therefore has no binary) never
-  shows up as a permanent failure. Both paths default to the reference site's
-  layout and can be overridden; set `ZABBIX_AGENTS_DIR=` (empty) to drop the
-  second requirement if your PVE hosts get the binary another way.
+  shows up as a permanent failure. The gate defaults to the reference site's
+  layout and can be switched off: set `ZABBIX_AGENTS_DIR=` (empty) if your
+  PVE hosts get the binary another way.
+
+All three (`EXPLORE_DIR`, `PACKAGES_FILE`, `ZABBIX_AGENTS_DIR`) are
+environment variables. The wrapper inherits the environment the site shim
+provides, so with `sudo -u cdist -i` they belong in that user's `~/.profile`
+(or, for site-owned copies of the script, in the script itself).

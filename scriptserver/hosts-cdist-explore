@@ -17,6 +17,9 @@
 #
 # Environment:
 #   EXPLORE_DIR        cdist explorer directory (default /home/cdist/explore)
+#   PACKAGES_FILE      per-host package list, relative to the host directory
+#                      (default "packages"; a subdirectory such as
+#                      "inventory/packages" also works)
 #   ZABBIX_AGENTS_DIR  the zabbix-agent-config gate: only PVE hosts with this
 #                      directory entry are monitored, and that manifest is
 #                      what deploys needrestart-lxc. Set it empty to drop the
@@ -26,6 +29,7 @@
 set -u
 
 EXPLORE_DIR=${EXPLORE_DIR:-/home/cdist/explore}
+PACKAGES_FILE=${PACKAGES_FILE:-packages}
 ZABBIX_AGENTS_DIR=${ZABBIX_AGENTS_DIR-/home/cdist/config/files/zabbix/agents}
 
 usage() {
@@ -46,7 +50,7 @@ filter_hosts() {
 
 # predicate: the host's explorer package list contains needrestart
 has_needrestart_package() {
-   local packages=${1}/packages
+   local packages=${1}/"$PACKAGES_FILE"
    [[ -r "$packages" ]] || return 1
    grep --quiet '^needrestart ' "$packages"
 }
@@ -62,6 +66,15 @@ is_managed_pve_host() {
 
 # list the hosts the needrestart (host level) runner reports on
 list_needrestart() {
+   local dir found=0
+   for dir in "${EXPLORE_DIR}"/*/; do
+      [[ -r ${dir%/}/"$PACKAGES_FILE" ]] && ((found++))
+   done
+   if ((found == 0)); then
+      printf 'no %s found under %s (set PACKAGES_FILE)\n' \
+         "$PACKAGES_FILE" "$EXPLORE_DIR" >&2
+      return 1
+   fi
    filter_hosts has_needrestart_package
 }
 
