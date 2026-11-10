@@ -1044,7 +1044,14 @@ def epoch_from_date(datestr, tz):
 
 def version_at_start(root, binpkg, start_epoch):
     """Determine the package version in effect when a process started, by
-    matching dpkg.log upgrade/install timestamps against the process start."""
+    matching dpkg.log upgrade/install timestamps against the process start.
+
+    logrotate keeps only ~12 months of dpkg.log, so the line that installed the
+    version a long-running process still uses is often already gone (installed
+    at container build time). In that case fall back to the *old* version of
+    the earliest upgrade of the package after the process started: that is the
+    version the upgrade replaced, i.e. what the process runs. Both paths are
+    exact; only if neither exists is the version unknown."""
     all_data = ""
     for f in sorted(glob.glob(root + "/var/log/dpkg.log*")):
         if not os.path.isfile(f):
@@ -1073,6 +1080,8 @@ def version_at_start(root, binpkg, start_epoch):
 
     best = ""
     best_ts = 0
+    after_ts = None
+    after_old = ""
     for line in all_data.splitlines():
         parts = line.split()
         if len(parts) < 5 or parts[2] not in ("upgrade", "install"):
@@ -1088,10 +1097,19 @@ def version_at_start(root, binpkg, start_epoch):
         ts = epoch_from_date(line[:19], tz)
         if ts is None:
             continue
-        if ts <= start_epoch and ts >= best_ts:
-            best_ts = ts
-            best = v
-    return best
+        if ts <= start_epoch:
+            if ts >= best_ts:
+                best_ts = ts
+                best = v
+            continue
+        # First upgrade after the process started. "install" lines carry
+        # <none> as the old version and are therefore not usable here.
+        if parts[2] == "upgrade" and (after_ts is None or ts < after_ts):
+            old_version = parts[4]
+            if old_version not in ("", "<none>", "-"):
+                after_ts = ts
+                after_old = old_version
+    return best or after_old
 
 
 def parse_changelog(path):
@@ -1400,6 +1418,10 @@ def security_analysis(ctid, srcpkg, binpkg, old, new):
     best_cvss = None
 
     if not old:
+        # The running version could not be reconstructed, so the count below is
+        # only "CVEs named in the latest changelog entry" and no online lookup
+        # (hence no CVSS score) is possible: analysis is indeterminate.
+        CT_CVE_UNKNOWN.add(ctid)
         result = changelog_verdict(root, binpkg, srcpkg, "", new)
         if result:
             count, verdict = result.split("\t", 1)

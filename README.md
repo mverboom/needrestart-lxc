@@ -176,7 +176,9 @@ database (`/var/lib/dpkg/info/*.list`), which works even though the file on disk
 2. **Old version** — the version the stale process is running is derived from the container's `dpkg.log`
 upgrade/install timestamps matched against the process start time (`/proc/<pid>` on the host). This
 is more accurate than assuming "last upgrade": a long-running daemon can be several versions behind.
-`/var/log/apt/history.log` is used as a fallback when `dpkg.log` is unavailable.
+`logrotate` keeps only about a year of `dpkg.log`, so when the install line of the running version has
+already been rotated away the *old* side of the earliest later upgrade of that package is used — that is
+exactly the version the upgrade replaced, so the fallback is exact and not a guess.
 3. **CVE lookup** — the version delta is checked against security data, queried online and cached for
 24h in `/var/cache/needrestart-lxc`:
    - **Debian**: the [OSV](https://osv.dev) API (per-package query by version, filtered to the
@@ -196,9 +198,10 @@ Caveats:
 - Online lookups require outbound HTTPS from the Proxmox host and a `python3` interpreter (stdlib
   `urllib`, no extra packages). The Ubuntu API is rate-limited, so the script paces requests and
   retries on HTTP 429. Everything is cached for 24h.
-- The old version can only be determined if the relevant `dpkg.log`/`apt history.log` entries are still
-  retained (log rotation). Otherwise the latest changelog entry is reported with an
-  "old version unknown" note.
+- The old version can only be determined if `dpkg.log` still contains a line for that package before
+  the process started, or an upgrade of it afterwards (`logrotate` keeps ~12 months). If neither exists
+  the latest changelog entry is reported with an "old version unknown" note, which counts CVE IDs but
+  can never produce a CVSS score, and `cves_ok` is 0 so the verdict is not treated as complete.
 - Log timestamps are interpreted with the container's timezone (`/etc/timezone`) — containers that
   override the host timezone may yield an imprecise old version.
 - The CVE count is per package, not per service: restarting one service may fix CVEs that also matter
@@ -282,8 +285,10 @@ that gap on the host:
 2. for each unit it finds the processes in that unit's cgroup and collects the
    executable mappings that are `(deleted)`;
 3. it resolves those library paths to the owning dpkg binary package, derives
-   the version in effect when the process started from `dpkg.log` timestamps,
-   and compares it with the installed version;
+   the version in effect when the process started from `dpkg.log` timestamps
+   (or, when that line has rotated out of the log, from the old side of the
+   earliest later upgrade of the package), and compares it with the installed
+   version;
 4. it asks the same sources needrestart-lxc uses — OSV for Debian (CVSS base
    score computed from the reported vector) and the Ubuntu Security API — how
    many CVEs the pending update fixes, with the highest CVSS among them;
@@ -305,7 +310,11 @@ needrestart-cve
 
 `state` is 0 (clean), 1 (restart needed, no known CVEs — also when the analysis
 is indeterminate), 2 (restart needed and CVEs are fixed) or 9 (the agent found
-no cache document, so the helper is not reporting). The Zabbix template splits
+no cache document, so the helper is not reporting). `cves_ok` is 0 when the
+analysis is incomplete: a stale library that maps to no package, a package with
+no dpkg status entry, or a running version that cannot be reconstructed from
+`dpkg.log` at all — in that last case the CVEs come from the latest changelog
+entry only and there is no CVSS (hence `max_cvss: "n/a"`). The Zabbix template splits
 the old single HIGH trigger into WARNING (state 1) and HIGH (state 2) on that
 value, raises a separate WARNING for state 9, and raises one when the report is
 more than an hour old (`generated_epoch` stops advancing, i.e. the cron stopped

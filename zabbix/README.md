@@ -234,7 +234,7 @@ Zabbix poll never performs an online lookup:
 | `needrestart.cve.master` | the JSON document itself |
 | `needrestart.cve.services` | services needrestart flags |
 | `needrestart.cve.count` | unique CVEs fixed by restarting them |
-| `needrestart.cve.cves_ok` | 0 when the analysis is indeterminate |
+| `needrestart.cve.cves_ok` | 0 when the analysis is indeterminate (no owning package, or the running version cannot be reconstructed) |
 | `needrestart.cve.max_cvss` | highest CVSS score, or `n/a` |
 | `needrestart.cve.state` | 0 clean, 1 restart without known CVEs, 2 restart with CVEs, 9 no data |
 | `needrestart.cve.generated` | epoch of the report the agent is serving (freshness check) |

@@ -78,6 +78,7 @@ BLACKLIST_PATTERNS = [re.compile(p) for p in (
 DPKG_STATUS = {}       # binpkg -> "version\tsrcpkg"
 EXT_VERDICTS = {}      # "srcpkg|old|new" -> "count\tverdict"
 EXT_VERDICT_CVSS = {}  # "srcpkg|old|new" -> highest CVSS for that update
+EXT_DELTA_KNOWN = {}   # "srcpkg|old|new" -> running version was determined
 VER_CMP_CACHE = {}     # (a, b) -> -1|0|1
 DPKG_LOG_TEXT = None   # /var/log/dpkg.log* concatenated once per run
 TZ_NAME = None         # /etc/timezone contents, once per run
@@ -340,13 +341,22 @@ def dpkg_log_text():
 
 
 def version_at_start(binpkg, start_epoch):
-    """Version in effect when a process started, from dpkg.log timestamps."""
+    """Version in effect when a process started, from dpkg.log timestamps.
+
+    logrotate keeps only ~12 months of dpkg.log, so the line that installed
+    the version a long-running process is still using is often already gone
+    (it was installed at build time). In that case fall back to the *old*
+    version of the earliest upgrade of the package after the process started:
+    that is the version the upgrade replaced, i.e. what the process runs.
+    Both paths are exact; only if neither exists is the version unknown."""
     all_data = dpkg_log_text()
     if not all_data:
         return ""
     tz = timezone_name()
     best = ""
     best_ts = 0
+    after_ts = None
+    after_old = ""
     for line in all_data.splitlines():
         parts = line.split()
         if len(parts) < 5 or parts[2] not in ("upgrade", "install"):
@@ -358,11 +368,21 @@ def version_at_start(binpkg, start_epoch):
         if not version or version == "<none>":
             continue
         ts = epoch_from_date(line[:19], tz)
-        if ts is None or ts > start_epoch or ts < best_ts:
+        if ts is None:
             continue
-        best_ts = ts
-        best = version
-    return best
+        if ts <= start_epoch:
+            if ts >= best_ts:
+                best_ts = ts
+                best = version
+            continue
+        # First upgrade after the process started. "install" lines carry
+        # <none> as the old version and are therefore not usable here.
+        if parts[2] == "upgrade" and (after_ts is None or ts < after_ts):
+            old_version = parts[4]
+            if old_version not in ("", "<none>", "-"):
+                after_ts = ts
+                after_old = old_version
+    return best or after_old
 
 
 # ---------------------------------------------------------------------------
@@ -673,18 +693,26 @@ def os_release():
 # ---------------------------------------------------------------------------
 
 def security_analysis(srcpkg, binpkg, old, new):
-    """Verdict for one source package update; returns (count, verdict, cvss)."""
+    """Verdict for one source package update.
+
+    Returns (count, verdict, cvss, delta_known). delta_known is False when the
+    version the process is running could not be reconstructed, in which case
+    the count comes from the latest changelog entry only and cannot be trusted
+    as "what this update fixes"."""
     key = f"{srcpkg}|{old}|{new}"
     if key in EXT_VERDICTS:
         result = EXT_VERDICTS[key]
         count, verdict = result.split("\t", 1)
-        return int(count), verdict, EXT_VERDICT_CVSS.get(key)
+        return (int(count), verdict, EXT_VERDICT_CVSS.get(key),
+                EXT_DELTA_KNOWN.get(key, True))
 
     count = 0
     verdict = ""
     best_cvss = None
+    delta_known = True
 
     if not old:
+        delta_known = False
         result = changelog_verdict(binpkg, srcpkg, "", new)
         if result:
             count_text, verdict = result.split("\t", 1)
@@ -754,8 +782,9 @@ def security_analysis(srcpkg, binpkg, old, new):
                            f"unavailable (offline?)")
 
     EXT_VERDICT_CVSS[key] = best_cvss
+    EXT_DELTA_KNOWN[key] = delta_known
     EXT_VERDICTS[key] = f"{count}\t{verdict}"
-    return count, verdict, best_cvss
+    return count, verdict, best_cvss, delta_known
 
 
 def unit_findings(unit, procs):
@@ -807,10 +836,14 @@ def analyze_unit(unit, pids, libs, start_epoch, owners):
             continue
         seen_updates.add(ukey)
 
-        count, verdict, update_cvss = security_analysis(
+        count, verdict, update_cvss, delta_known = security_analysis(
             srcpkg, binpkg, old, curver)
         entry["details"].append(verdict)
         entry["cves"] += count
+        if not delta_known:
+            # No reconstructable running version: the count is only "CVEs named
+            # in the latest changelog entry" and no online score is possible.
+            entry["cves_ok"] = 0
         if update_cvss is not None:
             best = max(best or 0.0, update_cvss)
 
