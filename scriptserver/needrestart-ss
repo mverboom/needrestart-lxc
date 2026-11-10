@@ -34,7 +34,9 @@
 #   services --hosts FQDN[,FQDN...]
 #       List the flagged systemd service units on the given host(s), one per
 #       line as "host:unit" - the value list for the restart runner's
-#       dynamic Services multiselect.
+#       dynamic Services multiselect. systemd-manager (PID 1) is included
+#       because the restart action can clear it with `systemctl
+#       daemon-reexec`.
 #   restart --hosts FQDN[,FQDN...] [--targets h1:svc1,h2:svc2]
 #           [--exclude REGEX] [--action dry-run|restart] [--allow-all]
 #       Restart selected services with `systemctl restart` over SSH (dry run
@@ -42,6 +44,11 @@
 #       only still-flagged selections are processed; guards mirror
 #       needrestart's own logic: RefuseManualStop units and findings that are
 #       not plain systemd service units are skipped and reported.
+#       systemd-manager is the one exception: it is PID 1, which cannot be
+#       restarted, but `systemctl daemon-reexec` reloads the manager with the
+#       upgraded libraries - no reboot and no service restart needed (the
+#       same thing the systemd package's postinst does, and what
+#       needrestart-lxc does inside containers).
 # ============================================================================
 set -u
 
@@ -53,6 +60,10 @@ HOSTS_CMD=${NEEDRESTART_SS_HOSTS_CMD:-needrestart-ss-hosts}  # site host list
 TOOL_NAME=needrestart     # argument passed to HOSTS_CMD
 GUARD_TIMEOUT=30          # systemctl show timeout, seconds
 RESTART_TIMEOUT=300       # systemctl restart timeout, seconds
+# needrestart's pseudo-unit for PID 1. Not a systemd unit (`systemctl show
+# systemd-manager` -> LoadState=not-found), never restartable, but its deleted
+# library mappings are cleared by re-executing the manager.
+MANAGER_UNIT=systemd-manager
 RESTART_RUNNER="needrestart"
 LXC_RUNNER="needrestart-lxc"
 ACTION_RESTART_UI="Restart flagged services"        # top-level Action option
@@ -155,9 +166,11 @@ extract_flagged() {
 }
 
 # is_flagged <unit>
-# Whether the unit is in FLAGGED_UNITS (exact match).
+# Whether the finding is currently flagged: a plain systemd service unit, or
+# the systemd-manager pseudo-unit (PID 1, restartable via daemon-reexec).
 is_flagged() {
-    [[ " ${FLAGGED_UNITS[*]} " == *" $1 "* ]]
+    [[ " ${FLAGGED_UNITS[*]} " == *" $1 "* ]] && return 0
+    [[ $1 == "$MANAGER_UNIT" && " ${FLAGGED_OTHER[*]} " == *" $1 "* ]]
 }
 
 # shquote <string>
@@ -225,14 +238,14 @@ do_status() {
 
     if ! python3 - "$STATUS_TMP" "$RESTART_RUNNER" "$LXC_RUNNER" "$ACTION_RESTART_UI" \
         "$ACTION_STATUS_UI" "$LXC_DATA_PARAM" "$LXC_DATA_SCAN_UI" "$RESTART_MODE" \
-        "$RESTART_MODE_RESTART_UI" "$CVE_MARKER" <<'PYEOF'
+        "$RESTART_MODE_RESTART_UI" "$CVE_MARKER" "$MANAGER_UNIT" <<'PYEOF'
 import glob, html, json, os, re, sys
 from datetime import datetime
 from urllib.parse import quote
 
 (tmpdir, restart_runner, lxc_runner, action_restart_ui, action_status_ui,
  lxc_data_param, lxc_data_scan_ui, restart_mode,
- restart_mode_restart_ui, cve_marker) = sys.argv[1:11]
+ restart_mode_restart_ui, cve_marker, manager_unit) = sys.argv[1:12]
 runner_enc = quote(restart_runner, safe="")
 lxc_runner_enc = quote(lxc_runner, safe="")
 UNIT_RE = re.compile(r"^[A-Za-z0-9@.:_-]+\.service$")
@@ -259,11 +272,12 @@ def parse_cve(text):
 
 
 def finding_type(svc):
-    """Type label for a non-restartable finding. needrestart's pseudo-units
-    are not plain systemd units, but they are also not arbitrary processes:
-    systemd-manager must be cleared with `systemctl daemon-reexec`, and
-    systemd-user is the user's own `systemd --user` instance."""
-    if svc == "systemd-manager":
+    """Type label for a finding that is not a plain systemd service unit.
+    needrestart's pseudo-units are not systemd units, but they are also not
+    arbitrary processes: systemd-manager (PID 1) is cleared with
+    `systemctl daemon-reexec`, and systemd-user is the user's own
+    `systemd --user` instance."""
+    if svc == manager_unit:
         return "systemd (daemon-reexec)"
     if svc == "systemd-user":
         return "systemd --user (manual)"
@@ -588,10 +602,15 @@ for (state, host, services, sessions, ksta, ucsta,
               f"<th title='highest CVSS base score among those CVEs'>CVSS</th>"
               f"<th title='services needrestart would defer restarting as potentially invasive'>"
               f"Invasive</th></tr>")
-        # restartable .service units first, other findings (interpreter /
-        # non-systemd, never restarted by the wrapper) after; alphabetical.
+        # Restartable findings first: .service units, then systemd-manager
+        # (PID 1, cleared with `systemctl daemon-reexec`). Remaining findings
+        # (systemd --user, sysv init, interpreters) have no safe remote
+        # command and stay unselectable; alphabetical within each group.
         units = sorted(s for s in services if UNIT_RE.match(s))
-        others = [s for s in services if not UNIT_RE.match(s)]
+        manager = [s for s in services
+                   if not UNIT_RE.match(s) and s == manager_unit]
+        others = [s for s in services
+                  if not UNIT_RE.match(s) and s != manager_unit]
         for svc in units:
             href = restart_link(host, svc)
             sel = f'<input type=checkbox class=ssel value="{esc(svc)}">'
@@ -604,6 +623,16 @@ for (state, host, services, sessions, ksta, ucsta,
                   f'{esc(svc)}</a></td>'
                   f"<td>systemd unit</td>"
                   f"{cve_cells(cvemap, svc)}<td>{inv}</td></tr>")
+        for svc in manager:
+            href = restart_link(host, svc)
+            sel = f'<input type=checkbox class=ssel value="{esc(svc)}">'
+            print(f'<tr><td class=sel>{sel}</td>'
+                  f'<td class=service><a target="_top" href="{href}" '
+                  f'title="open restart runner with this finding: PID 1, '
+                  f'cleared with systemctl daemon-reexec">'
+                  f'{esc(svc)}</a></td>'
+                  f"<td>{esc(finding_type(svc))}</td>"
+                  f"{cve_cells(cvemap, svc)}<td></td></tr>")
         for svc in others:
             inv = ('<span class=inv title="needrestart would defer restarting '
                    'this service by default">&#9888; deferred</span>'
@@ -663,10 +692,12 @@ do_services() {
         || { echo "bad --hosts format (expected host[,host...]): got '$hostspec'" >&2; exit 1; }
 
     # Fresh scan per host (there is no needrestart cache like needrestart-lxc
-    # has), all hosts in parallel, and emit one line per flagged systemd
-    # service unit as "host:unit" (host-qualified so services on different
-    # hosts cannot collide). Non-unit findings are not offered: the restart
-    # action never touches them.
+    # has), all hosts in parallel, and emit one line per restartable flagged
+    # finding as "host:unit" (host-qualified so services on different hosts
+    # cannot collide): the .service units plus systemd-manager, which the
+    # restart action clears with `systemctl daemon-reexec`. Other findings
+    # (systemd --user, sysv init, interpreters) are not offered: no safe
+    # remote command exists for them.
     # script-server raises an ExecutionException for a non-zero values
     # script, which empties the WHOLE multiselect - so a single unreachable
     # host must not fail the run: values for the reachable hosts are still
@@ -697,8 +728,11 @@ do_services() {
         fi
         ok=$((ok + 1))
         extract_flagged "$tmpdir/$h.out"
+        local -a offer=("${FLAGGED_UNITS[@]}")
+        [[ " ${FLAGGED_OTHER[*]} " == *" $MANAGER_UNIT "* ]] \
+            && offer+=("$MANAGER_UNIT")
         local unit
-        for unit in "${FLAGGED_UNITS[@]}"; do
+        for unit in "${offer[@]}"; do
             printf '%s:%s\n' "$h" "$unit"
         done
     done
@@ -714,11 +748,28 @@ do_services() {
 # restart
 # ---------------------------------------------------------------------------
 
+# restart_command <unit>
+# The remote command that clears one selected finding. systemd-manager is PID
+# 1: it is not a unit (`systemctl show` reports not-found) and cannot be
+# restarted, but a re-exec loads the upgraded libraries into the running
+# manager - what the systemd package's own postinst does, and what
+# needrestart-lxc does inside containers. No reboot, no service restarts.
+restart_command() {
+    if [[ $1 == "$MANAGER_UNIT" ]]; then
+        echo "systemctl daemon-reexec"
+    else
+        echo "systemctl restart $(shquote "$1")"
+    fi
+}
+
 # unit_guard <host> <unit>
 # Replicate needrestart's own restart guards remotely; print a skip reason on
 # stdout when the unit must not be restarted, print nothing when it may be.
 unit_guard() {
     local host=$1 unit=$2 show load ref
+    # PID 1 is not a unit and refuses nothing; the re-exec is guarded by the
+    # runner's explicit selection instead.
+    [[ $unit == "$MANAGER_UNIT" ]] && return
     show=$(timeout $GUARD_TIMEOUT ssh "${SSH_OPTS[@]}" -- "$host" \
         "systemctl show -p LoadState -p RefuseManualStop --value $(shquote "$unit")") \
         || { printf 'systemctl show failed on %s' "$host"; return; }
@@ -837,10 +888,19 @@ do_restart() {
         if [[ -n $csv ]]; then
             IFS=',' read -ra selected <<< "$csv"
         else
-            # explicit --allow-all: every flagged unit on the host
+            # explicit --allow-all: every flagged unit on the host. PID 1
+            # (systemd-manager) is deliberately NOT included: a daemon-reexec
+            # must always be selected explicitly.
             selected=("${FLAGGED_UNITS[@]}")
-            ((${#selected[@]})) \
-                || { echo "nothing flagged (clean)"; continue; }
+            if ((${#selected[@]} == 0)); then
+                if [[ " ${FLAGGED_OTHER[*]} " == *" $MANAGER_UNIT "* ]]; then
+                    echo "nothing to restart (only systemd-manager/PID 1 is" \
+                         "flagged; select it explicitly for daemon-reexec)"
+                else
+                    echo "nothing flagged (clean)"
+                fi
+                continue
+            fi
         fi
 
         for unit in "${selected[@]}"; do
@@ -856,20 +916,27 @@ do_restart() {
                 continue
             fi
             if [[ $action == dry-run ]]; then
-                echo "  (dry run) systemctl restart $unit"
+                echo "  (dry run) $(restart_command "$unit")"
             else
-                echo "  restarting $unit"
+                echo "  running $(restart_command "$unit")"
                 if ! timeout $RESTART_TIMEOUT ssh "${SSH_OPTS[@]}" -- "$h" \
-                    "systemctl restart $(shquote "$unit")"; then
-                    echo "  $unit: systemctl restart FAILED"
+                    "$(restart_command "$unit")"; then
+                    echo "  $unit: $(restart_command "$unit") FAILED"
                     rc=1
                 fi
             fi
         done
         ((${#FLAGGED_OTHER[@]})) && {
-            echo "  manual (not systemd units, not restarted):"
+            echo "  manual (not restarted):"
             local other
-            for other in "${FLAGGED_OTHER[@]}"; do echo "    $other"; done
+            for other in "${FLAGGED_OTHER[@]}"; do
+                if [[ $other == "$MANAGER_UNIT" ]]; then
+                    echo "    $other (PID 1: select it to run" \
+                         "'systemctl daemon-reexec')"
+                else
+                    echo "    $other"
+                fi
+            done
         }
     done
     rm -f "$out" "$err"

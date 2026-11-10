@@ -124,6 +124,16 @@ Potentially invasive services (needrestart's deferred list, shown in the
 report's Invasive column) are restarted like any other flagged service; that
 marking is informational and does not skip them.
 
+One pseudo-unit is selectable: `systemd-manager`, i.e. PID 1. It cannot be
+restarted (and `systemctl show systemd-manager` reports `not-found`), so the
+action runs `systemctl daemon-reexec` instead: the manager re-executes itself
+with the upgraded libraries, without a reboot and without touching any unit —
+the same thing the `systemd` package's own postinst does after an upgrade, and
+what `needrestart-lxc` does inside containers. It is never part of **Allow
+all**; a re-exec of init must be selected explicitly. Other non-unit findings
+(`systemd-user`, `sysv-init`, interpreter processes) stay read-only in the
+report.
+
 ## Installation / update
 
 On the cdist control host:
