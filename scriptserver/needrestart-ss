@@ -868,11 +868,12 @@ do_restart() {
         fi
     fi
 
-    local rc=0 h csv unit reason out err scan_rc
+    local rc=0 h csv unit reason out err scan_rc manager_done
     out=$(mktemp); err=$(mktemp)
     trap 'rm -f "$out" "$err"' EXIT
     for h in "${hostlist[@]}"; do
         echo "=== $h ==="
+        manager_done=0
         # 'if ! run_scan' would invert the status; capture the real rc
         scan_rc=0; run_scan "$h" "$out" "$err" || scan_rc=$?
         if [[ $scan_rc != 0 ]]; then
@@ -925,11 +926,19 @@ do_restart() {
                     rc=1
                 fi
             fi
+            [[ $unit == "$MANAGER_UNIT" ]] && manager_done=1
         done
-        ((${#FLAGGED_OTHER[@]})) && {
+        # Everything still flagged that this action cannot handle. The
+        # systemd-manager hint is only useful while it was not just dealt with.
+        local -a manual=()
+        local other
+        for other in "${FLAGGED_OTHER[@]}"; do
+            [[ $other == "$MANAGER_UNIT" && $manager_done == 1 ]] && continue
+            manual+=("$other")
+        done
+        if ((${#manual[@]})); then
             echo "  manual (not restarted):"
-            local other
-            for other in "${FLAGGED_OTHER[@]}"; do
+            for other in "${manual[@]}"; do
                 if [[ $other == "$MANAGER_UNIT" ]]; then
                     echo "    $other (PID 1: select it to run" \
                          "'systemctl daemon-reexec')"
@@ -937,7 +946,7 @@ do_restart() {
                     echo "    $other"
                 fi
             done
-        }
+        fi
     done
     rm -f "$out" "$err"
     trap - EXIT
